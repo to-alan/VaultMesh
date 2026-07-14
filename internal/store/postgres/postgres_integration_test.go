@@ -32,7 +32,9 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	projectID := "prj_pg_" + suffix
 	repositoryID := "repo_pg_" + suffix
 	commandID := "cmd_pg_" + suffix
-	now := time.Now().UTC()
+	// PostgreSQL timestamptz stores microsecond precision, so keep the fixture at
+	// the same precision before comparing the value read back from the database.
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	admin := domain.AdminAccount{
 		Username: "admin-" + suffix, PasswordHash: []byte("hash-" + suffix),
 		WebAuthnUserID: []byte("user-handle-" + suffix), SecurityData: []byte("v1:security-" + suffix),
