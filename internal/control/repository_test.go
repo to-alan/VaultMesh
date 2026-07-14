@@ -37,6 +37,10 @@ func TestValidateRepositoryURLRejectsProtocolMismatch(t *testing.T) {
 		{"sftp", "sftp://example.com/no-user"},
 		{"rest_server", "https://backup.example.com"},
 		{"amazon_s3", "s3:ftp://example.com/bucket"},
+		{"amazon_s3", "s3:https://access:secret@example.com/bucket"},
+		{"cloudflare_r2", "s3:https://example.com/bucket?token=secret"},
+		{"sftp", "sftp://backup:password@example.com//srv/restic"},
+		{"rest_server", "rest:https://user:password@backup.example.com/vaultmesh"},
 		{"openstack_swift", "swift:/missing-container"},
 		{"rclone", "rclone:bad remote:path"},
 	}

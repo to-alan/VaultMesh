@@ -16,7 +16,10 @@ import (
 	"github.com/to-alan/vaultmesh/internal/version"
 )
 
-const maxRequestBody = 1 << 20
+const (
+	maxRequestBody       = 1 << 20
+	maxSnapshotClockSkew = 5 * time.Minute
+)
 
 type HTTPServer struct {
 	service        *Service
@@ -444,6 +447,11 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	report.ServerID = server.ID
+	var (
+		snapshotInventory    []domain.Snapshot
+		hasSnapshotInventory bool
+		snapshotSyncedAt     time.Time
+	)
 	if report.Status == domain.RunSucceeded && report.Stats != nil {
 		if raw, ok := report.Stats["snapshots"]; ok {
 			encoded, err := json.Marshal(raw)
@@ -451,17 +459,16 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 				s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory is invalid", nil)
 				return
 			}
-			var snapshots []domain.Snapshot
-			if err := json.Unmarshal(encoded, &snapshots); err != nil {
+			if err := json.Unmarshal(encoded, &snapshotInventory); err != nil {
 				s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory is invalid", nil)
 				return
 			}
-			if len(snapshots) > 10000 {
+			if len(snapshotInventory) > 10000 {
 				s.writeError(w, http.StatusRequestEntityTooLarge, "snapshot_inventory_too_large", "snapshot inventory contains too many entries", nil)
 				return
 			}
-			for index := range snapshots {
-				snapshot := &snapshots[index]
+			for index := range snapshotInventory {
+				snapshot := &snapshotInventory[index]
 				if !fullResticSnapshotID.MatchString(snapshot.ID) || snapshot.Time.IsZero() {
 					s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory contains an invalid ID or timestamp", nil)
 					return
@@ -474,19 +481,19 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			syncedAt := time.Now().UTC()
-			if report.FinishedAt != nil {
-				syncedAt = report.FinishedAt.UTC()
-			}
-			if err := s.service.Store().ReplaceProjectSnapshots(r.Context(), report.ProjectID, server.ID, snapshots, syncedAt); err != nil {
-				s.handleServiceError(w, err)
-				return
-			}
+			hasSnapshotInventory = true
+			snapshotSyncedAt = snapshotSyncTime(report.FinishedAt, s.service.now())
 		}
 	}
 	if err := s.service.Store().UpsertRun(r.Context(), report); err != nil {
 		s.handleServiceError(w, err)
 		return
+	}
+	if hasSnapshotInventory {
+		if err := s.service.Store().ReplaceProjectSnapshots(r.Context(), report.ProjectID, server.ID, snapshotInventory, snapshotSyncedAt); err != nil {
+			s.handleServiceError(w, err)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -528,7 +535,7 @@ func (s *HTTPServer) cors(next http.Handler) http.Handler {
 			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
 			w.Header().Set("Access-Control-Max-Age", "600")
 			w.Header().Add("Vary", "Origin")
@@ -545,6 +552,20 @@ func (s *HTTPServer) cors(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// snapshotSyncTime preserves ordering for normally delayed run reports without
+// allowing a badly skewed Agent clock to suppress future snapshot inventories.
+func snapshotSyncTime(finishedAt *time.Time, receivedAt time.Time) time.Time {
+	receivedAt = receivedAt.UTC()
+	if finishedAt == nil {
+		return receivedAt
+	}
+	candidate := finishedAt.UTC()
+	if candidate.Before(receivedAt.Add(-maxSnapshotClockSkew)) || candidate.After(receivedAt.Add(maxSnapshotClockSkew)) {
+		return receivedAt
+	}
+	return candidate
 }
 
 func (s *HTTPServer) securityHeaders(next http.Handler) http.Handler {

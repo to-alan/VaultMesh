@@ -118,6 +118,9 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	if err := dataStore.ReplaceProjectSnapshots(ctx, projectID, serverID, nil, syncedAt.Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	if err := dataStore.ReplaceProjectSnapshots(ctx, projectID, serverID, nil, syncedAt); err != nil {
+		t.Fatal(err)
+	}
 	snapshots, err := dataStore.ListSnapshots(ctx, projectID, 10)
 	if err != nil || len(snapshots) != 1 || snapshots[0].ID != snapshotID || !snapshots[0].LastSyncedAt.Equal(syncedAt) {
 		t.Fatalf("snapshot inventory or stale-write guard failed: %#v err=%v", snapshots, err)
@@ -136,6 +139,18 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	if err := dataStore.UpsertRun(ctx, report); err != nil {
 		t.Fatal(err)
 	}
+	staleRunningReport := report
+	staleRunningReport.Status = domain.RunRunning
+	staleRunningReport.FinishedAt = nil
+	staleRunningReport.SnapshotID = ""
+	if err := dataStore.UpsertRun(ctx, staleRunningReport); err != nil {
+		t.Fatalf("delayed running report was not acknowledged: %v", err)
+	}
+	conflictingReport := report
+	conflictingReport.IdempotencyKey = "conflicting:" + commandID
+	if err := dataStore.UpsertRun(ctx, conflictingReport); err == nil {
+		t.Fatal("same run ID with a different idempotency identity was accepted")
+	}
 	commands, err = dataStore.ClaimCommands(ctx, serverID, now.Add(2*time.Minute), now.Add(3*time.Minute), 10)
 	if err != nil || len(commands) != 0 {
 		t.Fatalf("completed command was reclaimed: %#v err=%v", commands, err)
@@ -143,5 +158,8 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	runs, err := dataStore.ListRuns(ctx, 10)
 	if err != nil || len(runs) == 0 {
 		t.Fatalf("run was not persisted: %#v err=%v", runs, err)
+	}
+	if runs[0].ID == report.ID && runs[0].Status != domain.RunSucceeded {
+		t.Fatalf("delayed report regressed terminal run: %#v", runs[0])
 	}
 }

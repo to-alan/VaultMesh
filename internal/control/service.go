@@ -359,8 +359,8 @@ func (s *Service) CreateProject(ctx context.Context, input domain.Project) (doma
 	if input.Schedule.MaxRuntimeSeconds < 60 || input.Schedule.MaxRuntimeSeconds > 7*24*60*60 {
 		return domain.Project{}, validationError("schedule.max_runtime_seconds", "must be between 60 seconds and 7 days")
 	}
-	if input.Schedule.MissedRunPolicy != "skip" && input.Schedule.MissedRunPolicy != "run_once" {
-		return domain.Project{}, validationError("schedule.missed_run_policy", "must be skip or run_once")
+	if input.Schedule.MissedRunPolicy != "skip" {
+		return domain.Project{}, validationError("schedule.missed_run_policy", "the current version supports only skip")
 	}
 	if input.Schedule.ConcurrencyPolicy != "forbid" {
 		return domain.Project{}, validationError("schedule.concurrency_policy", "the current version supports only forbid")
@@ -771,6 +771,9 @@ func validateRepositoryURL(provider, value string) error {
 		if parsed.Scheme != "https" && parsed.Scheme != "http" {
 			return errors.New("S3 endpoint must use http or https")
 		}
+		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return errors.New("credentials, query parameters, and fragments are not allowed in repository URLs; use encrypted credential fields")
+		}
 		if parsed.Scheme == "http" && parsed.Hostname() != "localhost" && parsed.Hostname() != "127.0.0.1" && parsed.Hostname() != "minio" {
 			return errors.New("plain HTTP is allowed only for local MinIO development")
 		}
@@ -789,10 +792,16 @@ func validateRepositoryURL(provider, value string) error {
 		if err != nil || parsed.Scheme != "sftp" || parsed.Host == "" || parsed.User == nil || strings.Trim(parsed.Path, "/") == "" {
 			return errors.New("must use sftp://user@host:port//absolute/path syntax")
 		}
+		if _, hasPassword := parsed.User.Password(); hasPassword || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return errors.New("passwords, query parameters, and fragments are not allowed in repository URLs; use encrypted credential fields")
+		}
 	case "rest_server":
 		parsed, err := url.Parse(strings.TrimPrefix(value, "rest:"))
 		if !strings.HasPrefix(value, "rest:") || err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
 			return errors.New("must be a Restic REST URL beginning with rest:https://")
+		}
+		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return errors.New("credentials, query parameters, and fragments are not allowed in repository URLs; use encrypted credential fields")
 		}
 	case "openstack_swift":
 		if !regexp.MustCompile(`^swift:[^:/]+:/.*`).MatchString(value) {

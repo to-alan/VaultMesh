@@ -52,7 +52,7 @@ export interface Schedule {
   timezone: string
   jitter_seconds: number
   max_runtime_seconds: number
-  missed_run_policy: 'skip' | 'run_once'
+  missed_run_policy: 'skip'
   concurrency_policy: 'forbid'
 }
 

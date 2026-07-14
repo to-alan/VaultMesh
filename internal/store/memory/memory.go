@@ -321,7 +321,7 @@ func (s *Store) ReplaceProjectSnapshots(_ context.Context, projectID, serverID s
 	if !ok || project.ServerID != serverID {
 		return store.ErrNotFound
 	}
-	if s.snapshotSync[projectID].After(syncedAt) {
+	if latestSync := s.snapshotSync[projectID]; !latestSync.IsZero() && !syncedAt.After(latestSync) {
 		return nil
 	}
 	items := make(map[string]domain.Snapshot, len(snapshots))
@@ -382,6 +382,16 @@ func (s *Store) UpsertRun(_ context.Context, report domain.RunReport) error {
 	if existingID, ok := s.runKeys[report.IdempotencyKey]; ok && existingID != report.ID {
 		return store.ErrConflict
 	}
+	if existing, ok := s.runs[report.ID]; ok {
+		if existing.IdempotencyKey != report.IdempotencyKey || existing.ProjectID != report.ProjectID || existing.ServerID != report.ServerID {
+			return store.ErrConflict
+		}
+		if existing.Status != domain.RunRunning {
+			// Terminal run facts are immutable. A delayed duplicate running report
+			// is acknowledged without regressing the stored result.
+			return nil
+		}
+	}
 	project, ok := s.projects[report.ProjectID]
 	if !ok || project.ServerID != report.ServerID {
 		return store.ErrNotFound
@@ -406,7 +416,10 @@ func (s *Store) ListRuns(_ context.Context, limit int) ([]domain.RunReport, erro
 		result = append(result, cloneRun(report))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].StartedAt.After(result[j].StartedAt) })
-	if limit > 0 && len(result) > limit {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if len(result) > limit {
 		result = result[:limit]
 	}
 	return result, nil

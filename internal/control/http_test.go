@@ -127,6 +127,24 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 		SnapshotID:     "snapshot-test",
 	}, http.StatusNoContent, nil)
 	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_test",
+		IdempotencyKey: project.ID + ":different-identity",
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunFailed,
+		ErrorMessage:   "must not replace the original run",
+	}, http.StatusConflict, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_test",
+		IdempotencyKey: project.ID + ":2026-01-01T00:00:00Z",
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		Status:         domain.RunRunning,
+	}, http.StatusNoContent, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
 		ID:             "run_manual",
 		IdempotencyKey: "manual:" + command.ID,
 		ProjectID:      project.ID,
@@ -171,6 +189,11 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 	if len(runs.Items) != 3 {
 		t.Fatalf("unexpected run list: %#v", runs.Items)
 	}
+	for _, report := range runs.Items {
+		if report.ID == "run_test" && report.Status != domain.RunSucceeded {
+			t.Fatalf("delayed running report regressed terminal run: %#v", report)
+		}
+	}
 	var dashboard domain.Dashboard
 	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/dashboard", adminCookie,
 		nil, http.StatusOK, &dashboard)
@@ -211,6 +234,38 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 		nil, http.StatusOK, &snapshots)
 	if len(snapshots.Items) != 1 || snapshots.Items[0].ID != snapshotID || snapshots.Items[0].ProjectID != project.ID || snapshots.Items[0].ServerID != identity.AgentID {
 		t.Fatalf("snapshot inventory was not indexed safely: %#v", snapshots.Items)
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_snapshot_sync",
+		IdempotencyKey: "manual:" + refreshCommand.ID,
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunSucceeded,
+		Stats:          map[string]any{"operation": "snapshot_sync", "snapshots": []domain.Snapshot{}},
+	}, http.StatusNoContent, nil)
+	snapshots.Items = nil
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/snapshots?project_id="+project.ID, adminCookie,
+		nil, http.StatusOK, &snapshots)
+	if len(snapshots.Items) != 1 || snapshots.Items[0].ID != snapshotID {
+		t.Fatalf("duplicate run mutated the snapshot index: %#v", snapshots.Items)
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_snapshot_sync",
+		IdempotencyKey: project.ID + ":conflicting-snapshot-sync",
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunSucceeded,
+		Stats:          map[string]any{"operation": "snapshot_sync", "snapshots": []domain.Snapshot{}},
+	}, http.StatusConflict, nil)
+	snapshots.Items = nil
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/snapshots?project_id="+project.ID, adminCookie,
+		nil, http.StatusOK, &snapshots)
+	if len(snapshots.Items) != 1 || snapshots.Items[0].ID != snapshotID {
+		t.Fatalf("conflicting run mutated the snapshot index: %#v", snapshots.Items)
 	}
 	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
 		ID:             "run_stale_snapshot_sync",
@@ -506,7 +561,7 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 
 	preflight := httptest.NewRequest(http.MethodOptions, "/api/v1/dashboard", nil)
 	preflight.Header.Set("Origin", "https://console.example.com")
-	preflight.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodPatch)
 	preflightResponse := httptest.NewRecorder()
 	handler.ServeHTTP(preflightResponse, preflight)
 	if preflightResponse.Code != http.StatusNoContent {
@@ -518,6 +573,9 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 	if got := preflightResponse.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
 		t.Fatalf("unexpected access-control-allow-credentials %q", got)
 	}
+	if got := preflightResponse.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, http.MethodPatch) {
+		t.Fatalf("PATCH is missing from access-control-allow-methods %q", got)
+	}
 
 	forbidden := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	forbidden.Header.Set("Origin", "https://attacker.example.com")
@@ -525,6 +583,44 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 	handler.ServeHTTP(forbiddenResponse, forbidden)
 	if forbiddenResponse.Code != http.StatusForbidden {
 		t.Fatalf("expected forbidden origin to return 403, got %d", forbiddenResponse.Code)
+	}
+}
+
+func TestSnapshotSyncTimeBoundsAgentClockSkew(t *testing.T) {
+	receivedAt := time.Date(2026, time.July, 15, 1, 2, 3, 0, time.UTC)
+	closeFinishedAt := receivedAt.Add(-time.Minute)
+	farFuture := receivedAt.Add(24 * time.Hour)
+	farPast := receivedAt.Add(-24 * time.Hour)
+
+	for name, test := range map[string]struct {
+		finishedAt *time.Time
+		want       time.Time
+	}{
+		"missing":    {want: receivedAt},
+		"nearby":     {finishedAt: &closeFinishedAt, want: closeFinishedAt},
+		"far future": {finishedAt: &farFuture, want: receivedAt},
+		"far past":   {finishedAt: &farPast, want: receivedAt},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := snapshotSyncTime(test.finishedAt, receivedAt); !got.Equal(test.want) {
+				t.Fatalf("snapshotSyncTime() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCreateProjectRejectsUnimplementedMissedRunPolicy(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewService(memory.New(), sealer).CreateProject(context.Background(), domain.Project{
+		ServerID: "srv_test", RepositoryID: "repo_test", Name: "Test",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/etc"}}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC", MissedRunPolicy: "run_once"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "supports only skip") {
+		t.Fatalf("expected run_once to be rejected explicitly, got %v", err)
 	}
 }
 

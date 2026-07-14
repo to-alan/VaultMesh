@@ -509,7 +509,7 @@ func (s *Store) ReplaceProjectSnapshots(ctx context.Context, projectID, serverID
 	if storedServerID != serverID {
 		return store.ErrNotFound
 	}
-	if latestSync != nil && latestSync.After(syncedAt) {
+	if latestSync != nil && !syncedAt.After(*latestSync) {
 		return tx.Commit(ctx)
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM snapshots WHERE project_id = $1`, projectID); err != nil {
@@ -600,14 +600,33 @@ func (s *Store) UpsertRun(ctx context.Context, report domain.RunReport) error {
 		 error_code = EXCLUDED.error_code,
 		 error_message = EXCLUDED.error_message,
 		 stats = EXCLUDED.stats,
-		 updated_at = NOW()`, report.ID, report.IdempotencyKey, report.ProjectID, report.ServerID,
+		 updated_at = NOW()
+		 WHERE runs.idempotency_key = EXCLUDED.idempotency_key
+		   AND runs.project_id = EXCLUDED.project_id
+		   AND runs.server_id = EXCLUDED.server_id
+		   AND runs.status = 'running'`, report.ID, report.IdempotencyKey, report.ProjectID, report.ServerID,
 		report.ScheduledAt, report.StartedAt, report.FinishedAt, report.Status,
 		report.SnapshotID, report.ErrorCode, report.ErrorMessage, stats)
 	if err != nil {
 		return mapError(err)
 	}
 	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
+		var idempotencyKey, projectID, serverID, status string
+		err := s.pool.QueryRow(ctx, `
+			SELECT idempotency_key, project_id, server_id, status
+			FROM runs WHERE id = $1`, report.ID).Scan(&idempotencyKey, &projectID, &serverID, &status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if idempotencyKey != report.IdempotencyKey || projectID != report.ProjectID || serverID != report.ServerID {
+			return store.ErrConflict
+		}
+		// The identity matches and the WHERE clause can only reject an already
+		// terminal run. Treat delayed duplicates as acknowledged no-ops.
+		return nil
 	}
 	if commandID, ok := strings.CutPrefix(report.IdempotencyKey, "manual:"); ok {
 		completed := report.Status != domain.RunRunning

@@ -38,6 +38,8 @@ Control Plane ── PostgreSQL: snapshot metadata + command payload + run audit
 
 备份数据和恢复文件不经过 Control Plane。控制面保存快照 ID、时间、路径、标签、文件数、逻辑字节数、保护状态和最后同步时间；目录条目与恢复结果作为 Run 审计数据上报。
 
+快照索引使用 Agent 上报的完成时间保持迟到报告的顺序，但只信任控制面接收时间前后 5 分钟内的值；超出窗口时改用服务端接收时间。这样可以防止 Agent 时钟严重超前后压制后续快照同步。
+
 ## 操作流程
 
 1. 在“快照恢复”页按项目筛选，点击“从 Agent 同步”。

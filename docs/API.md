@@ -28,7 +28,7 @@ Authenticated personal-security endpoints are grouped under `/api/v1/profile`: `
 
 Adding or deleting a passkey requires an administrator session authenticated within the previous 10 minutes. A stale session receives HTTP `428` with code `reauthentication_required`; call `POST /api/v1/profile/reauthenticate` with `{"password":"...","code":"..."}` and retry. `code` is required only when TOTP is enabled and accepts either a current authenticator code or an unused recovery code. This keeps password and TOTP fields out of the normal passkey workflow while retaining explicit verification for older sessions.
 
-The API service does not serve the Web application. Configure the independently deployed, same-site Web origin in `VAULTMESH_ALLOWED_ORIGINS` and set the Web container's `VAULTMESH_API_BASE_URL` to the browser-visible API URL. Origins are matched exactly, credentialed CORS is enabled only for those origins, and wildcard CORS is intentionally unsupported.
+The API service does not serve the Web application. Configure the independently deployed, same-site Web origin in `VAULTMESH_ALLOWED_ORIGINS` and set the Web container's `VAULTMESH_API_BASE_URL` to the browser-visible API URL. Origins are matched exactly, credentialed CORS permits `GET`, `POST`, `PATCH`, and `OPTIONS` only for those origins, and wildcard CORS is intentionally unsupported.
 
 Passkeys additionally use `VAULTMESH_WEBAUTHN_RP_ID`, `VAULTMESH_WEBAUTHN_RP_ORIGINS`, and `VAULTMESH_WEBAUTHN_RP_NAME`. If omitted, RP ID/origins are derived from the first allowed Web origin. The RP ID must be a domain name without scheme or port; IP addresses are invalid. Local HTTP development must use `localhost`, while production requires an HTTPS domain. Changing the RP ID after passkeys are enrolled makes those credentials unusable.
 
@@ -64,6 +64,8 @@ Content-Type: application/json
 ```
 
 Storage channels are global and are not bound to a server. When a project is delivered to an Agent, the Control Plane appends `/<server-id>` to the base URL so each server gets an isolated Restic repository path. Passwords, environment credentials, and approved backend options are AES-256-GCM encrypted before being written to the metadata store, and the response never returns them. Supported provider identifiers and exact fields are documented in [Storage providers](./STORAGE_PROVIDERS.md).
+
+Repository URLs must contain only the endpoint and path. Embedded user information, passwords, query parameters, and fragments are rejected for S3 and REST URLs; SFTP permits the username but rejects an embedded password. Put credentials in the provider's encrypted credential fields instead.
 
 ## Create a file project
 
@@ -213,6 +215,8 @@ For PostgreSQL, use `"type": "postgresql"` with the same `database` object. The 
 ```
 
 The Agent runs `docker inspect` for the explicitly configured containers, stores a sanitized manifest without container environment variables, and adds bind-mount and named-volume host paths to Restic. It does not stop containers or back up their writable layers. Database containers should use the MySQL/PostgreSQL source adapters for application-consistent logical dumps.
+
+The current scheduler accepts only `"missed_run_policy":"skip"`. A future `run_once` policy requires a persisted missed-run cursor and additional idempotency semantics and is intentionally rejected instead of being silently ignored.
 
 ## Snapshot index and safe restore
 
