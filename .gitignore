@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+bin/
+dist/
+coverage/
+*.out
+*.log
+*.db
+*.db-shm
+*.db-wal
+web/node_modules/
+web/dist/

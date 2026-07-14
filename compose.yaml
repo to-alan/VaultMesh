@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vaultmesh
+      POSTGRES_USER: vaultmesh
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - vaultmesh-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vaultmesh -d vaultmesh"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      VAULTMESH_LISTEN: :8080
+      VAULTMESH_DATABASE_URL: postgres://vaultmesh:${POSTGRES_PASSWORD}@postgres:5432/vaultmesh?sslmode=disable
+      VAULTMESH_ADMIN_TOKEN: ${VAULTMESH_ADMIN_TOKEN:?set VAULTMESH_ADMIN_TOKEN in .env}
+      VAULTMESH_MASTER_KEY: ${VAULTMESH_MASTER_KEY:?set VAULTMESH_MASTER_KEY in .env}
+      VAULTMESH_WEB_DIR: /app/web
+      VAULTMESH_AUTO_MIGRATE: "true"
+    ports:
+      - "127.0.0.1:${VAULTMESH_HTTP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  vaultmesh-postgres:

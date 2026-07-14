@@ -1,0 +1,32 @@
+[Unit]
+Description=VaultMesh Backup Agent
+Documentation=https://github.com/to-alan/vaultmesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=-/etc/vaultmesh-agent.env
+ExecStart=/usr/local/bin/vaultmesh-agent \
+  --server ${VAULTMESH_SERVER_URL} \
+  --state /var/lib/vaultmesh-agent/state.json \
+  --staging-root /var/lib/vaultmesh-agent/staging
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/vaultmesh-agent
+StateDirectory=vaultmesh-agent
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
