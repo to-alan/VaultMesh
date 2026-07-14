@@ -12,6 +12,6 @@ RUN CGO_ENABLED=0 go build -trimpath \
     -o /out/vaultmesh-agent ./cmd/vaultmesh-agent
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates tzdata restic mysql-client postgresql-client
+RUN apk add --no-cache ca-certificates tzdata restic rclone mysql-client postgresql-client
 COPY --from=build /out/vaultmesh-agent /vaultmesh-agent
 ENTRYPOINT ["/vaultmesh-agent"]

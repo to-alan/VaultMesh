@@ -311,10 +311,22 @@ td small { margin-top: 4px; color: var(--muted-light); font-size: 10px; }
 .guide-steps strong, .guide-steps small { display: block; }
 .guide-steps strong { font-size: 13px; }
 .guide-steps small { margin-top: 5px; color: #91a69c; font-size: 11px; line-height: 1.55; }
+.guide-steps a { display: inline-block; margin-top: 8px; color: var(--accent); font-size: 10px; text-decoration: none; }
+.guide-steps a:hover { text-decoration: underline; }
 .guide-note { margin: 12px 0 0; color: #9eb3aa; font-size: 11px; line-height: 1.6; }
-.repository-grid { margin-top: 0; }
+.repository-grid { grid-template-columns: minmax(390px, .85fr) minmax(560px, 1.15fr); margin-top: 0; }
 .repository-card { grid-template-columns: minmax(180px, .55fr) auto; }
 .repository-card code { grid-column: 1 / -1; padding-top: 8px; border-top: 1px solid #17252c; }
+.repository-kind { display: grid; gap: 7px; padding: 12px; border: 1px solid #263b45; border-radius: 8px; background: linear-gradient(135deg, #0a1217, #0b1713); }
+.repository-kind > div { display: flex; align-items: center; gap: 8px; }
+.repository-kind strong { font-size: 13px; }
+.repository-kind p { margin: 0; color: #9bada5; font-size: 11px; line-height: 1.55; }
+.repository-kind > small { padding: 8px 9px; color: #e7c987; border-left: 2px solid #a77b2c; border-radius: 4px; background: rgba(100, 73, 20, .17); font-size: 10px; line-height: 1.5; }
+.engine-badge { padding: 4px 6px; color: #91c6ff; border: 1px solid #31597c; border-radius: 5px; background: #0d2132; font-size: 8px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.engine-badge.s3-preset { color: var(--accent); border-color: #2b6248; background: #0c281c; }
+.engine-badge.rclone { color: #d0b5ff; border-color: #5a427c; background: #1c1429; }
+.dynamic-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px 9px; }
+.dynamic-fields label:only-child { grid-column: 1 / -1; }
 .repository-preview { display: grid; gap: 7px; padding: 11px 12px; border: 1px solid #29483c; border-radius: 8px; background: #081812; }
 .repository-preview span { color: var(--accent); font-size: 9px; font-weight: 800; letter-spacing: .12em; }
 .repository-preview small { color: var(--muted-light); font-size: 10px; line-height: 1.5; }
@@ -436,7 +448,7 @@ td small { margin-top: 4px; color: var(--muted-light); font-size: 10px; }
 
 @media (max-width: 520px) {
   .login-card { padding: 30px 23px; }
-  .metric-grid, .form-row { grid-template-columns: 1fr; }
+  .metric-grid, .form-row, .dynamic-fields { grid-template-columns: 1fr; }
   .topbar { display: block; }
   .topbar-status { margin-top: 11px; }
   .overview-strip { align-items: flex-start; }

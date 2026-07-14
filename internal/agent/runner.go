@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -61,6 +62,7 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 		args = append(args, "--exclude", pattern)
 	}
 	args = append(args, paths...)
+	args = resticArguments(project.Repository, args...)
 
 	command := exec.CommandContext(ctx, r.resticPath, args...)
 	command.Env = repositoryEnvironment(project.Repository)
@@ -131,7 +133,7 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 
 func (r *Runner) ensureRepository(ctx context.Context, repository domain.Repository) *RunResult {
 	environment := repositoryEnvironment(repository)
-	exitCode, output, err := runCommand(ctx, environment, r.resticPath, "snapshots", "--json")
+	exitCode, output, err := runCommand(ctx, environment, r.resticPath, resticArguments(repository, "snapshots", "--json")...)
 	if err == nil && exitCode == 0 {
 		return nil
 	}
@@ -145,7 +147,7 @@ func (r *Runner) ensureRepository(ctx context.Context, repository domain.Reposit
 		}
 		return &RunResult{Status: domain.RunFailed, ErrorCode: "repository_unavailable", ErrorMessage: redact(truncate(message, 4096), repository)}
 	}
-	exitCode, output, err = runCommand(ctx, environment, r.resticPath, "init")
+	exitCode, output, err = runCommand(ctx, environment, r.resticPath, resticArguments(repository, "init")...)
 	if err != nil || exitCode != 0 {
 		if output == "" && err != nil {
 			output = err.Error()
@@ -469,6 +471,19 @@ func repositoryEnvironment(repository domain.Repository) []string {
 	overrides["RESTIC_REPOSITORY"] = repository.URL
 	overrides["RESTIC_PASSWORD"] = repository.Password
 	return overrideEnvironment(os.Environ(), overrides)
+}
+
+func resticArguments(repository domain.Repository, args ...string) []string {
+	keys := make([]string, 0, len(repository.Options))
+	for key := range repository.Options {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]string, 0, len(args)+len(keys)*2)
+	for _, key := range keys {
+		result = append(result, "-o", key+"="+repository.Options[key])
+	}
+	return append(result, args...)
 }
 
 func overrideEnvironment(base []string, overrides map[string]string) []string {

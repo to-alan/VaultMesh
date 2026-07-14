@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,6 +198,44 @@ func TestRunnerInitializesMissingRepositoryBeforeBackup(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("repository was not initialized: %v", err)
+	}
+}
+
+func TestRunnerPassesValidatedRepositoryOptionsToEveryResticCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell script")
+	}
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "arguments.log")
+	t.Setenv("FAKE_RESTIC_LOG", logPath)
+	restic := filepath.Join(directory, "fake-restic")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"$FAKE_RESTIC_LOG\"\n" +
+		"case \" $* \" in\n" +
+		"  *' snapshots --json '*) printf '%s\\n' '[]'; exit 0;;\n" +
+		"  *' backup '*) printf '%s\\n' '{\"message_type\":\"summary\",\"snapshot_id\":\"options123\"}'; exit 0;;\n" +
+		"esac\n" +
+		"exit 12\n"
+	if err := os.WriteFile(restic, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.AgentProject{
+		Project: domain.Project{ID: "prj", Sources: []domain.Source{{Type: "files", Paths: []string{"/tmp"}}}},
+		Repository: domain.Repository{ID: "repo", URL: "s3:https://example.invalid/bucket", Password: "secret", Options: map[string]string{
+			"s3.bucket-lookup": "path",
+		}},
+	}
+	result := NewRunner(restic).Execute(context.Background(), "srv", project)
+	if result.Status != domain.RunSucceeded {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	arguments, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(arguments)
+	if !strings.Contains(text, "-o s3.bucket-lookup=path snapshots --json") || !strings.Contains(text, "-o s3.bucket-lookup=path backup") {
+		t.Fatalf("repository options were not passed to all Restic commands:\n%s", text)
 	}
 }
 

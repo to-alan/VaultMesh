@@ -562,6 +562,7 @@ func publicRepository(repository domain.Repository) domain.Repository {
 	repository.SecretCiphertext = nil
 	repository.Password = ""
 	repository.Environment = nil
+	repository.Options = nil
 	return repository
 }
 

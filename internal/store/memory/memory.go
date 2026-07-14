@@ -359,6 +359,7 @@ func cloneAdminAccount(account domain.AdminAccount) domain.AdminAccount {
 func publicRepository(repository domain.Repository) domain.Repository {
 	repository.Password = ""
 	repository.Environment = nil
+	repository.Options = nil
 	repository.SecretCiphertext = nil
 	return repository
 }
@@ -367,6 +368,9 @@ func cloneRepository(repository domain.Repository) domain.Repository {
 	repository.SecretCiphertext = append([]byte(nil), repository.SecretCiphertext...)
 	if repository.Environment != nil {
 		repository.Environment = cloneMap(repository.Environment)
+	}
+	if repository.Options != nil {
+		repository.Options = cloneMap(repository.Options)
 	}
 	return repository
 }

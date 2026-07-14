@@ -62,8 +62,9 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 		URL:         "s3:http://localhost:9000/backups/server",
 		Password:    "repository-password",
 		Environment: map[string]string{"AWS_ACCESS_KEY_ID": "vaultmesh", "AWS_SECRET_ACCESS_KEY": "secret"},
+		Options:     map[string]string{"s3.bucket-lookup": "path"},
 	}, http.StatusCreated, &repository)
-	if repository.ID == "" || repository.Password != "" || repository.Environment != nil {
+	if repository.ID == "" || repository.Password != "" || repository.Environment != nil || repository.Options != nil {
 		t.Fatalf("repository response leaked or omitted data: %#v", repository)
 	}
 
@@ -91,6 +92,9 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 	}
 	if config.Projects[0].Repository.Password != "repository-password" {
 		t.Fatalf("repository secret was not delivered to the assigned agent")
+	}
+	if config.Projects[0].Repository.Options["s3.bucket-lookup"] != "path" {
+		t.Fatalf("repository backend options were not delivered to the assigned agent: %#v", config.Projects[0].Repository.Options)
 	}
 	if !strings.HasSuffix(config.Projects[0].Repository.URL, "/"+identity.AgentID) {
 		t.Fatalf("repository channel was not scoped to its assigned server: %s", config.Projects[0].Repository.URL)

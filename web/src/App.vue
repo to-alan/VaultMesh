@@ -1,6 +1,18 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { APIError, api, getAPIBaseURL } from './api'
+import {
+  buildRepositoryEnvironment,
+  buildRepositoryOptions,
+  buildRepositoryURL as buildRepositoryTarget,
+  engineLabel,
+  missingRepositoryFields,
+  repositoryDefaults,
+  repositoryFieldVisible,
+  repositoryProvider,
+  repositoryProviderGroups,
+  repositoryProviders,
+} from './repositories'
 import type { Dashboard, EnrollmentResult, Passkey, Profile, Project, Repository, Run, Server } from './types'
 
 type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'runs' | 'profile'
@@ -76,17 +88,11 @@ const securityForm = reactive({ password: '', code: '' })
 
 const serverForm = reactive({ name: '' })
 const repositoryForm = reactive({
-  provider: 'cloudflare_r2' as 'cloudflare_r2' | 's3_compatible',
+  provider: 'cloudflare_r2',
   name: '',
-  account_id: '',
-  jurisdiction: 'default' as 'default' | 'eu' | 'fedramp',
-  endpoint: '',
-  bucket: '',
   prefix: 'vaultmesh',
   password: '',
-  access_key: '',
-  secret_key: '',
-  region: 'auto',
+  values: repositoryDefaults('cloudflare_r2') as Record<string, string>,
 })
 const projectForm = reactive({
   server_id: '',
@@ -102,11 +108,17 @@ const projectForm = reactive({
   max_runtime_hours: 6,
 })
 
-const repositoryURL = computed(buildRepositoryURL)
+const activeRepositoryProvider = computed(() => repositoryProvider(repositoryForm.provider))
+const repositoryFields = computed(() => activeRepositoryProvider.value.fields.filter((field) => repositoryFieldVisible(field, repositoryForm.values)))
+const repositoryURL = computed(() => buildRepositoryTarget(repositoryForm.provider, repositoryForm.values, repositoryForm.prefix))
+const repositoryMissing = computed(() => missingRepositoryFields(repositoryForm.provider, repositoryForm.values))
 const repositoryReady = computed(() => Boolean(
-  repositoryForm.name.trim() && repositoryURL.value && repositoryForm.password &&
-  repositoryForm.access_key && repositoryForm.secret_key,
+  repositoryForm.name.trim() && repositoryURL.value && repositoryForm.password && !repositoryMissing.value.length,
 ))
+
+watch(() => repositoryForm.provider, (provider) => {
+  repositoryForm.values = repositoryDefaults(provider)
+})
 
 const projectNames = computed(() => new Map(projects.value.map((project) => [project.id, project.name])))
 const projectCron = computed(buildProjectCron)
@@ -531,11 +543,7 @@ async function createServer() {
 
 async function createRepository() {
   await perform(async () => {
-    if (!repositoryReady.value) throw new Error('请完整填写仓库、Bucket 和访问凭据')
-    const environment: Record<string, string> = {}
-    if (repositoryForm.access_key) environment.AWS_ACCESS_KEY_ID = repositoryForm.access_key
-    if (repositoryForm.secret_key) environment.AWS_SECRET_ACCESS_KEY = repositoryForm.secret_key
-    if (repositoryForm.region) environment.AWS_DEFAULT_REGION = repositoryForm.region
+    if (!repositoryReady.value) throw new Error(`请完成仓库配置${repositoryMissing.value.length ? `：${repositoryMissing.value.join('、')}` : ''}`)
     await api<Repository>('/api/v1/repositories', {
       method: 'POST',
       body: JSON.stringify({
@@ -543,17 +551,14 @@ async function createRepository() {
         name: repositoryForm.name,
         url: repositoryURL.value,
         password: repositoryForm.password,
-        environment,
+        environment: buildRepositoryEnvironment(repositoryForm.provider, repositoryForm.values),
+        options: buildRepositoryOptions(repositoryForm.provider, repositoryForm.values),
       }),
     })
     repositoryForm.name = ''
-    repositoryForm.account_id = ''
-    repositoryForm.endpoint = ''
-    repositoryForm.bucket = ''
     repositoryForm.prefix = 'vaultmesh'
     repositoryForm.password = ''
-    repositoryForm.access_key = ''
-    repositoryForm.secret_key = ''
+    repositoryForm.values = repositoryDefaults(repositoryForm.provider)
     await loadAll()
     success.value = '独立备份仓库已加密保存，可分配给任意服务器上的项目。'
   })
@@ -646,21 +651,6 @@ function changeSourceType(source: ProjectSourceDraft) {
   source.port = source.type === 'mysql' ? 3306 : source.type === 'postgresql' ? 5432 : 0
 }
 
-function buildRepositoryURL(): string {
-  const bucket = repositoryForm.bucket.trim()
-  if (!bucket) return ''
-  let endpoint = repositoryForm.endpoint.trim().replace(/\/+$/, '')
-  if (repositoryForm.provider === 'cloudflare_r2') {
-    const accountID = repositoryForm.account_id.trim()
-    if (!accountID) return ''
-    const jurisdiction = repositoryForm.jurisdiction === 'default' ? '' : `.${repositoryForm.jurisdiction}`
-    endpoint = `https://${accountID}${jurisdiction}.r2.cloudflarestorage.com`
-  }
-  if (!/^https?:\/\//.test(endpoint)) return ''
-  const prefix = repositoryForm.prefix.trim().replace(/^\/+|\/+$/g, '')
-  return `s3:${endpoint}/${bucket}${prefix ? `/${prefix}` : ''}`
-}
-
 function generateRepositoryPassword() {
   error.value = ''
   const bytes = crypto.getRandomValues(new Uint8Array(32))
@@ -672,7 +662,8 @@ function checkRepositoryConfiguration() {
   error.value = ''
   success.value = ''
   if (!repositoryReady.value) {
-    error.value = '配置尚不完整：请检查名称、Account ID/Endpoint、Bucket、仓库密码和访问密钥。'
+    const missing = repositoryMissing.value.length ? ` 缺少：${repositoryMissing.value.join('、')}。` : ''
+    error.value = `配置尚不完整：请检查渠道名称、仓库密码与目标地址。${missing}`
     return
   }
   success.value = `配置格式有效，Restic 目标为 ${repositoryURL.value}`
@@ -810,7 +801,7 @@ function repositoryUsageCount(id: string): number {
 }
 
 function providerLabel(provider: Repository['provider']): string {
-  return provider === 'cloudflare_r2' ? 'Cloudflare R2' : 'S3 兼容存储'
+  return repositoryProvider(provider).label
 }
 
 function sourceTypeLabel(type: SourceType): string {
@@ -1134,13 +1125,13 @@ onBeforeUnmount(() => {
 
       <template v-else-if="activeTab === 'repositories'">
         <section class="panel repository-guide">
-          <div class="panel-heading"><div><p class="eyebrow">CLOUDFLARE R2 ONBOARDING</p><h2>先在 Cloudflare 创建专用凭据</h2></div><a class="doc-link" href="https://dash.cloudflare.com/?to=/:account/r2/api-tokens" target="_blank" rel="noreferrer">打开 R2 API Tokens ↗</a></div>
+          <div class="panel-heading"><div><p class="eyebrow">INDUSTRY-BACKED STORAGE MODEL</p><h2>仓库类型来自成熟项目的真实实现</h2></div><span class="sample-size">{{ repositoryProviders.length }} TYPES</span></div>
           <div class="guide-steps">
-            <article><span>1</span><div><strong>创建 Bucket</strong><small>Storage &amp; databases → R2 → Create bucket。建议每个环境使用独立 Bucket。</small></div></article>
-            <article><span>2</span><div><strong>创建 R2 API Token</strong><small>选择 Object Read &amp; Write，并限制到这个 Bucket；Restic 初始化、备份和清理都需要读写权限。</small></div></article>
-            <article><span>3</span><div><strong>只复制一次凭据</strong><small>保存 Access Key ID、Secret Access Key 和 Account ID。Secret 创建后无法再次查看。</small></div></article>
+            <article><span>1</span><div><strong>Restic 是协议标准</strong><small>VaultMesh 的执行引擎就是 Restic，因此原生后端、URL 格式和环境变量以官方文档为准。</small><a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noreferrer">官方后端列表 ↗</a></div></article>
+            <article><span>2</span><div><strong>1Panel 提供产品字段参考</strong><small>S3、OSS、COS、SFTP、WebDAV 与网盘的字段分组参考其公开实现，不凭空发明表单。</small><a href="https://github.com/1Panel-dev/1Panel/blob/dev-v2/frontend/src/views/setting/backup-account/operate/index.vue" target="_blank" rel="noreferrer">查看源码 ↗</a></div></article>
+            <article><span>3</span><div><strong>Kopia 用于交叉验证</strong><small>用另一套成熟备份系统核对 S3、Azure、B2、GCS、SFTP、WebDAV 与 rclone 的分类边界。</small><a href="https://kopia.io/docs/repositories/" target="_blank" rel="noreferrer">仓库文档 ↗</a></div></article>
           </div>
-          <p class="guide-note">R2 不是 AWS S3，但提供 S3 兼容 API。VaultMesh 使用标准 S3 凭据和 Restic S3 后端连接，R2 的 Region 固定使用 <code>auto</code>。</p>
+          <p class="guide-note">没有跨所有备份软件的“万能表单”：SFTP、S3、Swift、Azure 和 OAuth 网盘的认证模型不同。VaultMesh 采用统一的三层模板：<code>Restic 原生协议</code>、<code>S3 厂商预设</code>、<code>rclone 扩展</code>。</p>
         </section>
         <div class="content-grid repository-grid">
           <section class="panel">
@@ -1150,17 +1141,15 @@ onBeforeUnmount(() => {
           </section>
           <aside class="panel form-panel wide-form"><p class="eyebrow">NEW STORAGE CHANNEL</p><h2>添加备份仓库</h2><p class="form-intro">仓库是全局存储渠道，不绑定服务器。创建项目时再选择由哪个 Agent 写入。</p>
             <form @submit.prevent="createRepository">
-              <div class="form-row"><label>存储类型<select v-model="repositoryForm.provider"><option value="cloudflare_r2">Cloudflare R2</option><option value="s3_compatible">其他 S3 兼容存储</option></select></label><label>渠道名称<input v-model="repositoryForm.name" required maxlength="100" placeholder="生产环境 R2" /></label></div>
-              <template v-if="repositoryForm.provider === 'cloudflare_r2'">
-                <div class="form-row"><label>Cloudflare Account ID<input v-model.trim="repositoryForm.account_id" required maxlength="64" autocomplete="off" placeholder="32 位 Account ID" /></label><label>数据管辖区<select v-model="repositoryForm.jurisdiction"><option value="default">默认 / Global</option><option value="eu">European Union (EU)</option><option value="fedramp">FedRAMP</option></select></label></div>
-              </template>
-              <label v-else>S3 Endpoint<input v-model.trim="repositoryForm.endpoint" required placeholder="https://s3.example.com" /></label>
-              <div class="form-row"><label>Bucket<input v-model.trim="repositoryForm.bucket" required placeholder="vaultmesh-backups" /></label><label>仓库目录前缀<input v-model.trim="repositoryForm.prefix" placeholder="vaultmesh" /><small class="field-help">可留空；用于在 Bucket 内隔离 Restic 数据。</small></label></div>
+              <div class="form-row"><label>存储类型<select v-model="repositoryForm.provider"><optgroup v-for="group in repositoryProviderGroups" :key="group" :label="group"><option v-for="provider in repositoryProviders.filter((item) => item.group === group)" :key="provider.id" :value="provider.id">{{ provider.label }}</option></optgroup></select></label><label>渠道名称<input v-model="repositoryForm.name" required maxlength="100" :placeholder="`${activeRepositoryProvider.label} · 生产环境`" /></label></div>
+              <div class="repository-kind"><div><span class="engine-badge" :class="activeRepositoryProvider.engine">{{ engineLabel(activeRepositoryProvider.engine) }}</span><strong>{{ activeRepositoryProvider.label }}</strong></div><p>{{ activeRepositoryProvider.summary }}</p><small v-if="activeRepositoryProvider.warning">{{ activeRepositoryProvider.warning }}</small></div>
+              <div class="dynamic-fields">
+                <label v-for="field in repositoryFields" :key="field.key">{{ field.label }}<select v-if="field.type === 'select'" v-model="repositoryForm.values[field.key]" :required="field.required"><option v-for="option in field.options" :key="option.value" :value="option.value">{{ option.label }}</option></select><input v-else v-model="repositoryForm.values[field.key]" :type="field.type" :required="field.required" :placeholder="field.placeholder" :autocomplete="field.type === 'password' ? 'new-password' : 'off'" /><small v-if="field.help" class="field-help">{{ field.help }}</small></label>
+              </div>
+              <label v-if="!['local', 'sftp'].includes(repositoryForm.provider) && activeRepositoryProvider.engine !== 'rclone'">仓库目录前缀<input v-model.trim="repositoryForm.prefix" placeholder="vaultmesh" /><small class="field-help">可留空；用于在 Bucket、Container 或 REST 服务内隔离 VaultMesh 数据。</small></label>
               <div class="repository-preview"><span>RESTIC CHANNEL BASE</span><code>{{ repositoryURL || '填写 Account ID / Endpoint 与 Bucket 后自动生成' }}</code><small>下发给 Agent 时自动追加 <code>/&lt;server-id&gt;</code>，同一渠道中的不同服务器使用独立 Restic 仓库路径。</small></div>
-              <div class="form-row"><label>Access Key ID<input v-model.trim="repositoryForm.access_key" required autocomplete="off" /></label><label>Secret Access Key<input v-model="repositoryForm.secret_key" required type="password" autocomplete="new-password" /></label></div>
-              <label>Region<input v-model="repositoryForm.region" required :readonly="repositoryForm.provider === 'cloudflare_r2'" placeholder="auto" /><small class="field-help">Cloudflare R2 使用 <code>auto</code>；其他厂商按其 S3 文档填写。</small></label>
-              <label>Restic 仓库密码<div class="field-action"><input v-model="repositoryForm.password" type="password" required autocomplete="new-password" /><button type="button" class="ghost" @click="generateRepositoryPassword">安全生成</button></div><small class="field-help">它用于 Restic 端到端加密，和 R2 Secret Key 不是同一个密码；丢失后无法恢复快照。</small></label>
-              <div class="form-actions"><button type="button" class="ghost" @click="checkRepositoryConfiguration">检查配置</button><button class="primary" :disabled="loading || !repositoryReady">加密并保存渠道</button></div>
+              <label>Restic 仓库密码<div class="field-action"><input v-model="repositoryForm.password" type="password" required autocomplete="new-password" /><button type="button" class="ghost" @click="generateRepositoryPassword">安全生成</button></div><small class="field-help">它用于 Restic 端到端加密，和云存储密钥不是同一个密码；丢失后无法恢复快照。</small></label>
+              <div class="form-actions"><button type="button" class="ghost" @click="checkRepositoryConfiguration">校验并预览</button><button class="primary" :disabled="loading || !repositoryReady">加密并保存渠道</button></div>
             </form>
           </aside>
         </div>

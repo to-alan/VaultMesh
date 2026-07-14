@@ -56,11 +56,14 @@ Content-Type: application/json
     "AWS_ACCESS_KEY_ID": "...",
     "AWS_SECRET_ACCESS_KEY": "...",
     "AWS_DEFAULT_REGION": "auto"
+  },
+  "options": {
+    "s3.bucket-lookup": "path"
   }
 }
 ```
 
-Storage channels are global and are not bound to a server. When a project is delivered to an Agent, the Control Plane appends `/<server-id>` to the base URL so each server gets an isolated Restic repository path. Secrets are AES-256-GCM encrypted before being written to the metadata store, and the response never returns them. Use `provider: "s3_compatible"` with the vendor endpoint for MinIO or another compatible service.
+Storage channels are global and are not bound to a server. When a project is delivered to an Agent, the Control Plane appends `/<server-id>` to the base URL so each server gets an isolated Restic repository path. Passwords, environment credentials, and approved backend options are AES-256-GCM encrypted before being written to the metadata store, and the response never returns them. Supported provider identifiers and exact fields are documented in [Storage providers](./STORAGE_PROVIDERS.md).
 
 ## Create a file project
 

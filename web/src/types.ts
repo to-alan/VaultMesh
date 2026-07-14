@@ -23,7 +23,7 @@ export interface Server {
 
 export interface Repository {
   id: string
-  provider: 'cloudflare_r2' | 's3_compatible'
+  provider: string
   name: string
   url: string
   created_at: string

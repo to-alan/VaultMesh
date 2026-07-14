@@ -37,6 +37,7 @@ type Repository struct {
 	URL              string            `json:"url"`
 	Password         string            `json:"password,omitempty"`
 	Environment      map[string]string `json:"environment,omitempty"`
+	Options          map[string]string `json:"options,omitempty"`
 	SecretCiphertext []byte            `json:"-"`
 	CreatedAt        time.Time         `json:"created_at"`
 }
