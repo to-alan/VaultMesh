@@ -30,7 +30,7 @@ Adding or deleting a passkey requires an administrator session authenticated wit
 
 The API service does not serve the Web application. Configure the independently deployed, same-site Web origin in `VAULTMESH_ALLOWED_ORIGINS` and set the Web container's `VAULTMESH_API_BASE_URL` to the browser-visible API URL. Origins are matched exactly, credentialed CORS is enabled only for those origins, and wildcard CORS is intentionally unsupported.
 
-Passkeys additionally use `VAULTMESH_WEBAUTHN_RP_ID`, `VAULTMESH_WEBAUTHN_RP_ORIGINS`, and `VAULTMESH_WEBAUTHN_RP_NAME`. If omitted, RP ID/origins are derived from the first allowed Web origin. The RP ID is a hostname without scheme or port, and changing it after passkeys are enrolled makes those credentials unusable.
+Passkeys additionally use `VAULTMESH_WEBAUTHN_RP_ID`, `VAULTMESH_WEBAUTHN_RP_ORIGINS`, and `VAULTMESH_WEBAUTHN_RP_NAME`. If omitted, RP ID/origins are derived from the first allowed Web origin. The RP ID must be a domain name without scheme or port; IP addresses are invalid. Local HTTP development must use `localhost`, while production requires an HTTPS domain. Changing the RP ID after passkeys are enrolled makes those credentials unusable.
 
 ## Create a server and enrollment token
 

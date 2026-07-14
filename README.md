@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh |
 ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 user@your-server
 ```
 
-然后浏览器打开 `http://127.0.0.1:3000`，使用脚本输出的用户名和密码登录。生产环境应配置可信 HTTPS 反向代理，把 Web Origin 精确写入 `VAULTMESH_ALLOWED_ORIGINS`，把浏览器可访问的 API URL 写入 `VAULTMESH_PUBLIC_API_URL`，并设置 `VAULTMESH_COOKIE_SECURE=true`。
+然后浏览器打开 `http://localhost:3000`，使用脚本输出的用户名和密码登录。生产环境应配置可信 HTTPS 反向代理，把 Web Origin 精确写入 `VAULTMESH_ALLOWED_ORIGINS`，把浏览器可访问的 API URL 写入 `VAULTMESH_PUBLIC_API_URL`，并设置 `VAULTMESH_COOKIE_SECURE=true`。
 
 如果不希望直接执行远程脚本，可先下载审阅：
 
@@ -94,7 +94,7 @@ VAULTMESH_WEBAUTHN_RP_ORIGINS=https://vaultmesh.example.com
 VAULTMESH_WEBAUTHN_RP_NAME=VaultMesh
 ```
 
-`RP_ID` 只能是主机名，不能包含协议和端口。除浏览器对 `localhost`/`127.0.0.1` 的安全上下文例外外，生产通行密钥必须部署在 HTTPS 下。
+`RP_ID` 必须是域名格式，不能是 IP 地址，也不能包含协议或端口。本地 HTTP 通行密钥必须通过 `localhost` 访问；生产环境必须部署在 HTTPS 域名下。
 
 ## 本地开发
 
@@ -104,7 +104,7 @@ VAULTMESH_WEBAUTHN_RP_NAME=VaultMesh
 export VAULTMESH_ADMIN_USERNAME="admin"
 export VAULTMESH_ADMIN_PASSWORD="$(openssl rand -hex 16)"
 export VAULTMESH_MASTER_KEY="$(openssl rand -base64 32)"
-export VAULTMESH_ALLOWED_ORIGINS="http://127.0.0.1:5173"
+export VAULTMESH_ALLOWED_ORIGINS="http://localhost:5173"
 export VAULTMESH_COOKIE_SECURE="false"
 # 未显式设置时，WebAuthn RP ID/Origin 会从 ALLOWED_ORIGINS 推导。
 make build

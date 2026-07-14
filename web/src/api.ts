@@ -1,5 +1,5 @@
 const configuredAPIBase = window.__VAULTMESH_CONFIG__?.apiBaseUrl || import.meta.env.VITE_API_BASE_URL
-const developmentAPIBase = import.meta.env.DEV ? 'http://127.0.0.1:8080' : ''
+const developmentAPIBase = import.meta.env.DEV ? 'http://localhost:8080' : ''
 const apiBaseURL = normalizeAPIBase(configuredAPIBase || developmentAPIBase)
 
 export class APIError extends Error {

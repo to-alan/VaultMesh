@@ -59,8 +59,8 @@ jobs:
       VAULTMESH_ADMIN_USERNAME: admin
       VAULTMESH_ADMIN_PASSWORD: vaultmesh-ci-administrator-password
       VAULTMESH_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-      VAULTMESH_ALLOWED_ORIGINS: http://127.0.0.1:3000
-      VAULTMESH_PUBLIC_API_URL: http://127.0.0.1:8080
+      VAULTMESH_ALLOWED_ORIGINS: http://localhost:3000
+      VAULTMESH_PUBLIC_API_URL: http://localhost:8080
     steps:
       - uses: actions/checkout@v7
       - run: sh -n install.sh

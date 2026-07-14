@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -75,8 +76,8 @@ func LoadServer() (Server, error) {
 			return Server{}, fmt.Errorf("VAULTMESH_WEBAUTHN_RP_ORIGINS contains %q: %w", origin, err)
 		}
 	}
-	if strings.Contains(config.WebAuthnRPID, "://") || strings.ContainsAny(config.WebAuthnRPID, "/:") {
-		return Server{}, fmt.Errorf("VAULTMESH_WEBAUTHN_RP_ID must be a hostname without scheme, path, or port")
+	if strings.Contains(config.WebAuthnRPID, "://") || strings.ContainsAny(config.WebAuthnRPID, "/:") || net.ParseIP(config.WebAuthnRPID) != nil {
+		return Server{}, fmt.Errorf("VAULTMESH_WEBAUTHN_RP_ID must be a domain name without scheme, path, or port; IP addresses are not valid WebAuthn RP IDs")
 	}
 	return config, nil
 }

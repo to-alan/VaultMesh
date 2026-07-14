@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestLoadServerUsesUsernamePasswordAndStrictBooleanConfiguration(t *testing.T) {
 	t.Setenv("VAULTMESH_ADMIN_USERNAME", "admin")
@@ -44,5 +47,16 @@ func TestSplitListAndValidateOrigin(t *testing.T) {
 		if err := validateOrigin(origin); err == nil {
 			t.Fatalf("expected %q to be invalid", origin)
 		}
+	}
+}
+
+func TestLoadServerRejectsIPAddressWebAuthnRPID(t *testing.T) {
+	t.Setenv("VAULTMESH_ADMIN_USERNAME", "admin")
+	t.Setenv("VAULTMESH_ADMIN_PASSWORD", "correct-horse-battery-staple")
+	t.Setenv("VAULTMESH_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("VAULTMESH_ALLOWED_ORIGINS", "http://127.0.0.1:5173")
+
+	if _, err := LoadServer(); err == nil || !strings.Contains(err.Error(), "IP addresses are not valid") {
+		t.Fatalf("expected an IP-address RP ID error, got %v", err)
 	}
 }

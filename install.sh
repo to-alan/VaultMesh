@@ -52,8 +52,8 @@ VAULTMESH_COOKIE_SECURE=false
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 VAULTMESH_API_PORT=8080
 VAULTMESH_WEB_PORT=3000
-VAULTMESH_PUBLIC_API_URL=http://127.0.0.1:8080
-VAULTMESH_ALLOWED_ORIGINS=http://127.0.0.1:3000
+VAULTMESH_PUBLIC_API_URL=http://localhost:8080
+VAULTMESH_ALLOWED_ORIGINS=http://localhost:3000
 EOF
 	chmod 600 "$INSTALL_DIR/.env"
 	generated_credentials=true
@@ -70,6 +70,12 @@ else
 	if ! grep -q '^VAULTMESH_COOKIE_SECURE=.' "$INSTALL_DIR/.env"; then
 		printf 'VAULTMESH_COOKIE_SECURE=false\n' >>"$INSTALL_DIR/.env"
 	fi
+	# WebAuthn RP IDs must be domain strings. Migrate the former loopback-IP
+	# defaults while preserving any custom deployment values.
+	sed -i 's|^VAULTMESH_PUBLIC_API_URL=http://127\.0\.0\.1:8080$|VAULTMESH_PUBLIC_API_URL=http://localhost:8080|' "$INSTALL_DIR/.env"
+	sed -i 's|^VAULTMESH_ALLOWED_ORIGINS=http://127\.0\.0\.1:3000$|VAULTMESH_ALLOWED_ORIGINS=http://localhost:3000|' "$INSTALL_DIR/.env"
+	sed -i 's|^VAULTMESH_WEBAUTHN_RP_ID=127\.0\.0\.1$|VAULTMESH_WEBAUTHN_RP_ID=localhost|' "$INSTALL_DIR/.env"
+	sed -i 's|^VAULTMESH_WEBAUTHN_RP_ORIGINS=http://127\.0\.0\.1:3000$|VAULTMESH_WEBAUTHN_RP_ORIGINS=http://localhost:3000|' "$INSTALL_DIR/.env"
 	chmod 600 "$INSTALL_DIR/.env"
 fi
 
@@ -77,8 +83,8 @@ printf '构建并启动 VaultMesh…\n'
 docker compose --file "$INSTALL_DIR/compose.yaml" --project-directory "$INSTALL_DIR" up -d --build
 
 printf '\nVaultMesh 已启动。\n'
-printf 'Web：http://127.0.0.1:3000\n'
-printf 'API：http://127.0.0.1:8080\n'
+printf 'Web：http://localhost:3000\n'
+printf 'API：http://localhost:8080\n'
 if [ "$generated_credentials" = true ]; then
 	printf '用户名：%s\n' "$ADMIN_USERNAME"
 	printf '密码：%s\n' "$ADMIN_PASSWORD"
