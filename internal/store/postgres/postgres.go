@@ -282,6 +282,10 @@ func (s *Store) CreateProject(ctx context.Context, project domain.Project) (doma
 	if err != nil {
 		return domain.Project{}, err
 	}
+	policy, err := json.Marshal(project.Policy)
+	if err != nil {
+		return domain.Project{}, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return domain.Project{}, err
@@ -306,10 +310,10 @@ func (s *Store) CreateProject(ctx context.Context, project domain.Project) (doma
 	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO projects
-		(id, server_id, repository_id, name, enabled, sources, schedule, revision, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, project.ID,
+		(id, server_id, repository_id, name, enabled, sources, schedule, policy, revision, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`, project.ID,
 		project.ServerID, project.RepositoryID, project.Name, project.Enabled, sources,
-		schedule, project.Revision, project.CreatedAt, project.UpdatedAt)
+		schedule, policy, project.Revision, project.CreatedAt, project.UpdatedAt)
 	if err != nil {
 		return domain.Project{}, mapError(err)
 	}
@@ -321,7 +325,7 @@ func (s *Store) CreateProject(ctx context.Context, project domain.Project) (doma
 
 func (s *Store) ListProjects(ctx context.Context) ([]domain.Project, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, server_id, repository_id, name, enabled, sources, schedule,
+		SELECT id, server_id, repository_id, name, enabled, sources, schedule, policy,
 		       revision, created_at, updated_at
 		FROM projects ORDER BY created_at`)
 	if err != nil {
@@ -339,6 +343,51 @@ func (s *Store) ListProjects(ctx context.Context) ([]domain.Project, error) {
 	return result, rows.Err()
 }
 
+func (s *Store) SetProjectEnabled(ctx context.Context, id string, enabled bool, updatedAt time.Time) (domain.Project, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Project{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var serverID string
+	var current bool
+	if err := tx.QueryRow(ctx, `SELECT server_id, enabled FROM projects WHERE id = $1 FOR UPDATE`, id).Scan(&serverID, &current); errors.Is(err, pgx.ErrNoRows) {
+		return domain.Project{}, store.ErrNotFound
+	} else if err != nil {
+		return domain.Project{}, err
+	}
+	if current == enabled {
+		project, err := scanProject(tx.QueryRow(ctx, `
+			SELECT id, server_id, repository_id, name, enabled, sources, schedule, policy,
+			       revision, created_at, updated_at FROM projects WHERE id = $1`, id))
+		if err != nil {
+			return domain.Project{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return domain.Project{}, err
+		}
+		return project, nil
+	}
+	var revision int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE servers SET desired_revision = desired_revision + 1
+		WHERE id = $1 RETURNING desired_revision`, serverID).Scan(&revision); err != nil {
+		return domain.Project{}, err
+	}
+	project, err := scanProject(tx.QueryRow(ctx, `
+		UPDATE projects SET enabled = $2, revision = $3, updated_at = $4
+		WHERE id = $1
+		RETURNING id, server_id, repository_id, name, enabled, sources, schedule, policy,
+		          revision, created_at, updated_at`, id, enabled, revision, updatedAt))
+	if err != nil {
+		return domain.Project{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Project{}, err
+	}
+	return project, nil
+}
+
 func (s *Store) DesiredConfig(ctx context.Context, serverID string) (domain.AgentConfig, error) {
 	var revision int64
 	if err := s.pool.QueryRow(ctx, `SELECT desired_revision FROM servers WHERE id = $1`, serverID).Scan(&revision); errors.Is(err, pgx.ErrNoRows) {
@@ -348,7 +397,7 @@ func (s *Store) DesiredConfig(ctx context.Context, serverID string) (domain.Agen
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT p.id, p.server_id, p.repository_id, p.name, p.enabled, p.sources,
-		       p.schedule, p.revision, p.created_at, p.updated_at,
+		       p.schedule, p.policy, p.revision, p.created_at, p.updated_at,
 		       r.id, r.provider, r.name, r.url, r.secret_ciphertext, r.created_at
 		FROM projects p
 		JOIN repositories r ON r.id = p.repository_id
@@ -361,9 +410,9 @@ func (s *Store) DesiredConfig(ctx context.Context, serverID string) (domain.Agen
 	config := domain.AgentConfig{Revision: revision}
 	for rows.Next() {
 		var item domain.AgentProject
-		var sources, schedule []byte
+		var sources, schedule, policy []byte
 		if err := rows.Scan(&item.ID, &item.ServerID, &item.RepositoryID, &item.Project.Name,
-			&item.Enabled, &sources, &schedule, &item.Revision, &item.Project.CreatedAt,
+			&item.Enabled, &sources, &schedule, &policy, &item.Revision, &item.Project.CreatedAt,
 			&item.Project.UpdatedAt, &item.Repository.ID, &item.Repository.Provider,
 			&item.Repository.Name, &item.Repository.URL, &item.Repository.SecretCiphertext,
 			&item.Repository.CreatedAt); err != nil {
@@ -374,6 +423,9 @@ func (s *Store) DesiredConfig(ctx context.Context, serverID string) (domain.Agen
 		}
 		if err := json.Unmarshal(schedule, &item.Schedule); err != nil {
 			return domain.AgentConfig{}, fmt.Errorf("decode project schedule: %w", err)
+		}
+		if err := json.Unmarshal(policy, &item.Policy); err != nil {
+			return domain.AgentConfig{}, fmt.Errorf("decode project policy: %w", err)
 		}
 		config.Projects = append(config.Projects, item)
 	}
@@ -543,9 +595,9 @@ func getServer(ctx context.Context, tx pgx.Tx, id string) (domain.Server, error)
 
 func scanProject(row scanner) (domain.Project, error) {
 	var project domain.Project
-	var sources, schedule []byte
+	var sources, schedule, policy []byte
 	err := row.Scan(&project.ID, &project.ServerID, &project.RepositoryID, &project.Name,
-		&project.Enabled, &sources, &schedule, &project.Revision, &project.CreatedAt, &project.UpdatedAt)
+		&project.Enabled, &sources, &schedule, &policy, &project.Revision, &project.CreatedAt, &project.UpdatedAt)
 	if err != nil {
 		return domain.Project{}, err
 	}
@@ -553,6 +605,9 @@ func scanProject(row scanner) (domain.Project, error) {
 		return domain.Project{}, err
 	}
 	if err := json.Unmarshal(schedule, &project.Schedule); err != nil {
+		return domain.Project{}, err
+	}
+	if err := json.Unmarshal(policy, &project.Policy); err != nil {
 		return domain.Project{}, err
 	}
 	return project, nil

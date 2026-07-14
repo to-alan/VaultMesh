@@ -73,6 +73,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("POST /api/v1/repositories", s.admin(http.HandlerFunc(s.createRepository)))
 	mux.Handle("GET /api/v1/projects", s.admin(http.HandlerFunc(s.listProjects)))
 	mux.Handle("POST /api/v1/projects", s.admin(http.HandlerFunc(s.createProject)))
+	mux.Handle("PATCH /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.updateProject)))
 	mux.Handle("POST /api/v1/projects/{projectID}/run", s.admin(http.HandlerFunc(s.createManualRun)))
 	mux.Handle("GET /api/v1/runs", s.admin(http.HandlerFunc(s.listRuns)))
 
@@ -258,6 +259,25 @@ func (s *HTTPServer) listProjects(w http.ResponseWriter, r *http.Request) {
 		items[projectIndex] = publicProject(items[projectIndex], now)
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *HTTPServer) updateProject(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	if input.Enabled == nil {
+		s.handleServiceError(w, validationError("enabled", "is required"))
+		return
+	}
+	project, err := s.service.SetProjectEnabled(r.Context(), r.PathValue("projectID"), *input.Enabled)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, project)
 }
 
 func (s *HTTPServer) createManualRun(w http.ResponseWriter, r *http.Request) {

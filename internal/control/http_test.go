@@ -529,11 +529,63 @@ func TestGlobalRepositoryCanBeAssignedToDockerProject(t *testing.T) {
 func TestPublicProjectIncludesNextRunInConfiguredTimezone(t *testing.T) {
 	now := time.Date(2026, time.July, 14, 1, 0, 0, 0, time.UTC)
 	project := publicProject(domain.Project{
+		Enabled:  true,
 		Schedule: domain.Schedule{Cron: "30 2 * * *", Timezone: "Asia/Shanghai"},
 	}, now)
 	want := time.Date(2026, time.July, 14, 18, 30, 0, 0, time.UTC)
 	if project.NextRunAt == nil || !project.NextRunAt.Equal(want) {
 		t.Fatalf("unexpected next run: got %v, want %v", project.NextRunAt, want)
+	}
+}
+
+func TestProjectCanBePausedAndResumed(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	enrollment, err := service.CreateServer(ctx, "Pause host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "pause-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Pause repo", URL: "/tmp/pause-repo", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Pause me",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paused, err := service.SetProjectEnabled(ctx, project.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paused.Enabled || paused.NextRunAt != nil || paused.Revision != 2 {
+		t.Fatalf("unexpected paused project: %#v", paused)
+	}
+	config, err := service.DesiredConfig(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Revision != 2 || len(config.Projects) != 0 {
+		t.Fatalf("paused project is still in desired config: %#v", config)
+	}
+	resumed, err := service.SetProjectEnabled(ctx, project.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumed.Enabled || resumed.NextRunAt == nil || resumed.Revision != 3 {
+		t.Fatalf("unexpected resumed project: %#v", resumed)
 	}
 }
 

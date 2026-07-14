@@ -72,6 +72,11 @@ func TestPostgresVerticalSlice(t *testing.T) {
 		ID: projectID, ServerID: serverID, RepositoryID: repositoryID, Name: "Project", Enabled: true,
 		Sources:  []domain.Source{{ID: "src", Type: "files", Paths: []string{"/etc"}, Required: true}},
 		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"}, CreatedAt: now, UpdatedAt: now,
+		Policy: domain.ProjectPolicy{
+			Backup:       domain.BackupPolicy{OneFileSystem: true, ExcludeIfPresent: []string{".nobackup"}},
+			Retention:    domain.RetentionPolicy{Enabled: true, KeepLast: 3, KeepDaily: 7},
+			Verification: domain.VerificationPolicy{Mode: "subset", ReadDataSubset: "1%"},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -82,6 +87,9 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	config, err := dataStore.DesiredConfig(ctx, serverID)
 	if err != nil || config.Revision != 1 || len(config.Projects) != 1 {
 		t.Fatalf("unexpected config: %#v err=%v", config, err)
+	}
+	if !config.Projects[0].Policy.Backup.OneFileSystem || config.Projects[0].Policy.Retention.KeepDaily != 7 || config.Projects[0].Policy.Verification.ReadDataSubset != "1%" {
+		t.Fatalf("project policy was not persisted: %#v", config.Projects[0].Policy)
 	}
 	_, err = dataStore.CreateCommand(ctx, domain.Command{ID: commandID, ProjectID: projectID, Type: "backup", CreatedAt: now})
 	if err != nil {

@@ -34,6 +34,7 @@ type Store interface {
 
 	CreateProject(context.Context, domain.Project) (domain.Project, error)
 	ListProjects(context.Context) ([]domain.Project, error)
+	SetProjectEnabled(context.Context, string, bool, time.Time) (domain.Project, error)
 	DesiredConfig(context.Context, string) (domain.AgentConfig, error)
 	CreateCommand(context.Context, domain.Command) (domain.Command, error)
 	ClaimCommands(context.Context, string, time.Time, time.Time, int) ([]domain.Command, error)

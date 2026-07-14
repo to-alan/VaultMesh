@@ -106,6 +106,20 @@ const projectForm = reactive({
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
   jitter_minutes: 5,
   max_runtime_hours: 6,
+  one_file_system: true,
+  exclude_caches: true,
+  exclude_if_present: '.nobackup',
+  exclude_larger_than: '',
+  retention_enabled: true,
+  keep_last: 3,
+  keep_hourly: 0,
+  keep_daily: 7,
+  keep_weekly: 4,
+  keep_monthly: 12,
+  keep_yearly: 3,
+  prune: false,
+  verification_mode: 'off' as 'off' | 'metadata' | 'subset' | 'full',
+  read_data_subset: '1%',
 })
 
 const activeRepositoryProvider = computed(() => repositoryProvider(repositoryForm.provider))
@@ -612,6 +626,28 @@ async function createProject() {
           missed_run_policy: 'skip',
           concurrency_policy: 'forbid',
         },
+        policy: {
+          backup: {
+            one_file_system: projectForm.one_file_system,
+            exclude_caches: projectForm.exclude_caches,
+            exclude_if_present: lines(projectForm.exclude_if_present),
+            exclude_larger_than: projectForm.exclude_larger_than.trim(),
+          },
+          retention: {
+            enabled: projectForm.retention_enabled,
+            keep_last: Number(projectForm.keep_last),
+            keep_hourly: Number(projectForm.keep_hourly),
+            keep_daily: Number(projectForm.keep_daily),
+            keep_weekly: Number(projectForm.keep_weekly),
+            keep_monthly: Number(projectForm.keep_monthly),
+            keep_yearly: Number(projectForm.keep_yearly),
+            prune: projectForm.prune,
+          },
+          verification: {
+            mode: projectForm.verification_mode,
+            read_data_subset: projectForm.verification_mode === 'subset' ? projectForm.read_data_subset : '',
+          },
+        },
       }),
     })
     projectForm.name = ''
@@ -688,6 +724,18 @@ async function runNow(project: Project) {
       next.delete(project.id)
       queuedProjectIDs.value = next
     }, 5000)
+  })
+}
+
+async function toggleProject(project: Project) {
+  await perform(async () => {
+    const enabled = !project.enabled
+    await api<Project>(`/api/v1/projects/${encodeURIComponent(project.id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    })
+    await loadAll()
+    success.value = enabled ? `${project.name} 已恢复，Agent 将重新加载执行计划。` : `${project.name} 已暂停，不再接受计划或手动备份。`
   })
 }
 
@@ -823,6 +871,25 @@ function sourceSummary(source: Project['sources'][number]): string {
   return `${sourceTypeLabel(source.type)} · ${database.database}@${database.host}:${database.port}`
 }
 
+function retentionSummary(project: Project): string {
+  const retention = project.policy?.retention
+  if (!retention?.enabled) return '不自动清理'
+  return `最近 ${retention.keep_last || 0} / 日 ${retention.keep_daily || 0} / 周 ${retention.keep_weekly || 0} / 月 ${retention.keep_monthly || 0}`
+}
+
+function verificationSummary(project: Project): string {
+  const verification = project.policy?.verification
+  if (!verification || verification.mode === 'off') return '关闭'
+  if (verification.mode === 'metadata') return '仓库结构'
+  if (verification.mode === 'subset') return `抽样 ${verification.read_data_subset || '—'}`
+  return '完整数据'
+}
+
+function scanSummary(project: Project): string {
+  const backup = project.policy?.backup
+  return `${backup?.one_file_system ? '不跨文件系统' : '允许跨文件系统'} · ${backup?.exclude_caches ? '忽略缓存' : '包含缓存'}`
+}
+
 function cronDescription(cron: string): string {
   const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(cron)
   if (daily) return `每天 ${clock(daily[2], daily[1])}`
@@ -836,6 +903,7 @@ function clock(hour: string, minute: string): string {
 }
 
 function formatNextRun(project: Project): string {
+  if (!project.enabled) return '项目已暂停'
   if (!project.next_run_at) return '等待 Agent 应用计划'
   try {
     return new Intl.DateTimeFormat('zh-CN', {
@@ -1168,10 +1236,10 @@ onBeforeUnmount(() => {
                 </header>
                 <div v-if="!group.projects.length" class="server-empty">这台服务器还没有备份项目。</div>
                 <div v-else class="card-list">
-              <article v-for="project in group.projects" :key="project.id" class="project-card">
+              <article v-for="project in group.projects" :key="project.id" class="project-card" :class="{ 'project-disabled': !project.enabled }">
                 <div class="project-top">
                   <div><strong>{{ project.name }}</strong><small>{{ serverName(project.server_id) }} · {{ repositoryName(project.repository_id) }}</small></div>
-                  <div class="project-actions"><span class="status-pill online">Revision {{ project.revision }}</span><button type="button" class="ghost compact" :disabled="loading || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
+                  <div class="project-actions"><span class="status-pill" :class="project.enabled ? 'online' : 'neutral'">{{ project.enabled ? `Revision ${project.revision}` : '已暂停' }}</span><button type="button" class="text-button" :disabled="loading" @click="toggleProject(project)">{{ project.enabled ? '暂停' : '恢复' }}</button><button type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
                 </div>
                 <div class="project-source-list">
                   <span v-for="source in project.sources" :key="source.id" class="source-chip" :class="source.type">{{ sourceSummary(source) }}</span>
@@ -1179,6 +1247,11 @@ onBeforeUnmount(() => {
                 <div class="schedule-overview">
                   <div><small>执行计划</small><strong>{{ cronDescription(project.schedule.cron) }}</strong><span>{{ project.schedule.timezone }}<template v-if="project.schedule.jitter_seconds"> · 最多延后 {{ Math.round(project.schedule.jitter_seconds / 60) }} 分钟</template></span></div>
                   <div class="next-run"><small>下次计划</small><strong>{{ formatNextRun(project) }}</strong><span>最长运行 {{ Math.round(project.schedule.max_runtime_seconds / 3600) }} 小时</span></div>
+                </div>
+                <div class="policy-strip">
+                  <span><small>保留</small><strong>{{ retentionSummary(project) }}</strong></span>
+                  <span><small>校验</small><strong>{{ verificationSummary(project) }}</strong></span>
+                  <span><small>扫描</small><strong>{{ scanSummary(project) }}</strong></span>
                 </div>
               </article>
                 </div>
@@ -1194,7 +1267,7 @@ onBeforeUnmount(() => {
               </section>
 
               <section class="form-section">
-                <div class="section-title"><span>2</span><div><strong>备份内容</strong><small>可添加多个数据源；任一数据源失败会标记本次任务失败</small></div></div>
+                <div class="section-title"><span>2</span><div><strong>备份内容与扫描边界</strong><small>组合数据源，并使用 Restic 原生过滤选项控制遍历范围</small></div></div>
                 <article v-for="(source, index) in projectForm.sources" :key="source.key" class="source-editor">
                   <header><strong>数据源 {{ index + 1 }}</strong><button v-if="projectForm.sources.length > 1" type="button" class="text-button danger-text" @click="removeProjectSource(index)">移除</button></header>
                   <label>类型<select v-model="source.type" @change="changeSourceType(source)"><option value="files">文件与目录</option><option value="docker">Docker 容器与挂载卷</option><option value="mysql">MySQL 逻辑备份</option><option value="postgresql">PostgreSQL 逻辑备份</option></select></label>
@@ -1215,6 +1288,11 @@ onBeforeUnmount(() => {
                   </template>
                 </article>
                 <div class="source-add-row"><span>添加数据源</span><button type="button" class="ghost compact" @click="addProjectSource('files')">+ 文件</button><button type="button" class="ghost compact" @click="addProjectSource('docker')">+ Docker</button><button type="button" class="ghost compact" @click="addProjectSource('mysql')">+ MySQL</button><button type="button" class="ghost compact" @click="addProjectSource('postgresql')">+ PostgreSQL</button></div>
+                <div class="policy-option-grid">
+                  <label class="check-row"><input v-model="projectForm.one_file_system" type="checkbox" /><span><strong>不跨越文件系统</strong><small>对应 Restic <code>--one-file-system</code>，避免误扫额外挂载盘。</small></span></label>
+                  <label class="check-row"><input v-model="projectForm.exclude_caches" type="checkbox" /><span><strong>排除标准缓存目录</strong><small>识别有效的 <code>CACHEDIR.TAG</code>。</small></span></label>
+                </div>
+                <div class="form-row"><label>目录忽略标记（每行一个）<textarea v-model="projectForm.exclude_if_present" rows="2" placeholder=".nobackup"></textarea><small class="field-help">目录内出现该文件时跳过整个目录。</small></label><label>排除大于<input v-model.trim="projectForm.exclude_larger_than" placeholder="例如 2G；留空不限制" /><small class="field-help">Restic 大小格式，例如 500M、2G。</small></label></div>
               </section>
 
               <section class="form-section">
@@ -1224,6 +1302,16 @@ onBeforeUnmount(() => {
                 <label>时区<input v-model="projectForm.timezone" required list="timezone-options" /><datalist id="timezone-options"><option v-for="timezone in commonTimezones" :key="timezone" :value="timezone" /></datalist></label>
                 <div class="form-row"><label>随机延迟<select v-model.number="projectForm.jitter_minutes"><option :value="0">不延迟</option><option :value="5">最多 5 分钟</option><option :value="10">最多 10 分钟</option><option :value="30">最多 30 分钟</option><option :value="60">最多 60 分钟</option></select></label><label>最长运行时间<select v-model.number="projectForm.max_runtime_hours"><option :value="1">1 小时</option><option :value="3">3 小时</option><option :value="6">6 小时</option><option :value="12">12 小时</option><option :value="24">24 小时</option></select></label></div>
                 <div class="schedule-preview"><span>计划预览</span><strong>{{ projectSchedulePreview }}</strong><code>{{ projectCron }}</code></div>
+              </section>
+              <section class="form-section">
+                <div class="section-title"><span>4</span><div><strong>保留与完整性策略</strong><small>备份成功后依次执行 forget/prune 和 check</small></div></div>
+                <label class="check-row"><input v-model="projectForm.retention_enabled" type="checkbox" /><span><strong>自动应用快照保留策略</strong><small>仅匹配当前服务器与当前项目标签，不影响仓库内其他项目。</small></span></label>
+                <div v-if="projectForm.retention_enabled" class="retention-grid">
+                  <label>最近<input v-model.number="projectForm.keep_last" type="number" min="0" max="100000" /></label><label>每小时<input v-model.number="projectForm.keep_hourly" type="number" min="0" max="100000" /></label><label>每天<input v-model.number="projectForm.keep_daily" type="number" min="0" max="100000" /></label><label>每周<input v-model.number="projectForm.keep_weekly" type="number" min="0" max="100000" /></label><label>每月<input v-model.number="projectForm.keep_monthly" type="number" min="0" max="100000" /></label><label>每年<input v-model.number="projectForm.keep_yearly" type="number" min="0" max="100000" /></label>
+                </div>
+                <label v-if="projectForm.retention_enabled" class="check-row caution-row"><input v-model="projectForm.prune" type="checkbox" /><span><strong>保留后立即回收存储空间</strong><small><code>prune</code> 会锁定仓库并重写数据，耗时和流量较大；默认关闭。</small></span></label>
+                <div class="form-row"><label>仓库校验<select v-model="projectForm.verification_mode"><option value="off">关闭</option><option value="metadata">检查仓库结构</option><option value="subset">抽样读取数据</option><option value="full">读取全部数据（高成本）</option></select></label><label v-if="projectForm.verification_mode === 'subset'">抽样比例<select v-model="projectForm.read_data_subset"><option value="1%">1%</option><option value="5%">5%</option><option value="10%">10%</option><option value="25%">25%</option></select></label></div>
+                <p class="policy-reference">字段与执行语义直接采用 <a href="https://restic.readthedocs.io/en/stable/040_backup.html" target="_blank" rel="noreferrer">Restic backup</a>、<a href="https://restic.readthedocs.io/en/stable/060_forget.html" target="_blank" rel="noreferrer">forget/prune</a> 和 <a href="https://kopia.io/docs/reference/command-line/common/policy-set/" target="_blank" rel="noreferrer">Kopia policy</a> 的成熟模型。</p>
               </section>
               <button class="primary" :disabled="loading || !servers.length || !repositories.length">创建并下发</button>
             </form>

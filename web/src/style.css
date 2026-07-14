@@ -275,6 +275,7 @@ td small { margin-top: 4px; color: var(--muted-light); font-size: 10px; }
 .enrollment-card .ghost { justify-self: start; }
 .data-card { grid-template-columns: minmax(140px, .4fr) minmax(0, 1fr); }
 .project-card { padding: 14px; border: 1px solid #1c2a32; border-radius: 8px; background: #090f14; }
+.project-card.project-disabled { opacity: .7; border-style: dashed; }
 .project-server-list { display: grid; gap: 12px; }
 .project-server-group { overflow: hidden; border: 1px solid #24343d; border-radius: 10px; background: #090f14; }
 .project-server-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 14px; border-bottom: 1px solid #21313a; background: linear-gradient(90deg, rgba(93,240,168,.08), rgba(15,22,28,.72)); }
@@ -301,6 +302,10 @@ td small { margin-top: 4px; color: var(--muted-light); font-size: 10px; }
 .schedule-overview span { color: var(--muted-light); font-size: 10px; line-height: 1.5; }
 .schedule-overview .next-run { padding-left: 10px; border-left: 1px solid #203039; }
 .schedule-overview .next-run strong { color: var(--accent); }
+.policy-strip { display: grid; grid-template-columns: 1.35fr .7fr 1fr; gap: 1px; margin-top: 10px; overflow: hidden; border: 1px solid #1e3038; border-radius: 7px; background: #1e3038; }
+.policy-strip > span { display: grid; gap: 3px; min-width: 0; padding: 8px 9px; background: #0a1217; }
+.policy-strip small { color: #748891; font-size: 8px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.policy-strip strong { overflow: hidden; color: #b7c8c0; font-size: 9px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 
 .repository-guide { margin-bottom: 12px; border-color: #28513f; background: linear-gradient(135deg, rgba(12,35,26,.95), rgba(13,18,24,.95)); }
 .doc-link { color: var(--accent); font-size: 12px; text-decoration: none; }
@@ -337,6 +342,14 @@ td small { margin-top: 4px; color: var(--muted-light); font-size: 10px; }
 .check-row input { width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--accent); }
 .check-row strong, .check-row small { display: block; }
 .check-row small { margin-top: 4px; color: var(--muted-light); font-size: 10px; font-weight: 400; line-height: 1.5; }
+.policy-option-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.retention-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; }
+.retention-grid label { color: #80928a; font-size: 9px; text-align: center; }
+.retention-grid input { padding: 9px 5px; text-align: center; }
+.caution-row { border-color: #5b4b26; background: #1d190d; }
+.policy-reference { margin: 0; padding: 9px 10px; color: #7f948a; border-left: 2px solid #395e4d; background: #0a1511; font-size: 10px; line-height: 1.6; }
+.policy-reference a { color: var(--accent); text-decoration: none; }
+.policy-reference a:hover { text-decoration: underline; }
 .docker-note { border-left-color: #9c6de0; background: #191123; }
 
 .danger-ghost { color: #ff969d; border-color: #593038; }
@@ -461,6 +474,8 @@ td small { margin-top: 4px; color: var(--muted-light); font-size: 10px; }
   .donut-chart::before { width: 72px; height: 72px; }
   .schedule-overview { grid-template-columns: 1fr; }
   .schedule-overview .next-run { padding: 9px 0 0; border-top: 1px solid #203039; border-left: 0; }
+  .policy-strip, .policy-option-grid { grid-template-columns: 1fr; }
+  .retention-grid { grid-template-columns: repeat(3, 1fr); }
   .weekday-grid { grid-template-columns: repeat(4, 1fr); }
   .security-dialog { padding: 18px; }
   .totp-wizard { grid-template-columns: 1fr; }

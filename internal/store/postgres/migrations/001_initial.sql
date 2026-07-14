@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS projects (
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     sources JSONB NOT NULL,
     schedule JSONB NOT NULL,
+    policy JSONB NOT NULL DEFAULT '{}'::jsonb,
     revision BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,

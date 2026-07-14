@@ -215,6 +215,29 @@ func (s *Store) ListProjects(context.Context) ([]domain.Project, error) {
 	return result, nil
 }
 
+func (s *Store) SetProjectEnabled(_ context.Context, id string, enabled bool, updatedAt time.Time) (domain.Project, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	project, ok := s.projects[id]
+	if !ok {
+		return domain.Project{}, store.ErrNotFound
+	}
+	server, ok := s.servers[project.ServerID]
+	if !ok {
+		return domain.Project{}, store.ErrNotFound
+	}
+	if project.Enabled == enabled {
+		return cloneProject(project), nil
+	}
+	server.DesiredRevision++
+	project.Enabled = enabled
+	project.Revision = server.DesiredRevision
+	project.UpdatedAt = updatedAt
+	s.servers[server.ID] = server
+	s.projects[id] = cloneProject(project)
+	return cloneProject(project), nil
+}
+
 func (s *Store) DesiredConfig(_ context.Context, serverID string) (domain.AgentConfig, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -390,6 +413,7 @@ func cloneProject(project domain.Project) domain.Project {
 			project.Sources[i].Docker = &docker
 		}
 	}
+	project.Policy.Backup.ExcludeIfPresent = append([]string(nil), project.Policy.Backup.ExcludeIfPresent...)
 	return project
 }
 

@@ -66,6 +66,82 @@ func TestRunnerTreatsResticExitThreeAsPartial(t *testing.T) {
 	}
 }
 
+func TestRunnerAppliesBackupRetentionAndVerificationPolicy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell script")
+	}
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "restic.log")
+	t.Setenv("FAKE_RESTIC_LOG", logPath)
+	restic := filepath.Join(directory, "fake-restic")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"$FAKE_RESTIC_LOG\"\n" +
+		"case \"$1\" in\n" +
+		"  snapshots) printf '%s\\n' '[]';;\n" +
+		"  backup) printf '%s\\n' '{\"message_type\":\"summary\",\"snapshot_id\":\"policy123\"}';;\n" +
+		"  forget|check) exit 0;;\n" +
+		"  *) exit 12;;\n" +
+		"esac\n"
+	if err := os.WriteFile(restic, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.AgentProject{
+		Project: domain.Project{
+			ID: "prj_policy", Sources: []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+			Policy: domain.ProjectPolicy{
+				Backup:       domain.BackupPolicy{OneFileSystem: true, ExcludeCaches: true, ExcludeIfPresent: []string{".nobackup"}, ExcludeLargerThan: "2G"},
+				Retention:    domain.RetentionPolicy{Enabled: true, KeepLast: 3, KeepDaily: 7, KeepWeekly: 4, Prune: true},
+				Verification: domain.VerificationPolicy{Mode: "subset", ReadDataSubset: "5%"},
+			},
+		},
+		Repository: domain.Repository{ID: "repo", URL: "/tmp/repository", Password: "secret"},
+	}
+	result := NewRunner(restic).Execute(context.Background(), "srv_policy", project)
+	if result.Status != domain.RunSucceeded || result.SnapshotID != "policy123" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := string(logged)
+	for _, expected := range []string{
+		"backup --json --host srv_policy --tag vaultmesh.project_id=prj_policy --one-file-system --exclude-caches --exclude-if-present .nobackup --exclude-larger-than 2G",
+		"forget --host srv_policy --tag vaultmesh.project_id=prj_policy --keep-last 3 --keep-daily 7 --keep-weekly 4 --prune",
+		"check --read-data-subset=5%",
+	} {
+		if !strings.Contains(commands, expected) {
+			t.Fatalf("missing command %q in:\n%s", expected, commands)
+		}
+	}
+}
+
+func TestRunnerKeepsSnapshotWhenRetentionFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell script")
+	}
+	restic := filepath.Join(t.TempDir(), "fake-restic")
+	script := "#!/bin/sh\n" +
+		"case \"$1\" in\n" +
+		"  snapshots) printf '%s\\n' '[]';;\n" +
+		"  backup) printf '%s\\n' '{\"message_type\":\"summary\",\"snapshot_id\":\"kept123\"}';;\n" +
+		"  forget) printf '%s\\n' 'repository locked' >&2; exit 11;;\n" +
+		"esac\n"
+	if err := os.WriteFile(restic, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.AgentProject{
+		Project: domain.Project{ID: "prj", Sources: []domain.Source{{Type: "files", Paths: []string{"/tmp"}}}, Policy: domain.ProjectPolicy{
+			Retention: domain.RetentionPolicy{Enabled: true, KeepLast: 2},
+		}},
+		Repository: domain.Repository{ID: "repo", URL: "/tmp/repository", Password: "secret"},
+	}
+	result := NewRunner(restic).Execute(context.Background(), "srv", project)
+	if result.Status != domain.RunPartial || result.SnapshotID != "kept123" || result.ErrorCode != "retention_failed" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
 func TestRunnerCreatesMySQLLogicalDumpBeforeBackup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses POSIX shell scripts")

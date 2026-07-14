@@ -75,18 +75,52 @@ type Schedule struct {
 	ConcurrencyPolicy string `json:"concurrency_policy"`
 }
 
+// ProjectPolicy maps the project-level controls to Restic's native backup,
+// forget/prune, and check commands. Keeping this separate from Schedule makes
+// the execution policy portable when additional schedulers are introduced.
+type ProjectPolicy struct {
+	Backup       BackupPolicy       `json:"backup"`
+	Retention    RetentionPolicy    `json:"retention"`
+	Verification VerificationPolicy `json:"verification"`
+}
+
+type BackupPolicy struct {
+	OneFileSystem     bool     `json:"one_file_system"`
+	ExcludeCaches     bool     `json:"exclude_caches"`
+	ExcludeIfPresent  []string `json:"exclude_if_present,omitempty"`
+	ExcludeLargerThan string   `json:"exclude_larger_than,omitempty"`
+}
+
+type RetentionPolicy struct {
+	Enabled     bool `json:"enabled"`
+	KeepLast    int  `json:"keep_last"`
+	KeepHourly  int  `json:"keep_hourly"`
+	KeepDaily   int  `json:"keep_daily"`
+	KeepWeekly  int  `json:"keep_weekly"`
+	KeepMonthly int  `json:"keep_monthly"`
+	KeepYearly  int  `json:"keep_yearly"`
+	Prune       bool `json:"prune"`
+}
+
+type VerificationPolicy struct {
+	// Mode is one of off, metadata, subset, or full.
+	Mode           string `json:"mode"`
+	ReadDataSubset string `json:"read_data_subset,omitempty"`
+}
+
 type Project struct {
-	ID           string     `json:"id"`
-	ServerID     string     `json:"server_id"`
-	RepositoryID string     `json:"repository_id"`
-	Name         string     `json:"name"`
-	Enabled      bool       `json:"enabled"`
-	Sources      []Source   `json:"sources"`
-	Schedule     Schedule   `json:"schedule"`
-	Revision     int64      `json:"revision"`
-	NextRunAt    *time.Time `json:"next_run_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	ID           string        `json:"id"`
+	ServerID     string        `json:"server_id"`
+	RepositoryID string        `json:"repository_id"`
+	Name         string        `json:"name"`
+	Enabled      bool          `json:"enabled"`
+	Sources      []Source      `json:"sources"`
+	Schedule     Schedule      `json:"schedule"`
+	Policy       ProjectPolicy `json:"policy"`
+	Revision     int64         `json:"revision"`
+	NextRunAt    *time.Time    `json:"next_run_at,omitempty"`
+	CreatedAt    time.Time     `json:"created_at"`
+	UpdatedAt    time.Time     `json:"updated_at"`
 }
 
 type AgentProject struct {

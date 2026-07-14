@@ -56,6 +56,29 @@ export interface Schedule {
   concurrency_policy: 'forbid'
 }
 
+export interface ProjectPolicy {
+  backup: {
+    one_file_system: boolean
+    exclude_caches: boolean
+    exclude_if_present?: string[]
+    exclude_larger_than?: string
+  }
+  retention: {
+    enabled: boolean
+    keep_last: number
+    keep_hourly: number
+    keep_daily: number
+    keep_weekly: number
+    keep_monthly: number
+    keep_yearly: number
+    prune: boolean
+  }
+  verification: {
+    mode: 'off' | 'metadata' | 'subset' | 'full'
+    read_data_subset?: string
+  }
+}
+
 export interface Project {
   id: string
   server_id: string
@@ -64,6 +87,7 @@ export interface Project {
   enabled: boolean
   sources: Source[]
   schedule: Schedule
+  policy?: ProjectPolicy
   revision: number
   next_run_at?: string
   created_at: string

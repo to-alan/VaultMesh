@@ -364,6 +364,9 @@ func (s *Service) CreateProject(ctx context.Context, input domain.Project) (doma
 	if err := schedule.Validate(input.Schedule.Cron, input.Schedule.Timezone); err != nil {
 		return domain.Project{}, validationError("schedule", err.Error())
 	}
+	if err := validateProjectPolicy(&input.Policy); err != nil {
+		return domain.Project{}, err
+	}
 	id, err := randomValue("prj", 10)
 	if err != nil {
 		return domain.Project{}, err
@@ -378,6 +381,17 @@ func (s *Service) CreateProject(ctx context.Context, input domain.Project) (doma
 		return domain.Project{}, err
 	}
 	return publicProject(created, s.now()), nil
+}
+
+func (s *Service) SetProjectEnabled(ctx context.Context, projectID string, enabled bool) (domain.Project, error) {
+	if strings.TrimSpace(projectID) == "" {
+		return domain.Project{}, validationError("project_id", "is required")
+	}
+	project, err := s.store.SetProjectEnabled(ctx, projectID, enabled, s.now())
+	if err != nil {
+		return domain.Project{}, err
+	}
+	return publicProject(project, s.now()), nil
 }
 
 func (s *Service) DesiredConfig(ctx context.Context, serverID string) (domain.AgentConfig, error) {
@@ -510,6 +524,68 @@ func prepareDockerSource(source *domain.Source) error {
 	return nil
 }
 
+var resticSize = regexp.MustCompile(`(?i)^[1-9][0-9]*(?:\.[0-9]+)?[kmgt]?$`)
+
+func validateProjectPolicy(policy *domain.ProjectPolicy) error {
+	backup := &policy.Backup
+	backup.ExcludeLargerThan = strings.TrimSpace(backup.ExcludeLargerThan)
+	if backup.ExcludeLargerThan != "" && !resticSize.MatchString(backup.ExcludeLargerThan) {
+		return validationError("policy.backup.exclude_larger_than", "must be a Restic size such as 500M or 2G")
+	}
+	if len(backup.ExcludeIfPresent) > 20 {
+		return validationError("policy.backup.exclude_if_present", "must contain no more than 20 marker filenames")
+	}
+	seenMarkers := make(map[string]struct{}, len(backup.ExcludeIfPresent))
+	markers := make([]string, 0, len(backup.ExcludeIfPresent))
+	for _, marker := range backup.ExcludeIfPresent {
+		marker = strings.TrimSpace(marker)
+		if marker == "" || len(marker) > 255 || marker == "." || marker == ".." || filepath.Base(marker) != marker || strings.ContainsAny(marker, "\x00\r\n") {
+			return validationError("policy.backup.exclude_if_present", fmt.Sprintf("%q is not a valid marker filename", marker))
+		}
+		if _, exists := seenMarkers[marker]; exists {
+			continue
+		}
+		seenMarkers[marker] = struct{}{}
+		markers = append(markers, marker)
+	}
+	backup.ExcludeIfPresent = markers
+
+	retention := policy.Retention
+	counts := []int{retention.KeepLast, retention.KeepHourly, retention.KeepDaily, retention.KeepWeekly, retention.KeepMonthly, retention.KeepYearly}
+	positive := false
+	for _, count := range counts {
+		if count < 0 || count > 100000 {
+			return validationError("policy.retention", "keep counts must be between 0 and 100000")
+		}
+		positive = positive || count > 0
+	}
+	if retention.Enabled && !positive {
+		return validationError("policy.retention", "at least one keep rule is required when retention is enabled")
+	}
+	if retention.Prune && !retention.Enabled {
+		return validationError("policy.retention.prune", "requires retention to be enabled")
+	}
+
+	verification := &policy.Verification
+	verification.Mode = strings.TrimSpace(verification.Mode)
+	if verification.Mode == "" {
+		verification.Mode = "off"
+	}
+	switch verification.Mode {
+	case "off", "metadata", "full":
+		verification.ReadDataSubset = ""
+	case "subset":
+		verification.ReadDataSubset = strings.TrimSpace(verification.ReadDataSubset)
+		matched, _ := regexp.MatchString(`^(?:100|[1-9]?[0-9])%$`, verification.ReadDataSubset)
+		if !matched || verification.ReadDataSubset == "0%" {
+			return validationError("policy.verification.read_data_subset", "must be a percentage from 1% to 100%")
+		}
+	default:
+		return validationError("policy.verification.mode", "must be off, metadata, subset, or full")
+	}
+	return nil
+}
+
 func (s *Service) Store() store.Store { return s.store }
 
 type ValidationError struct {
@@ -614,10 +690,12 @@ func validateSourcePath(value string) (string, error) {
 }
 
 func publicProject(project domain.Project, now time.Time) domain.Project {
-	if location, err := time.LoadLocation(project.Schedule.Timezone); err == nil {
-		if parsed, err := schedule.Parser.Parse(project.Schedule.Cron); err == nil {
-			next := parsed.Next(now.In(location)).UTC()
-			project.NextRunAt = &next
+	if project.Enabled {
+		if location, err := time.LoadLocation(project.Schedule.Timezone); err == nil {
+			if parsed, err := schedule.Parser.Parse(project.Schedule.Cron); err == nil {
+				next := parsed.Next(now.In(location)).UTC()
+				project.NextRunAt = &next
+			}
 		}
 	}
 	for index := range project.Sources {

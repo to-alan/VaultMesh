@@ -90,6 +90,28 @@ Content-Type: application/json
     "max_runtime_seconds": 21600,
     "missed_run_policy": "skip",
     "concurrency_policy": "forbid"
+  },
+  "policy": {
+    "backup": {
+      "one_file_system": true,
+      "exclude_caches": true,
+      "exclude_if_present": [".nobackup"],
+      "exclude_larger_than": "2G"
+    },
+    "retention": {
+      "enabled": true,
+      "keep_last": 3,
+      "keep_hourly": 0,
+      "keep_daily": 7,
+      "keep_weekly": 4,
+      "keep_monthly": 12,
+      "keep_yearly": 3,
+      "prune": false
+    },
+    "verification": {
+      "mode": "subset",
+      "read_data_subset": "1%"
+    }
   }
 }
 ```
@@ -128,6 +150,17 @@ Use a dedicated database user with the minimum privileges required by `mysqldump
 ```
 
 The password is replaced by AES-GCM ciphertext before the project JSON is persisted. The Agent writes a root-only temporary client option file, performs a single-transaction logical dump, backs up the artifact with Restic, and removes the staging directory.
+
+`policy.backup` maps directly to Restic backup options. After a successful snapshot, retention is scoped by both Agent host and `vaultmesh.project_id`; optional verification then checks the repository. A post-backup maintenance failure returns `partial` while preserving the snapshot ID. See [backup project policies](./BACKUP_PROJECTS.md) for the complete contract.
+
+Pause or resume a project without deleting its history:
+
+```http
+PATCH /api/v1/projects/{project_id}
+Content-Type: application/json
+
+{"enabled": false}
+```
 
 For PostgreSQL, use `"type": "postgresql"` with the same `database` object. The Agent uses `pg_dump --format=custom` and a protected temporary password file.
 

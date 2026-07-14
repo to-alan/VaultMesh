@@ -58,6 +58,18 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 	}
 	defer cleanup()
 	args := []string{"backup", "--json", "--host", agentID, "--tag", "vaultmesh.project_id=" + project.ID}
+	if project.Policy.Backup.OneFileSystem {
+		args = append(args, "--one-file-system")
+	}
+	if project.Policy.Backup.ExcludeCaches {
+		args = append(args, "--exclude-caches")
+	}
+	for _, marker := range project.Policy.Backup.ExcludeIfPresent {
+		args = append(args, "--exclude-if-present", marker)
+	}
+	if project.Policy.Backup.ExcludeLargerThan != "" {
+		args = append(args, "--exclude-larger-than", project.Policy.Backup.ExcludeLargerThan)
+	}
 	for _, pattern := range excludes {
 		args = append(args, "--exclude", pattern)
 	}
@@ -128,7 +140,83 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 	if summary.SnapshotID == "" {
 		return RunResult{Status: domain.RunFailed, ErrorCode: "snapshot_missing", ErrorMessage: "restic did not return a snapshot ID", Stats: stats}
 	}
+	if result := r.applyPostBackupPolicy(ctx, agentID, project, summary.SnapshotID, stats); result != nil {
+		return *result
+	}
 	return RunResult{Status: domain.RunSucceeded, SnapshotID: summary.SnapshotID, Stats: stats}
+}
+
+func (r *Runner) applyPostBackupPolicy(ctx context.Context, agentID string, project domain.AgentProject, snapshotID string, stats map[string]any) *RunResult {
+	environment := repositoryEnvironment(project.Repository)
+	retention := project.Policy.Retention
+	if retention.Enabled {
+		args := []string{"forget", "--host", agentID, "--tag", "vaultmesh.project_id=" + project.ID}
+		keep := []struct {
+			name  string
+			value int
+		}{
+			{"--keep-last", retention.KeepLast}, {"--keep-hourly", retention.KeepHourly},
+			{"--keep-daily", retention.KeepDaily}, {"--keep-weekly", retention.KeepWeekly},
+			{"--keep-monthly", retention.KeepMonthly}, {"--keep-yearly", retention.KeepYearly},
+		}
+		for _, item := range keep {
+			if item.value > 0 {
+				args = append(args, item.name, strconv.Itoa(item.value))
+			}
+		}
+		if retention.Prune {
+			args = append(args, "--prune")
+		}
+		exitCode, output, err := runCommand(ctx, environment, r.resticPath, resticArguments(project.Repository, args...)...)
+		stats["retention_applied"] = exitCode == 0 && err == nil
+		stats["prune_requested"] = retention.Prune
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return &RunResult{Status: domain.RunTimedOut, SnapshotID: snapshotID, ErrorCode: "max_runtime_exceeded", ErrorMessage: "retention maintenance exceeded the configured maximum runtime", Stats: stats}
+		}
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return &RunResult{Status: domain.RunCanceled, SnapshotID: snapshotID, ErrorCode: "canceled", ErrorMessage: "retention maintenance was canceled", Stats: stats}
+		}
+		if err != nil || exitCode != 0 {
+			if output == "" && err != nil {
+				output = err.Error()
+			}
+			return &RunResult{
+				Status: domain.RunPartial, SnapshotID: snapshotID, ErrorCode: "retention_failed",
+				ErrorMessage: redact(truncate(output, 4096), project.Repository), Stats: stats,
+			}
+		}
+	}
+
+	verification := project.Policy.Verification
+	if verification.Mode == "" || verification.Mode == "off" {
+		return nil
+	}
+	args := []string{"check"}
+	switch verification.Mode {
+	case "subset":
+		args = append(args, "--read-data-subset="+verification.ReadDataSubset)
+	case "full":
+		args = append(args, "--read-data")
+	}
+	exitCode, output, err := runCommand(ctx, environment, r.resticPath, resticArguments(project.Repository, args...)...)
+	stats["verification_mode"] = verification.Mode
+	stats["verification_passed"] = exitCode == 0 && err == nil
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return &RunResult{Status: domain.RunTimedOut, SnapshotID: snapshotID, ErrorCode: "max_runtime_exceeded", ErrorMessage: "repository verification exceeded the configured maximum runtime", Stats: stats}
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return &RunResult{Status: domain.RunCanceled, SnapshotID: snapshotID, ErrorCode: "canceled", ErrorMessage: "repository verification was canceled", Stats: stats}
+	}
+	if err != nil || exitCode != 0 {
+		if output == "" && err != nil {
+			output = err.Error()
+		}
+		return &RunResult{
+			Status: domain.RunPartial, SnapshotID: snapshotID, ErrorCode: "repository_verification_failed",
+			ErrorMessage: redact(truncate(output, 4096), project.Repository), Stats: stats,
+		}
+	}
+	return nil
 }
 
 func (r *Runner) ensureRepository(ctx context.Context, repository domain.Repository) *RunResult {
