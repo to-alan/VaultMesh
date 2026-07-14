@@ -20,7 +20,7 @@ VaultMesh 的项目模型不自创备份术语。实际执行引擎是 Restic，
 | 数据源 | files、Docker、MySQL、PostgreSQL | 文件直接读取；Docker 生成脱敏清单并解析挂载；数据库先生成受保护的逻辑导出 |
 | 扫描边界 | 文件系统边界、缓存、目录标记、大文件、逐源排除规则 | 转换为 Restic 原生参数，不经过 Shell 解释 |
 | 快照计划 | 5 段 Cron、IANA 时区、随机延迟、最长运行时间 | Agent 离线持有最后一份配置并本地调度 |
-| 保留 | 最多 N 份、智能、GFS、按时间、可选 Prune | `forget` 按 Agent host 与项目标签过滤，并固定 `--group-by host` |
+| 保留 | 最多 N 份、智能、GFS、按时间、永久保护、可选 Prune | `forget` 按 Agent host 与项目标签过滤，固定 `--group-by host`，并用 `--keep-tag vaultmesh.protected=true` 排除受保护快照 |
 | 校验 | 关闭、仓库结构、抽样数据、完整数据 | 在独立维护窗口执行 `check`、`--read-data-subset`、`--read-data` |
 | 维护窗口 | Forget、Prune、Check 各自的 5 段 Cron | 与备份使用相同仓库互斥锁，但失败不会把成功备份标记为 partial |
 | 运行控制 | 启用、暂停、立即备份 | 暂停会提升服务器配置版本，并从下一份 Agent 配置中移除项目 |
@@ -40,6 +40,8 @@ VaultMesh 的项目模型不自创备份术语。实际执行引擎是 Restic，
 5. 到达空间回收窗口时，独立执行 Prune；到达校验窗口时，独立执行结构检查、抽样读取或完整数据读取。
 
 四类操作分别写入运行记录，并通过 `stats.operation` 区分 backup、retention、prune 与 verification。维护任务失败不会改变已经成功的备份状态，也不会污染 Dashboard 的备份成功率。缺少 `maintenance.separate` 的历史项目仍沿用备份后 Forget/Prune/Check，并在维护失败时标记 `partial`，以保证升级兼容。
+
+每次成功备份后，Agent 还会用 Restic JSON 输出刷新该项目的快照索引。管理员可为某份快照添加 `vaultmesh.protected=true` 标签；Restic 修改标签会生成新的快照 ID，因此 Agent 会在操作后立即重新同步索引。保护规则不是控制面的近似判断，而是随后的真实 Forget 命令固定携带 `--keep-tag vaultmesh.protected=true`。
 
 ## 安全和成本边界
 

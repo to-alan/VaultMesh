@@ -107,7 +107,7 @@ func TestRunnerAppliesBackupRetentionAndVerificationPolicy(t *testing.T) {
 	commands := string(logged)
 	for _, expected := range []string{
 		"backup --json --host srv_policy --tag vaultmesh.project_id=prj_policy --one-file-system --exclude-caches --exclude-if-present .nobackup --exclude-larger-than 2G",
-		"forget --host srv_policy --tag vaultmesh.project_id=prj_policy --group-by host --keep-last 3 --keep-daily 7 --keep-weekly 4 --prune",
+		"forget --host srv_policy --tag vaultmesh.project_id=prj_policy --group-by host --keep-last 3 --keep-daily 7 --keep-weekly 4 --keep-tag vaultmesh.protected=true --prune",
 		"check --read-data-subset=5%",
 	} {
 		if !strings.Contains(commands, expected) {
@@ -145,7 +145,7 @@ func TestRetentionArgumentsCompileSupportedModes(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			actual := strings.Join(retentionArguments("srv", "prj", test.policy, true), " ")
-			for _, expected := range append([]string{"--host srv", "--tag vaultmesh.project_id=prj", "--dry-run --json"}, test.expected...) {
+			for _, expected := range append([]string{"--host srv", "--tag vaultmesh.project_id=prj", "--keep-tag vaultmesh.protected=true", "--dry-run --json"}, test.expected...) {
 				if !strings.Contains(actual, expected) {
 					t.Fatalf("missing %q in %q", expected, actual)
 				}

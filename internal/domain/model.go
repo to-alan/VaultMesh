@@ -187,6 +187,31 @@ type RunReport struct {
 	Stats          map[string]any `json:"stats,omitempty"`
 }
 
+type Snapshot struct {
+	ID           string    `json:"id"`
+	ProjectID    string    `json:"project_id"`
+	ServerID     string    `json:"server_id"`
+	Time         time.Time `json:"time"`
+	Hostname     string    `json:"hostname"`
+	Username     string    `json:"username,omitempty"`
+	Paths        []string  `json:"paths"`
+	Tags         []string  `json:"tags"`
+	TotalFiles   int64     `json:"total_files,omitempty"`
+	TotalBytes   int64     `json:"total_bytes,omitempty"`
+	Protected    bool      `json:"protected"`
+	LastSyncedAt time.Time `json:"last_synced_at"`
+}
+
+type SnapshotEntry struct {
+	Name        string    `json:"name"`
+	Path        string    `json:"path"`
+	Type        string    `json:"type"`
+	Size        int64     `json:"size"`
+	Mode        uint32    `json:"mode,omitempty"`
+	Permissions string    `json:"permissions,omitempty"`
+	ModifiedAt  time.Time `json:"modified_at,omitempty"`
+}
+
 type Dashboard struct {
 	ServersTotal  int `json:"servers_total"`
 	ServersOnline int `json:"servers_online"`
@@ -197,13 +222,14 @@ type Dashboard struct {
 }
 
 type Command struct {
-	ID         string     `json:"id"`
-	ServerID   string     `json:"server_id"`
-	ProjectID  string     `json:"project_id"`
-	Type       string     `json:"type"`
-	LeaseUntil *time.Time `json:"lease_until,omitempty"`
-	Attempts   int        `json:"attempts"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID         string         `json:"id"`
+	ServerID   string         `json:"server_id"`
+	ProjectID  string         `json:"project_id"`
+	Type       string         `json:"type"`
+	Payload    map[string]any `json:"payload,omitempty"`
+	LeaseUntil *time.Time     `json:"lease_until,omitempty"`
+	Attempts   int            `json:"attempts"`
+	CreatedAt  time.Time      `json:"created_at"`
 }
 
 // AdminAccount is the single control-plane administrator identity. SecurityData

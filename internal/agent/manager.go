@@ -114,27 +114,29 @@ func (m *Manager) Stop() {
 	}
 }
 
-func (m *Manager) Manual(projectID, commandID, commandType string) error {
+func (m *Manager) Manual(command domain.Command) error {
 	config := m.state.Config()
 	for _, project := range config.Projects {
-		if project.ID != projectID {
+		if project.ID != command.ProjectID {
 			continue
 		}
 		scheduledAt := time.Now().UTC()
-		if commandType != "backup" && commandType != "retention_preview" {
-			return fmt.Errorf("unsupported command type %q", commandType)
+		switch command.Type {
+		case "backup", "retention_preview", "snapshot_sync", "snapshot_protect", "snapshot_browse", "snapshot_restore":
+		default:
+			return fmt.Errorf("unsupported command type %q", command.Type)
 		}
-		go m.executeWithKey(project, scheduledAt, "manual:"+commandID, commandType)
+		go m.executeWithKey(project, scheduledAt, "manual:"+command.ID, command.Type, command.ID, command.Payload)
 		return nil
 	}
-	return fmt.Errorf("project %s is not present in applied configuration revision %d", projectID, config.Revision)
+	return fmt.Errorf("project %s is not present in applied configuration revision %d", command.ProjectID, config.Revision)
 }
 
 func (m *Manager) executeOperation(project domain.AgentProject, scheduledAt time.Time, operation string) {
-	m.executeWithKey(project, scheduledAt, project.ID+":"+operation+":"+scheduledAt.UTC().Format(time.RFC3339), operation)
+	m.executeWithKey(project, scheduledAt, project.ID+":"+operation+":"+scheduledAt.UTC().Format(time.RFC3339), operation, "", nil)
 }
 
-func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.Time, idempotencyKey, operation string) {
+func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.Time, idempotencyKey, operation, commandID string, payload map[string]any) {
 	runID := deterministicRunID(idempotencyKey)
 	now := time.Now().UTC()
 	report := domain.RunReport{
@@ -190,8 +192,28 @@ func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.T
 		result = m.runner.Prune(ctx, project)
 	case "verification":
 		result = m.runner.Verify(ctx, project)
+	case "snapshot_sync":
+		result = m.runner.ListSnapshots(ctx, m.identity.AgentID, project)
+	case "snapshot_protect":
+		result = m.runner.ProtectSnapshot(ctx, m.identity.AgentID, project, payloadString(payload, "snapshot_id"), payloadBool(payload, "protected"))
+	case "snapshot_browse":
+		result = m.runner.BrowseSnapshot(ctx, project, payloadString(payload, "snapshot_id"), payloadString(payload, "path"))
+	case "snapshot_restore":
+		result = m.runner.RestoreSnapshot(ctx, commandID, project, payloadString(payload, "snapshot_id"), payloadString(payload, "path"))
 	default:
 		result = m.runner.Execute(ctx, m.identity.AgentID, project)
+	}
+	if operation == "backup" && result.SnapshotID != "" {
+		inventory := m.runner.ListSnapshots(ctx, m.identity.AgentID, project)
+		if result.Stats == nil {
+			result.Stats = make(map[string]any)
+		}
+		if inventory.Status == domain.RunSucceeded {
+			result.Stats["snapshots"] = inventory.Stats["snapshots"]
+			result.Stats["snapshot_count"] = inventory.Stats["snapshot_count"]
+		} else {
+			result.Stats["snapshot_sync_error"] = inventory.ErrorMessage
+		}
 	}
 	finished := time.Now().UTC()
 	report.FinishedAt = &finished
@@ -205,6 +227,16 @@ func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.T
 		return
 	}
 	m.logger.Info("agent operation finished", "operation", operation, "run_id", report.ID, "project_id", project.ID, "status", report.Status, "snapshot_id", report.SnapshotID)
+}
+
+func payloadString(payload map[string]any, key string) string {
+	value, _ := payload[key].(string)
+	return value
+}
+
+func payloadBool(payload map[string]any, key string) bool {
+	value, _ := payload[key].(bool)
+	return value
 }
 
 func (m *Manager) acquireRepository(ctx context.Context, repositoryID string) (func(), error) {

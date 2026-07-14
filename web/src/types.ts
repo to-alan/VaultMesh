@@ -118,6 +118,31 @@ export interface Run {
   stats?: Record<string, unknown>
 }
 
+export interface Snapshot {
+  id: string
+  project_id: string
+  server_id: string
+  time: string
+  hostname: string
+  username?: string
+  paths: string[]
+  tags: string[]
+  total_files?: number
+  total_bytes?: number
+  protected: boolean
+  last_synced_at: string
+}
+
+export interface SnapshotEntry {
+  name: string
+  path: string
+  type: 'dir' | 'file' | 'symlink' | string
+  size: number
+  mode?: number
+  permissions?: string
+  modified_at?: string
+}
+
 export interface EnrollmentResult {
   server: Server
   enrollment_token: string

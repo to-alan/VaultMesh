@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -21,6 +22,7 @@ import (
 )
 
 const enrollmentTTL = 15 * time.Minute
+const protectedSnapshotTag = "vaultmesh.protected=true"
 
 var allowedRepositoryEnvironment = map[string]struct{}{
 	"AWS_ACCESS_KEY_ID":                {},
@@ -64,6 +66,8 @@ var allowedRepositoryEnvironment = map[string]struct{}{
 	"OS_AUTH_TOKEN":                    {},
 	"SWIFT_DEFAULT_CONTAINER_POLICY":   {},
 }
+
+var fullResticSnapshotID = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 var allowedRepositoryProviders = map[string]struct{}{
 	"local": {}, "sftp": {}, "rest_server": {},
@@ -441,14 +445,78 @@ func (s *Service) DesiredConfig(ctx context.Context, serverID string) (domain.Ag
 }
 
 func (s *Service) CreateManualRun(ctx context.Context, projectID string) (domain.Command, error) {
-	return s.createProjectCommand(ctx, projectID, "backup")
+	return s.createProjectCommand(ctx, projectID, "backup", nil)
 }
 
 func (s *Service) CreateRetentionPreview(ctx context.Context, projectID string) (domain.Command, error) {
-	return s.createProjectCommand(ctx, projectID, "retention_preview")
+	return s.createProjectCommand(ctx, projectID, "retention_preview", nil)
 }
 
-func (s *Service) createProjectCommand(ctx context.Context, projectID, commandType string) (domain.Command, error) {
+func (s *Service) RefreshSnapshots(ctx context.Context, projectID string) (domain.Command, error) {
+	return s.createProjectCommand(ctx, projectID, "snapshot_sync", nil)
+}
+
+func (s *Service) SetSnapshotProtected(ctx context.Context, projectID, snapshotID string, protected bool) (domain.Command, error) {
+	if _, err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
+		return domain.Command{}, err
+	}
+	return s.createProjectCommand(ctx, projectID, "snapshot_protect", map[string]any{
+		"snapshot_id": snapshotID,
+		"protected":   protected,
+	})
+}
+
+func (s *Service) BrowseSnapshot(ctx context.Context, projectID, snapshotID, snapshotPath string) (domain.Command, error) {
+	if _, err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
+		return domain.Command{}, err
+	}
+	cleaned, err := normalizeSnapshotPath(snapshotPath)
+	if err != nil {
+		return domain.Command{}, err
+	}
+	return s.createProjectCommand(ctx, projectID, "snapshot_browse", map[string]any{
+		"snapshot_id": snapshotID,
+		"path":        cleaned,
+	})
+}
+
+func (s *Service) RestoreSnapshot(ctx context.Context, projectID, snapshotID, snapshotPath string) (domain.Command, error) {
+	if _, err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
+		return domain.Command{}, err
+	}
+	cleaned, err := normalizeSnapshotPath(snapshotPath)
+	if err != nil {
+		return domain.Command{}, err
+	}
+	return s.createProjectCommand(ctx, projectID, "snapshot_restore", map[string]any{
+		"snapshot_id": snapshotID,
+		"path":        cleaned,
+	})
+}
+
+func (s *Service) snapshotForCommand(ctx context.Context, projectID, snapshotID string) (domain.Snapshot, error) {
+	if !fullResticSnapshotID.MatchString(snapshotID) {
+		return domain.Snapshot{}, validationError("snapshot_id", "must be a full 64-character Restic snapshot ID")
+	}
+	return s.store.GetSnapshot(ctx, projectID, snapshotID)
+}
+
+func normalizeSnapshotPath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = "/"
+	}
+	if strings.ContainsAny(value, "\x00\r\n") || !strings.HasPrefix(value, "/") {
+		return "", validationError("path", "must be an absolute snapshot path")
+	}
+	cleaned := pathpkg.Clean(value)
+	if cleaned == "." || !strings.HasPrefix(cleaned, "/") {
+		return "", validationError("path", "must be an absolute snapshot path")
+	}
+	return cleaned, nil
+}
+
+func (s *Service) createProjectCommand(ctx context.Context, projectID, commandType string, payload map[string]any) (domain.Command, error) {
 	if strings.TrimSpace(projectID) == "" {
 		return domain.Command{}, validationError("project_id", "is required")
 	}
@@ -460,6 +528,7 @@ func (s *Service) createProjectCommand(ctx context.Context, projectID, commandTy
 		ID:        id,
 		ProjectID: projectID,
 		Type:      commandType,
+		Payload:   payload,
 		CreatedAt: s.now(),
 	})
 }

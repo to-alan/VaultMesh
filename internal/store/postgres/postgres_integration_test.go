@@ -91,13 +91,34 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	if !config.Projects[0].Policy.Backup.OneFileSystem || config.Projects[0].Policy.Retention.KeepDaily != 7 || config.Projects[0].Policy.Verification.ReadDataSubset != "1%" {
 		t.Fatalf("project policy was not persisted: %#v", config.Projects[0].Policy)
 	}
-	_, err = dataStore.CreateCommand(ctx, domain.Command{ID: commandID, ProjectID: projectID, Type: "backup", CreatedAt: now})
+	_, err = dataStore.CreateCommand(ctx, domain.Command{
+		ID: commandID, ProjectID: projectID, Type: "snapshot_browse", CreatedAt: now,
+		Payload: map[string]any{"snapshot_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "path": "/etc"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	commands, err := dataStore.ClaimCommands(ctx, serverID, now, now.Add(time.Minute), 10)
 	if err != nil || len(commands) != 1 {
 		t.Fatalf("unexpected commands: %#v err=%v", commands, err)
+	}
+	if commands[0].Payload["path"] != "/etc" {
+		t.Fatalf("command payload was not persisted: %#v", commands[0].Payload)
+	}
+	const snapshotID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	syncedAt := now.Add(2 * time.Second)
+	if err := dataStore.ReplaceProjectSnapshots(ctx, projectID, serverID, []domain.Snapshot{{
+		ID: snapshotID, Time: now, Hostname: "integration", Paths: []string{"/etc"},
+		Tags: []string{"vaultmesh.project_id=" + projectID}, TotalFiles: 4, TotalBytes: 1024,
+	}}, syncedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.ReplaceProjectSnapshots(ctx, projectID, serverID, nil, syncedAt.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	snapshots, err := dataStore.ListSnapshots(ctx, projectID, 10)
+	if err != nil || len(snapshots) != 1 || snapshots[0].ID != snapshotID || !snapshots[0].LastSyncedAt.Equal(syncedAt) {
+		t.Fatalf("snapshot inventory or stale-write guard failed: %#v err=%v", snapshots, err)
 	}
 	report := domain.RunReport{
 		ID: "run_pg_" + suffix, IdempotencyKey: "manual:" + commandID, ProjectID: projectID,

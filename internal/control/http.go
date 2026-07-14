@@ -76,6 +76,11 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("PATCH /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.updateProject)))
 	mux.Handle("POST /api/v1/projects/{projectID}/run", s.admin(http.HandlerFunc(s.createManualRun)))
 	mux.Handle("POST /api/v1/projects/{projectID}/retention-preview", s.admin(http.HandlerFunc(s.createRetentionPreview)))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/refresh", s.admin(http.HandlerFunc(s.refreshSnapshots)))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/protect", s.admin(http.HandlerFunc(s.protectSnapshot)))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/browse", s.admin(http.HandlerFunc(s.browseSnapshot)))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/restore", s.admin(http.HandlerFunc(s.restoreSnapshot)))
+	mux.Handle("GET /api/v1/snapshots", s.admin(http.HandlerFunc(s.listSnapshots)))
 	mux.Handle("GET /api/v1/runs", s.admin(http.HandlerFunc(s.listRuns)))
 
 	mux.Handle("POST /api/v1/agent/heartbeat", s.agent(http.HandlerFunc(s.agentHeartbeat)))
@@ -299,6 +304,74 @@ func (s *HTTPServer) createRetentionPreview(w http.ResponseWriter, r *http.Reque
 	s.writeJSON(w, http.StatusAccepted, command)
 }
 
+func (s *HTTPServer) refreshSnapshots(w http.ResponseWriter, r *http.Request) {
+	command, err := s.service.RefreshSnapshots(r.Context(), r.PathValue("projectID"))
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, command)
+}
+
+func (s *HTTPServer) protectSnapshot(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Protected *bool `json:"protected"`
+	}
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	if input.Protected == nil {
+		s.handleServiceError(w, validationError("protected", "is required"))
+		return
+	}
+	command, err := s.service.SetSnapshotProtected(r.Context(), r.PathValue("projectID"), r.PathValue("snapshotID"), *input.Protected)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, command)
+}
+
+func (s *HTTPServer) browseSnapshot(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	command, err := s.service.BrowseSnapshot(r.Context(), r.PathValue("projectID"), r.PathValue("snapshotID"), input.Path)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, command)
+}
+
+func (s *HTTPServer) restoreSnapshot(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	command, err := s.service.RestoreSnapshot(r.Context(), r.PathValue("projectID"), r.PathValue("snapshotID"), input.Path)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, command)
+}
+
+func (s *HTTPServer) listSnapshots(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	items, err := s.service.Store().ListSnapshots(r.Context(), strings.TrimSpace(r.URL.Query().Get("project_id")), limit)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
 func (s *HTTPServer) listRuns(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	items, err := s.service.Store().ListRuns(r.Context(), limit)
@@ -371,6 +444,46 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	report.ServerID = server.ID
+	if report.Status == domain.RunSucceeded && report.Stats != nil {
+		if raw, ok := report.Stats["snapshots"]; ok {
+			encoded, err := json.Marshal(raw)
+			if err != nil {
+				s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory is invalid", nil)
+				return
+			}
+			var snapshots []domain.Snapshot
+			if err := json.Unmarshal(encoded, &snapshots); err != nil {
+				s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory is invalid", nil)
+				return
+			}
+			if len(snapshots) > 10000 {
+				s.writeError(w, http.StatusRequestEntityTooLarge, "snapshot_inventory_too_large", "snapshot inventory contains too many entries", nil)
+				return
+			}
+			for index := range snapshots {
+				snapshot := &snapshots[index]
+				if !fullResticSnapshotID.MatchString(snapshot.ID) || snapshot.Time.IsZero() {
+					s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory contains an invalid ID or timestamp", nil)
+					return
+				}
+				snapshot.Protected = false
+				for _, tag := range snapshot.Tags {
+					if tag == protectedSnapshotTag {
+						snapshot.Protected = true
+						break
+					}
+				}
+			}
+			syncedAt := time.Now().UTC()
+			if report.FinishedAt != nil {
+				syncedAt = report.FinishedAt.UTC()
+			}
+			if err := s.service.Store().ReplaceProjectSnapshots(r.Context(), report.ProjectID, server.ID, snapshots, syncedAt); err != nil {
+				s.handleServiceError(w, err)
+				return
+			}
+		}
+	}
 	if err := s.service.Store().UpsertRun(r.Context(), report); err != nil {
 		s.handleServiceError(w, err)
 		return

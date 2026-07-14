@@ -32,6 +32,12 @@ type Runner struct {
 	pgDumpPath    string
 	dockerPath    string
 	stagingRoot   string
+	restoreRoot   string
+}
+
+func (r *Runner) SetRestoreRoot(path string) *Runner {
+	r.restoreRoot = strings.TrimSpace(path)
+	return r
 }
 
 func NewRunner(resticPath string) *Runner {
@@ -327,6 +333,7 @@ func retentionArguments(agentID, projectID string, retention domain.RetentionPol
 			}
 		}
 	}
+	args = append(args, "--keep-tag", "vaultmesh.protected=true")
 	return args
 }
 

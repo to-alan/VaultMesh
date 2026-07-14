@@ -177,6 +177,88 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 	if dashboard.RunsSucceeded != 2 {
 		t.Fatalf("maintenance operation polluted backup success metrics: %#v", dashboard)
 	}
+
+	var refreshCommand domain.Command
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/snapshots/refresh", adminCookie,
+		nil, http.StatusAccepted, &refreshCommand)
+	commands.Items = nil
+	requestJSON(t, handler, http.MethodGet, "/api/v1/agent/commands", identity.Token,
+		nil, http.StatusOK, &commands)
+	if len(commands.Items) != 1 || commands.Items[0].Type != "snapshot_sync" {
+		t.Fatalf("snapshot refresh command was not leased: %#v", commands.Items)
+	}
+	const snapshotID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_snapshot_sync",
+		IdempotencyKey: "manual:" + refreshCommand.ID,
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunSucceeded,
+		Stats: map[string]any{
+			"operation": "snapshot_sync",
+			"snapshots": []domain.Snapshot{{
+				ID: snapshotID, Time: now, Hostname: "test-vps", Paths: []string{"/etc"},
+				Tags: []string{"vaultmesh.project_id=" + project.ID}, TotalFiles: 12, TotalBytes: 4096,
+			}},
+		},
+	}, http.StatusNoContent, nil)
+	var snapshots struct {
+		Items []domain.Snapshot `json:"items"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/snapshots?project_id="+project.ID, adminCookie,
+		nil, http.StatusOK, &snapshots)
+	if len(snapshots.Items) != 1 || snapshots.Items[0].ID != snapshotID || snapshots.Items[0].ProjectID != project.ID || snapshots.Items[0].ServerID != identity.AgentID {
+		t.Fatalf("snapshot inventory was not indexed safely: %#v", snapshots.Items)
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_stale_snapshot_sync",
+		IdempotencyKey: project.ID + ":snapshot_sync:stale",
+		ProjectID:      project.ID,
+		ScheduledAt:    now.Add(-time.Minute),
+		StartedAt:      now.Add(-time.Minute),
+		FinishedAt:     &now,
+		Status:         domain.RunSucceeded,
+		Stats:          map[string]any{"operation": "snapshot_sync", "snapshots": []domain.Snapshot{}},
+	}, http.StatusNoContent, nil)
+	snapshots.Items = nil
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/snapshots?project_id="+project.ID, adminCookie,
+		nil, http.StatusOK, &snapshots)
+	if len(snapshots.Items) != 1 || snapshots.Items[0].ID != snapshotID {
+		t.Fatalf("stale empty inventory replaced a newer snapshot index: %#v", snapshots.Items)
+	}
+
+	tests := []struct {
+		name         string
+		path         string
+		body         any
+		commandType  string
+		payloadKey   string
+		payloadValue any
+	}{
+		{"browse", "/browse", map[string]string{"path": "/etc"}, "snapshot_browse", "path", "/etc"},
+		{"protect", "/protect", map[string]bool{"protected": true}, "snapshot_protect", "protected", true},
+		{"restore", "/restore", map[string]string{"path": "/etc/hosts"}, "snapshot_restore", "path", "/etc/hosts"},
+	}
+	for _, test := range tests {
+		t.Run("snapshot "+test.name+" command", func(t *testing.T) {
+			var issued domain.Command
+			requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/snapshots/"+snapshotID+test.path,
+				adminCookie, test.body, http.StatusAccepted, &issued)
+			commands.Items = nil
+			requestJSON(t, handler, http.MethodGet, "/api/v1/agent/commands", identity.Token,
+				nil, http.StatusOK, &commands)
+			if len(commands.Items) != 1 || commands.Items[0].ID != issued.ID || commands.Items[0].Type != test.commandType {
+				t.Fatalf("unexpected leased command: %#v", commands.Items)
+			}
+			if commands.Items[0].Payload["snapshot_id"] != snapshotID || commands.Items[0].Payload[test.payloadKey] != test.payloadValue {
+				t.Fatalf("command payload was not preserved: %#v", commands.Items[0].Payload)
+			}
+		})
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/snapshots/"+snapshotID+"/browse", adminCookie,
+		map[string]string{"path": "../etc"}, http.StatusUnprocessableEntity, nil)
 }
 
 func TestAdminAPIRequiresLoginSessionAndRejectsBearerToken(t *testing.T) {

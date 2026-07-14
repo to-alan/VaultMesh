@@ -214,6 +214,45 @@ For PostgreSQL, use `"type": "postgresql"` with the same `database` object. The 
 
 The Agent runs `docker inspect` for the explicitly configured containers, stores a sanitized manifest without container environment variables, and adds bind-mount and named-volume host paths to Restic. It does not stop containers or back up their writable layers. Database containers should use the MySQL/PostgreSQL source adapters for application-consistent logical dumps.
 
+## Snapshot index and safe restore
+
+Refresh one project's cached Restic inventory:
+
+```http
+POST /api/v1/projects/{project_id}/snapshots/refresh
+```
+
+The call returns `202 Accepted`. The target Agent executes `restic snapshots --json` scoped by Agent host and project tag; completed metadata is available from:
+
+```http
+GET /api/v1/snapshots?project_id={project_id}&limit=200
+```
+
+Snapshot commands require the full 64-character Restic ID already present in the cached project inventory:
+
+```http
+POST /api/v1/projects/{project_id}/snapshots/{snapshot_id}/protect
+Content-Type: application/json
+
+{"protected": true}
+```
+
+```http
+POST /api/v1/projects/{project_id}/snapshots/{snapshot_id}/browse
+Content-Type: application/json
+
+{"path": "/etc/nginx"}
+```
+
+```http
+POST /api/v1/projects/{project_id}/snapshots/{snapshot_id}/restore
+Content-Type: application/json
+
+{"path": "/etc/nginx/nginx.conf"}
+```
+
+All three calls are asynchronous and return a leased Agent command. Browse results are written to a Run with `stats.operation = snapshot_browse` and an `entries` array. A restore Run includes `restore_target`, file counts and byte counts. Restore always creates `VAULTMESH_RESTORE_ROOT/<command-id>` on the project's Agent and invokes Restic with `--overwrite never`; the API does not support restoring directly over the source path.
+
 `sources` accepts multiple entries. A project may therefore combine application files, Docker mounts and database dumps in the same Restic snapshot. Every project response also includes a server-calculated `next_run_at` value based on its five-field Cron expression and IANA timezone:
 
 ```json
