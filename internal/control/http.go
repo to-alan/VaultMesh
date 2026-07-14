@@ -2,8 +2,6 @@ package control
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -23,13 +21,17 @@ const maxRequestBody = 1 << 20
 type HTTPServer struct {
 	service        *Service
 	logger         *slog.Logger
-	adminTokenSum  [32]byte
+	adminAuth      *adminAuthenticator
 	allowedOrigins map[string]struct{}
 }
 
 type agentContextKey struct{}
 
-func NewHTTPServer(service *Service, logger *slog.Logger, adminToken string, allowedOrigins []string) *HTTPServer {
+func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthConfig, allowedOrigins []string) (*HTTPServer, error) {
+	adminAuth, err := newAdminAuthenticator(adminConfig)
+	if err != nil {
+		return nil, err
+	}
 	origins := make(map[string]struct{}, len(allowedOrigins))
 	for _, origin := range allowedOrigins {
 		origins[origin] = struct{}{}
@@ -37,9 +39,9 @@ func NewHTTPServer(service *Service, logger *slog.Logger, adminToken string, all
 	return &HTTPServer{
 		service:        service,
 		logger:         logger,
-		adminTokenSum:  sha256.Sum256([]byte(adminToken)),
+		adminAuth:      adminAuth,
 		allowedOrigins: origins,
-	}
+	}, nil
 }
 
 func (s *HTTPServer) Handler() http.Handler {
@@ -47,6 +49,9 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/v1/meta", s.meta)
 	mux.HandleFunc("POST /api/v1/enroll", s.enrollAgent)
+	mux.HandleFunc("POST /api/v1/auth/login", s.login)
+	mux.HandleFunc("POST /api/v1/auth/logout", s.logout)
+	mux.Handle("GET /api/v1/auth/session", s.admin(http.HandlerFunc(s.session)))
 
 	mux.Handle("GET /api/v1/dashboard", s.admin(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /api/v1/servers", s.admin(http.HandlerFunc(s.listServers)))
@@ -82,6 +87,45 @@ func (s *HTTPServer) meta(w http.ResponseWriter, _ *http.Request) {
 		"name":    "VaultMesh",
 		"version": version.Version,
 		"commit":  version.Commit,
+	})
+}
+
+func (s *HTTPServer) login(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	if !s.adminAuth.authenticate(strings.TrimSpace(input.Username), input.Password) {
+		s.writeError(w, http.StatusUnauthorized, "invalid_credentials", "username or password is incorrect", nil)
+		return
+	}
+	token, session, err := s.adminAuth.createSession(time.Now())
+	if err != nil {
+		s.logger.Error("create administrator session", "error", err)
+		s.writeError(w, http.StatusInternalServerError, "internal_error", "administrator session could not be created", nil)
+		return
+	}
+	s.adminAuth.setSessionCookie(w, token)
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"username":   session.Username,
+		"expires_at": session.ExpiresAt,
+	})
+}
+
+func (s *HTTPServer) logout(w http.ResponseWriter, r *http.Request) {
+	s.adminAuth.deleteSession(r)
+	s.adminAuth.clearSessionCookies(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *HTTPServer) session(w http.ResponseWriter, r *http.Request) {
+	session, _ := s.adminAuth.session(r, time.Now())
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"username":   session.Username,
+		"expires_at": session.ExpiresAt,
 	})
 }
 
@@ -263,10 +307,8 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) admin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r.Header.Get("Authorization"))
-		sum := sha256.Sum256([]byte(token))
-		if token == "" || subtle.ConstantTimeCompare(sum[:], s.adminTokenSum[:]) != 1 {
-			s.writeError(w, http.StatusUnauthorized, "unauthorized", "valid administrator token required", nil)
+		if _, ok := s.adminAuth.session(r, time.Now()); !ok {
+			s.writeError(w, http.StatusUnauthorized, "unauthorized", "administrator login required", nil)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -299,6 +341,7 @@ func (s *HTTPServer) cors(next http.Handler) http.Handler {
 				return
 			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
 			w.Header().Set("Access-Control-Max-Age", "600")

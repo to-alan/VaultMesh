@@ -11,23 +11,41 @@ import (
 type Server struct {
 	ListenAddress  string
 	DatabaseURL    string
-	AdminToken     string
+	AdminUsername  string
+	AdminPassword  string
 	MasterKey      string
 	AllowedOrigins []string
+	CookieSecure   bool
 	AutoMigrate    bool
 }
 
 func LoadServer() (Server, error) {
+	cookieSecure, err := envBool("VAULTMESH_COOKIE_SECURE", false)
+	if err != nil {
+		return Server{}, err
+	}
+	autoMigrate, err := envBool("VAULTMESH_AUTO_MIGRATE", true)
+	if err != nil {
+		return Server{}, err
+	}
 	config := Server{
 		ListenAddress:  envOr("VAULTMESH_LISTEN", ":8080"),
 		DatabaseURL:    strings.TrimSpace(os.Getenv("VAULTMESH_DATABASE_URL")),
-		AdminToken:     strings.TrimSpace(os.Getenv("VAULTMESH_ADMIN_TOKEN")),
+		AdminUsername:  strings.TrimSpace(os.Getenv("VAULTMESH_ADMIN_USERNAME")),
+		AdminPassword:  os.Getenv("VAULTMESH_ADMIN_PASSWORD"),
 		MasterKey:      strings.TrimSpace(os.Getenv("VAULTMESH_MASTER_KEY")),
 		AllowedOrigins: splitList(os.Getenv("VAULTMESH_ALLOWED_ORIGINS")),
-		AutoMigrate:    envBool("VAULTMESH_AUTO_MIGRATE", true),
+		CookieSecure:   cookieSecure,
+		AutoMigrate:    autoMigrate,
 	}
-	if len(config.AdminToken) < 24 {
-		return Server{}, fmt.Errorf("VAULTMESH_ADMIN_TOKEN must contain at least 24 characters")
+	if config.AdminUsername == "" {
+		return Server{}, fmt.Errorf("VAULTMESH_ADMIN_USERNAME is required")
+	}
+	if len(config.AdminPassword) < 12 {
+		return Server{}, fmt.Errorf("VAULTMESH_ADMIN_PASSWORD must contain at least 12 characters")
+	}
+	if len([]byte(config.AdminPassword)) > 72 {
+		return Server{}, fmt.Errorf("VAULTMESH_ADMIN_PASSWORD must not exceed 72 bytes")
 	}
 	if config.MasterKey == "" {
 		return Server{}, fmt.Errorf("VAULTMESH_MASTER_KEY is required")
@@ -69,14 +87,14 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func envBool(key string, fallback bool) bool {
+func envBool(key string, fallback bool) (bool, error) {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
-		return fallback
+		return fallback, nil
 	}
 	parsed, err := strconv.ParseBool(value)
 	if err != nil {
-		return fallback
+		return false, fmt.Errorf("%s must be true or false", key)
 	}
-	return parsed
+	return parsed, nil
 }

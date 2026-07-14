@@ -1,4 +1,3 @@
-const tokenKey = 'vaultmesh.adminToken'
 const configuredAPIBase = window.__VAULTMESH_CONFIG__?.apiBaseUrl || import.meta.env.VITE_API_BASE_URL
 const developmentAPIBase = import.meta.env.DEV ? 'http://127.0.0.1:8080' : ''
 const apiBaseURL = normalizeAPIBase(configuredAPIBase || developmentAPIBase)
@@ -13,18 +12,6 @@ export class APIError extends Error {
   }
 }
 
-export function getToken(): string {
-  return sessionStorage.getItem(tokenKey) ?? ''
-}
-
-export function setToken(token: string): void {
-  if (token) {
-    sessionStorage.setItem(tokenKey, token)
-  } else {
-    sessionStorage.removeItem(tokenKey)
-  }
-}
-
 export function getAPIBaseURL(): string {
   return apiBaseURL
 }
@@ -32,11 +19,9 @@ export function getAPIBaseURL(): string {
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
   headers.set('Accept', 'application/json')
-  const token = getToken()
-  if (token) headers.set('Authorization', `Bearer ${token}`)
   if (options.body) headers.set('Content-Type', 'application/json')
 
-  const response = await fetch(`${apiBaseURL}${path}`, { ...options, headers })
+  const response = await fetch(`${apiBaseURL}${path}`, { ...options, headers, credentials: 'include' })
   if (!response.ok) {
     let message = `请求失败（HTTP ${response.status}）`
     let code = 'http_error'

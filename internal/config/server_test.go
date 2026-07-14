@@ -2,6 +2,30 @@ package config
 
 import "testing"
 
+func TestLoadServerUsesUsernamePasswordAndStrictBooleanConfiguration(t *testing.T) {
+	t.Setenv("VAULTMESH_ADMIN_USERNAME", "admin")
+	t.Setenv("VAULTMESH_ADMIN_PASSWORD", "correct-horse-battery-staple")
+	t.Setenv("VAULTMESH_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("VAULTMESH_COOKIE_SECURE", "true")
+	t.Setenv("VAULTMESH_AUTO_MIGRATE", "false")
+
+	config, err := LoadServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.AdminUsername != "admin" || config.AdminPassword != "correct-horse-battery-staple" {
+		t.Fatalf("unexpected administrator credentials: %#v", config)
+	}
+	if !config.CookieSecure || config.AutoMigrate {
+		t.Fatalf("unexpected boolean configuration: %#v", config)
+	}
+
+	t.Setenv("VAULTMESH_COOKIE_SECURE", "sometimes")
+	if _, err := LoadServer(); err == nil {
+		t.Fatal("expected invalid cookie security boolean to fail")
+	}
+}
+
 func TestSplitListAndValidateOrigin(t *testing.T) {
 	origins := splitList(" https://console.example.com, http://127.0.0.1:5173 ,, ")
 	if len(origins) != 2 || origins[0] != "https://console.example.com" || origins[1] != "http://127.0.0.1:5173" {

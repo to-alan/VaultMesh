@@ -40,46 +40,60 @@ Browser → VaultMesh Web (Nginx/static) → HTTPS API → Control Plane → Pos
                                                └─ pg_dump
 ```
 
-Web 与 Control Plane 不共享进程、镜像或静态目录。Web 容器通过 `VAULTMESH_API_BASE_URL` 在启动时生成运行时配置；API 只接受 `VAULTMESH_ALLOWED_ORIGINS` 中精确列出的浏览器来源。两者可以使用不同域名、独立扩缩容和独立发布。
+Web 与 Control Plane 不共享进程、镜像或静态目录。Web 容器通过 `VAULTMESH_API_BASE_URL` 在启动时生成运行时配置；API 只接受 `VAULTMESH_ALLOWED_ORIGINS` 中精确列出的浏览器来源。两者可以使用同一站点下的不同域名（例如 `vaultmesh.example.com` 与 `api.example.com`），并独立扩缩容和发布。
 
 备份仓库在控制面中是独立的全局存储渠道。项目分别选择执行服务器和存储渠道；控制面在下发时把渠道基础路径扩展为 `/<server-id>`，避免不同服务器写入同一个 Restic 仓库路径。
 
 备份正文不经过控制面。中心暂时不可用时，Agent 继续执行最后一份已应用配置，并在连接恢复后补报结果。
 
-## 快速启动控制面
+## 一键部署
 
-需要 Docker Compose。先创建配置：
+适用于已安装 Git、OpenSSL、Docker Engine 和 Docker Compose v2 的 Linux 主机：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh
+```
+
+脚本会把公开仓库安装到 `/opt/vaultmesh`，首次运行生成主密钥、PostgreSQL 密码和管理员密码，以权限 `0600` 写入 `/opt/vaultmesh/.env`，随后构建并启动 Control Plane、Web 和 PostgreSQL。重复执行会更新 Git 仓库、保留现有 `.env` 和数据库卷，并重新构建服务；旧版 Token 配置会自动补齐新的账号密码字段，旧 Token 不再参与认证。
+
+默认只监听服务器回环地址。若部署在远程 VPS，先从本机建立隧道：
+
+```bash
+ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 user@your-server
+```
+
+然后浏览器打开 `http://127.0.0.1:3000`，使用脚本输出的用户名和密码登录。生产环境应配置可信 HTTPS 反向代理，把 Web Origin 精确写入 `VAULTMESH_ALLOWED_ORIGINS`，把浏览器可访问的 API URL 写入 `VAULTMESH_PUBLIC_API_URL`，并设置 `VAULTMESH_COOKIE_SECURE=true`。
+
+如果不希望直接执行远程脚本，可先下载审阅：
+
+```bash
+curl -fsSLo vaultmesh-install.sh https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh
+less vaultmesh-install.sh
+sudo sh vaultmesh-install.sh
+```
+
+## 手动启动控制面
+
+复制配置并填写 `VAULTMESH_MASTER_KEY`、`VAULTMESH_ADMIN_PASSWORD` 和 `POSTGRES_PASSWORD`；对应的生成命令已经写在 `.env.example` 中：
 
 ```bash
 cp .env.example .env
-```
-
-分别生成并填写三个值：
-
-```bash
-openssl rand -base64 32
-openssl rand -hex 32
-openssl rand -hex 32
-```
-
-然后启动：
-
-```bash
+$EDITOR .env
 docker compose up -d --build
 ```
 
-Compose 默认将 Web 监听在 `127.0.0.1:3000`，API 监听在 `127.0.0.1:8080`。生产环境应分别使用例如 `vaultmesh.example.com` 和 `api.vaultmesh.example.com` 的可信 HTTPS 入口，并把 Web Origin 精确写入 `VAULTMESH_ALLOWED_ORIGINS`。
-
-浏览器打开 `http://127.0.0.1:3000`，输入 `.env` 中的 `VAULTMESH_ADMIN_TOKEN`。
+管理员通过用户名和密码登录。Control Plane 使用 bcrypt 生成进程内密码校验值；登录后浏览器使用不可由 JavaScript 读取的 HttpOnly 会话 Cookie，前端不保存管理员认证凭据。当前会话最长 12 小时，浏览器会话结束或 Control Plane 重启后需要重新登录。
 
 ## 本地开发
 
 本地开发要求 Go 1.26.5 或更高的补丁版本以及 Node.js 24；低于 1.26.5 的 Go 标准库包含本项目调用路径可触达的已知安全问题。可不安装 PostgreSQL；省略 `VAULTMESH_DATABASE_URL` 时使用内存存储，进程重启后元数据会丢失。
 
 ```bash
-export VAULTMESH_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export VAULTMESH_ADMIN_USERNAME="admin"
+export VAULTMESH_ADMIN_PASSWORD="$(openssl rand -hex 16)"
 export VAULTMESH_MASTER_KEY="$(openssl rand -base64 32)"
 export VAULTMESH_ALLOWED_ORIGINS="http://127.0.0.1:5173"
+export VAULTMESH_COOKIE_SECURE="false"
 make build
 ./bin/vaultmesh-server
 ```
@@ -140,7 +154,9 @@ make check
 
 ## 当前限制
 
-- 管理端使用单个高熵管理员 Token，尚未实现多用户登录和 RBAC；
+- 管理端目前只有一个本地用户名/密码账号，尚未实现多用户、RBAC、密码找回和登录审计；
+- 管理会话保存在单个 Control Plane 进程内，进程重启后需要重新登录，尚不支持多副本共享会话；
+- 应用内尚未实现登录限速；公网入口必须在反向代理或 WAF 对登录接口实施限速；
 - 尚未实现快照浏览、保留/Prune、仓库 Check 和恢复 UI；
 - 直接 S3 模式不提供不可变备份保证；
 - Docker 挂载卷默认为崩溃一致性快照，不会自动停止容器；数据库容器应同时配置 MySQL/PostgreSQL 逻辑备份；
@@ -151,7 +167,7 @@ make check
 
 ## 安全
 
-请阅读 [SECURITY.md](./SECURITY.md)。不要把控制面直接以明文 HTTP 暴露到公网，不要在日志或 Issue 中提交管理员 Token、Restic 密码、数据库密码或对象存储密钥。
+请阅读 [SECURITY.md](./SECURITY.md)。不要把控制面直接以明文 HTTP 暴露到公网，不要在日志或 Issue 中提交管理员密码、Agent 设备凭据、Restic 密码、数据库密码或对象存储密钥。
 
 ## API
 

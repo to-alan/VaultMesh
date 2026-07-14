@@ -60,7 +60,16 @@ func main() {
 	defer dataStore.Close()
 
 	service := control.NewService(dataStore, sealer)
-	handler := control.NewHTTPServer(service, logger, config.AdminToken, config.AllowedOrigins).Handler()
+	httpServer, err := control.NewHTTPServer(service, logger, control.AdminAuthConfig{
+		Username:     config.AdminUsername,
+		Password:     config.AdminPassword,
+		CookieSecure: config.CookieSecure,
+	}, config.AllowedOrigins)
+	if err != nil {
+		logger.Error("initialize administrator authentication", "error", err)
+		os.Exit(1)
+	}
+	handler := httpServer.Handler()
 	server := &http.Server{
 		Addr:              config.ListenAddress,
 		Handler:           handler,

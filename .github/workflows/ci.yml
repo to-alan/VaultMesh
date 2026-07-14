@@ -56,12 +56,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       POSTGRES_PASSWORD: vaultmesh_ci_postgres
-      VAULTMESH_ADMIN_TOKEN: vaultmesh-ci-administrator-token
+      VAULTMESH_ADMIN_USERNAME: admin
+      VAULTMESH_ADMIN_PASSWORD: vaultmesh-ci-administrator-password
       VAULTMESH_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
       VAULTMESH_ALLOWED_ORIGINS: http://127.0.0.1:3000
       VAULTMESH_PUBLIC_API_URL: http://127.0.0.1:8080
     steps:
       - uses: actions/checkout@v7
+      - run: sh -n install.sh
       - run: docker compose config --quiet
       - run: docker build --tag vaultmesh-control:ci .
       - run: docker build --file Dockerfile.web --tag vaultmesh-web:ci .
@@ -72,11 +74,17 @@ jobs:
           }
           trap cleanup EXIT
           docker run --detach --name vaultmesh-control-ci --publish 127.0.0.1:18081:8080 \
-            --env VAULTMESH_ADMIN_TOKEN --env VAULTMESH_MASTER_KEY --env VAULTMESH_ALLOWED_ORIGINS \
+            --env VAULTMESH_ADMIN_USERNAME --env VAULTMESH_ADMIN_PASSWORD \
+            --env VAULTMESH_MASTER_KEY --env VAULTMESH_ALLOWED_ORIGINS \
             vaultmesh-control:ci
           docker run --detach --name vaultmesh-web-ci --publish 127.0.0.1:18080:80 \
             --env VAULTMESH_API_BASE_URL=https://api.example.test vaultmesh-web:ci
           curl --fail --silent --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:18081/healthz
+          curl --fail --silent --cookie-jar /tmp/vaultmesh-ci-cookie \
+            --header 'Content-Type: application/json' \
+            --data '{"username":"admin","password":"vaultmesh-ci-administrator-password"}' \
+            http://127.0.0.1:18081/api/v1/auth/login
+          curl --fail --silent --cookie /tmp/vaultmesh-ci-cookie http://127.0.0.1:18081/api/v1/dashboard
           web_config=$(curl --fail --silent --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:18080/config.js) || {
             docker logs vaultmesh-web-ci
             exit 1

@@ -18,6 +18,11 @@ import (
 	"github.com/to-alan/vaultmesh/internal/store/memory"
 )
 
+const (
+	testAdminUsername = "admin"
+	testAdminPassword = "correct-horse-battery-staple"
+)
+
 func TestControlPlaneVerticalSlice(t *testing.T) {
 	dataStore := memory.New()
 	key := bytes.Repeat([]byte{7}, 32)
@@ -27,10 +32,11 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 	}
 	service := NewService(dataStore, sealer)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := NewHTTPServer(service, logger, "a-very-long-administrator-token", []string{"https://console.example.com"}).Handler()
+	handler := newTestHTTPHandler(t, service, logger, false, []string{"https://console.example.com"})
+	adminCookie := loginAdmin(t, handler)
 
 	var enrollment domain.EnrollmentResult
-	requestJSON(t, handler, http.MethodPost, "/api/v1/servers", "a-very-long-administrator-token",
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/servers", adminCookie,
 		map[string]string{"name": "Test VPS"}, http.StatusCreated, &enrollment)
 	if enrollment.Server.ID == "" || enrollment.EnrollmentToken == "" {
 		t.Fatalf("incomplete enrollment response: %#v", enrollment)
@@ -49,7 +55,7 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 	}
 
 	var repository domain.Repository
-	requestJSON(t, handler, http.MethodPost, "/api/v1/repositories", "a-very-long-administrator-token", domain.Repository{
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/repositories", adminCookie, domain.Repository{
 		Provider:    "s3_compatible",
 		Name:        "MinIO",
 		URL:         "s3:http://localhost:9000/backups/server",
@@ -61,7 +67,7 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 	}
 
 	var project domain.Project
-	requestJSON(t, handler, http.MethodPost, "/api/v1/projects", "a-very-long-administrator-token", domain.Project{
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects", adminCookie, domain.Project{
 		ServerID:     identity.AgentID,
 		RepositoryID: repository.ID,
 		Name:         "Configuration",
@@ -89,7 +95,7 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 		t.Fatalf("repository channel was not scoped to its assigned server: %s", config.Projects[0].Repository.URL)
 	}
 	var command domain.Command
-	requestJSON(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/run", "a-very-long-administrator-token",
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/run", adminCookie,
 		nil, http.StatusAccepted, &command)
 	if command.ID == "" || command.ProjectID != project.ID {
 		t.Fatalf("unexpected manual command: %#v", command)
@@ -135,14 +141,14 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 	var runs struct {
 		Items []domain.RunReport `json:"items"`
 	}
-	requestJSON(t, handler, http.MethodGet, "/api/v1/runs", "a-very-long-administrator-token",
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/runs", adminCookie,
 		nil, http.StatusOK, &runs)
 	if len(runs.Items) != 2 {
 		t.Fatalf("unexpected run list: %#v", runs.Items)
 	}
 }
 
-func TestAdminAPIRejectsMissingToken(t *testing.T) {
+func TestAdminAPIRequiresLoginSessionAndRejectsBearerToken(t *testing.T) {
 	key, err := secret.ParseKey(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)))
 	if err != nil {
 		t.Fatal(err)
@@ -151,8 +157,9 @@ func TestAdminAPIRejectsMissingToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), "a-very-long-administrator-token", nil).Handler()
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false, nil)
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/servers", nil)
+	request.Header.Set("Authorization", "Bearer legacy-administrator-token")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {
@@ -160,13 +167,44 @@ func TestAdminAPIRejectsMissingToken(t *testing.T) {
 	}
 }
 
+func TestAdminLoginUsesProtectedCookieAndLogoutRevokesSession(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{2}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), true, nil)
+	cookie := loginAdmin(t, handler)
+	if cookie.Name != secureSessionCookie || !cookie.HttpOnly || !cookie.Secure || cookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("unexpected administrator cookie: %#v", cookie)
+	}
+	if cookie.MaxAge != 0 || !cookie.Expires.IsZero() {
+		t.Fatalf("administrator cookie must be non-persistent: %#v", cookie)
+	}
+
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/auth/session", cookie, nil, http.StatusOK, nil)
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/auth/logout", cookie, nil, http.StatusNoContent, nil)
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/auth/session", cookie, nil, http.StatusUnauthorized, nil)
+}
+
+func TestAdminLoginRejectsInvalidCredentials(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/v1/auth/login", "", map[string]string{
+		"username": testAdminUsername,
+		"password": "wrong-password",
+	}, http.StatusUnauthorized, nil)
+}
+
 func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 	sealer, err := secret.New(bytes.Repeat([]byte{3}, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(),
-		"a-very-long-administrator-token", []string{"https://console.example.com"}).Handler()
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false,
+		[]string{"https://console.example.com"})
 
 	preflight := httptest.NewRequest(http.MethodOptions, "/api/v1/dashboard", nil)
 	preflight.Header.Set("Origin", "https://console.example.com")
@@ -178,6 +216,9 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 	}
 	if got := preflightResponse.Header().Get("Access-Control-Allow-Origin"); got != "https://console.example.com" {
 		t.Fatalf("unexpected access-control-allow-origin %q", got)
+	}
+	if got := preflightResponse.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("unexpected access-control-allow-credentials %q", got)
 	}
 
 	forbidden := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -307,6 +348,14 @@ func TestPublicProjectIncludesNextRunInConfiguredTimezone(t *testing.T) {
 }
 
 func requestJSON(t *testing.T, handler http.Handler, method, path, token string, input any, expectedStatus int, output any) {
+	requestJSONWithAuth(t, handler, method, path, token, nil, input, expectedStatus, output)
+}
+
+func requestJSONWithCookie(t *testing.T, handler http.Handler, method, path string, cookie *http.Cookie, input any, expectedStatus int, output any) {
+	requestJSONWithAuth(t, handler, method, path, "", cookie, input, expectedStatus, output)
+}
+
+func requestJSONWithAuth(t *testing.T, handler http.Handler, method, path, token string, cookie *http.Cookie, input any, expectedStatus int, output any) {
 	t.Helper()
 	var body io.Reader
 	if input != nil {
@@ -326,6 +375,9 @@ func requestJSON(t *testing.T, handler http.Handler, method, path, token string,
 	if token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
+	if cookie != nil {
+		request.AddCookie(cookie)
+	}
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	response := recorder.Result()
@@ -339,4 +391,43 @@ func requestJSON(t *testing.T, handler http.Handler, method, path, token string,
 			t.Fatal(err)
 		}
 	}
+}
+
+func newTestHTTPHandler(t *testing.T, service *Service, logger *slog.Logger, cookieSecure bool, origins []string) http.Handler {
+	t.Helper()
+	server, err := NewHTTPServer(service, logger, AdminAuthConfig{
+		Username:     testAdminUsername,
+		Password:     testAdminPassword,
+		CookieSecure: cookieSecure,
+	}, origins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server.Handler()
+}
+
+func loginAdmin(t *testing.T, handler http.Handler) *http.Cookie {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{
+		"username": testAdminUsername,
+		"password": testAdminPassword,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(data))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	response := recorder.Result()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("login: expected 200, got %d: %s", response.StatusCode, body)
+	}
+	cookies := response.Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("login: expected one session cookie, got %d", len(cookies))
+	}
+	return cookies[0]
 }

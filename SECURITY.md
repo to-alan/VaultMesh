@@ -15,7 +15,9 @@ Please include the affected component, reproduction steps, expected impact, and 
 ## Deployment requirements
 
 - Expose the control plane only through HTTPS.
-- Serve the Web console and API as separate origins, and list only exact Web origins in `VAULTMESH_ALLOWED_ORIGINS`; never use a wildcard origin.
+- Serve the Web console and API as same-site HTTPS origins, list only exact Web origins in `VAULTMESH_ALLOWED_ORIGINS`, never use a wildcard origin, and set `VAULTMESH_COOKIE_SECURE=true`.
+- Protect `.env` as a root-readable secret because it contains the administrator password, master key, and PostgreSQL password. Rotate those values if the file is exposed.
+- Administrator login uses a server-side session carried by an HttpOnly, SameSite cookie. The Web application does not store a bearer token. Agent enrollment and device credentials remain separate machine identities and must not be reused as administrator credentials.
 - Keep `VAULTMESH_MASTER_KEY` separate from the PostgreSQL backup.
 - Treat a global storage channel as a trust boundary: scope its token to the minimum Bucket, do not share it across mutually untrusted servers, and use separate channels when credential isolation is required. VaultMesh automatically isolates Restic paths by server ID but cannot reduce the permissions of the underlying S3 token.
 - Remove the one-time enrollment token from the Agent environment after enrollment.

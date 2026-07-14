@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { APIError, api, getAPIBaseURL, getToken, setToken } from './api'
+import { APIError, api, getAPIBaseURL } from './api'
 import type { Dashboard, EnrollmentResult, Project, Repository, Run, Server } from './types'
 
 type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'runs'
@@ -28,8 +28,10 @@ const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '�
 const commonTimezones = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Tokyo', 'UTC', 'Europe/London', 'America/New_York']
 const apiBaseURL = getAPIBaseURL()
 
-const tokenInput = ref('')
-const authenticated = ref(Boolean(getToken()))
+const usernameInput = ref('admin')
+const passwordInput = ref('')
+const authenticated = ref(false)
+const authReady = ref(false)
 const activeTab = ref<Tab>('overview')
 const loading = ref(false)
 const error = ref('')
@@ -171,22 +173,33 @@ const projectHealth = computed(() => projects.value.map((project) => {
 
 async function login() {
   error.value = ''
-  setToken(tokenInput.value.trim())
+  loading.value = true
   try {
-    await loadAll()
+    await api('/api/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username: usernameInput.value.trim(), password: passwordInput.value }),
+    })
     authenticated.value = true
-    tokenInput.value = ''
+    passwordInput.value = ''
+    await loadAll()
   } catch (cause) {
-    setToken('')
     authenticated.value = false
     showError(cause)
+  } finally {
+    loading.value = false
   }
 }
 
-function logout() {
-  setToken('')
-  authenticated.value = false
-  tokenInput.value = ''
+async function logout() {
+  try {
+    await api('/api/v1/auth/logout', { method: 'POST' })
+  } catch {
+    // Clear the local UI state even if the API is temporarily unreachable.
+  } finally {
+    authenticated.value = false
+    passwordInput.value = ''
+    error.value = ''
+  }
 }
 
 async function loadAll() {
@@ -427,7 +440,13 @@ async function perform(operation: () => Promise<void>) {
 
 function showError(cause: unknown) {
   if (cause instanceof APIError) {
-    error.value = cause.message
+    if (cause.status === 401 && cause.code !== 'invalid_credentials') {
+      authenticated.value = false
+      passwordInput.value = ''
+      error.value = '登录已过期，请重新登录'
+      return
+    }
+    error.value = cause.code === 'invalid_credentials' ? '用户名或密码错误' : cause.message
   } else if (cause instanceof Error) {
     error.value = cause.message
   } else {
@@ -574,12 +593,15 @@ onMounted(async () => {
   refreshTimer = window.setInterval(() => {
     if (authenticated.value && !loading.value) void loadAll().catch(showError)
   }, 30000)
-  if (!authenticated.value) return
   try {
+    await api('/api/v1/auth/session')
+    authenticated.value = true
     await loadAll()
   } catch (cause) {
-    if (cause instanceof APIError && cause.status === 401) logout()
-    showError(cause)
+    authenticated.value = false
+    if (!(cause instanceof APIError && cause.status === 401)) showError(cause)
+  } finally {
+    authReady.value = true
   }
 })
 
@@ -590,19 +612,30 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main v-if="!authenticated" class="login-shell">
+  <main v-if="!authReady" class="login-shell">
+    <section class="login-card">
+      <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+      <p class="eyebrow">SELF-HOSTED BACKUP CONTROL</p>
+      <h1>VaultMesh</h1>
+      <p class="muted">正在确认登录状态…</p>
+    </section>
+  </main>
+
+  <main v-else-if="!authenticated" class="login-shell">
     <section class="login-card">
       <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
       <p class="eyebrow">SELF-HOSTED BACKUP CONTROL</p>
       <h1>VaultMesh</h1>
       <p class="muted">连接每一台服务器，看见每一次备份是否真正完成。</p>
       <form class="login-form" @submit.prevent="login">
-        <label for="admin-token">管理员令牌</label>
-        <input id="admin-token" v-model="tokenInput" type="password" autocomplete="current-password" required placeholder="VAULTMESH_ADMIN_TOKEN" />
+        <label for="admin-username">用户名</label>
+        <input id="admin-username" v-model="usernameInput" type="text" autocomplete="username" required placeholder="admin" />
+        <label for="admin-password">密码</label>
+        <input id="admin-password" v-model="passwordInput" type="password" autocomplete="current-password" required placeholder="请输入管理员密码" />
         <button class="primary" :disabled="loading">{{ loading ? '正在验证…' : '进入控制台' }}</button>
       </form>
       <p v-if="error" class="message error">{{ error }}</p>
-      <p class="security-note">令牌只保存在当前浏览器标签页的 sessionStorage 中。</p>
+      <p class="security-note">登录成功后使用 HttpOnly 会话 Cookie，前端不会读取或保存密码与会话凭据。</p>
     </section>
   </main>
 

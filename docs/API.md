@@ -1,14 +1,28 @@
 # VaultMesh API quick reference
 
-The API is versioned under `/api/v1`. Administrator endpoints use:
+The API is versioned under `/api/v1`. Administrator access uses a username/password login and a server-side session. The Web application never receives an administrator bearer token.
 
-```http
-Authorization: Bearer <VAULTMESH_ADMIN_TOKEN>
+Log in and store the HttpOnly session cookie:
+
+```bash
+curl --fail --silent \
+  --cookie-jar vaultmesh-cookie.txt \
+  --header 'Content-Type: application/json' \
+  --data '{"username":"admin","password":"YOUR_PASSWORD"}' \
+  https://api.example.com/api/v1/auth/login
 ```
 
-Agent endpoints use the device token returned by one-time enrollment. Secrets are accepted only over HTTPS in production.
+Use that cookie for administrator requests:
 
-The API service does not serve the Web application. Configure the independently deployed Web origin in `VAULTMESH_ALLOWED_ORIGINS` and set the Web container's `VAULTMESH_API_BASE_URL` to the browser-visible API URL. Origins are matched exactly; wildcard CORS is intentionally unsupported.
+```bash
+curl --fail --silent \
+  --cookie vaultmesh-cookie.txt \
+  https://api.example.com/api/v1/servers
+```
+
+`POST /api/v1/auth/logout` revokes the current session. Session cookies are HttpOnly, SameSite=Lax, non-persistent, and marked Secure when `VAULTMESH_COOKIE_SECURE=true`. Agent endpoints still use the device credential returned by one-time enrollment; this is machine identity and is deliberately separate from administrator login. Secrets and login passwords are accepted only over HTTPS in production.
+
+The API service does not serve the Web application. Configure the independently deployed, same-site Web origin in `VAULTMESH_ALLOWED_ORIGINS` and set the Web container's `VAULTMESH_API_BASE_URL` to the browser-visible API URL. Origins are matched exactly, credentialed CORS is enabled only for those origins, and wildcard CORS is intentionally unsupported.
 
 ## Create a server and enrollment token
 
