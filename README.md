@@ -1,76 +1,124 @@
 # VaultMesh
 
-VaultMesh 是一个面向 Linux VPS、Homelab 和小型技术团队的自托管多服务器备份控制平台。控制面统一管理服务器、Restic 仓库、备份项目、计划和运行状态；Agent 在源服务器本地持久化配置、按时执行，并把加密后的备份数据直接写入所选存储后端。
+[![CI](https://github.com/to-alan/VaultMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/to-alan/VaultMesh/actions/workflows/ci.yml)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-5ee9b5)](./LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8?logo=go&logoColor=white)](./go.mod)
+[![Vue](https://img.shields.io/badge/Vue-3-42b883?logo=vuedotjs&logoColor=white)](./web/package.json)
 
-> 当前状态：早期可运行纵向版本。请先在测试数据和独立 Bucket/Prefix 上验证，不要直接替换现有生产备份方案。
+面向 Linux VPS、Homelab 和小型技术团队的自托管多服务器备份控制平台。
 
-## 已实现
+VaultMesh 使用独立 Control Plane 集中管理服务器、备份项目、执行计划、Restic 仓库、运行状态和恢复流程；轻量 Agent 在源服务器本地执行备份，并把加密数据直接写入用户自己的存储。备份正文不经过控制面。
 
-- Go Control Plane 和 Go Agent；
-- PostgreSQL 元数据存储，以及无需数据库的内存开发模式；
-- 一次性 Agent 注册令牌和独立设备凭据；
-- Repository 与数据库密码的 AES-256-GCM 信封加密基础；
-- 全局备份仓库渠道，不与服务器绑定；下发时按服务器 ID 隔离 Restic 路径；
-- Restic 原生 Local、SFTP、REST、S3、Swift、B2、Azure Blob、GCS 后端，常用 S3 厂商预设，以及 rclone 扩展；
-- Agent 配置版本、本地持久化、重启恢复和离线继续调度；
-- 5 段 Cron、IANA 时区、随机抖动和仓库级串行执行；
-- 项目暂停/恢复、Restic 原生扫描边界、分层快照保留、可选 Prune 与仓库完整性校验；
-- 带租约和幂等键的“立即备份”命令；
-- 文件、Docker 挂载卷、MySQL 逻辑导出、PostgreSQL 逻辑导出；
-- Restic 仓库自动初始化、JSON 结果解析和退出码判定；
-- `succeeded`、`partial`、`failed`、`timed_out`、`unknown` 等运行状态；
-- 运行 Outbox：中心离线时本地保存，恢复后幂等上报；
-- Vue 3 + TypeScript 管理界面，支持 Cloudflare R2 引导，以及在一个项目中组合文件、Docker、MySQL 与 PostgreSQL 数据源；
-- 个人中心、持久化管理员密码、TOTP 二步验证、一次性恢复码与 WebAuthn 通行密钥；
-- 按服务器分组的备份项目视图，每台 Agent 的任务、数据源和下次执行时间独立呈现；
-- 日/周可视化计划、5 段高级 Cron、IANA 时区与服务端计算的下次执行时间；
-- API 与 Web 独立镜像、独立端口和独立发布，Web 通过运行时配置选择 API 地址；
-- Docker Compose、systemd Unit、CI 和安全部署说明。
+> [!IMPORTANT]
+> VaultMesh 当前处于 1.0 之前的可运行阶段。请先使用测试数据和独立 Bucket/Prefix 完成备份、校验和恢复演练，再考虑替换现有生产备份方案。
 
-项目边界、完整 P0/P1 范围和技术风险见 [VaultMesh 项目说明书](./VaultMesh-项目说明书.md)。备份项目字段、执行顺序、安全边界及开源依据见 [备份项目策略说明](./docs/BACKUP_PROJECTS.md)。
+## 项目概览
 
-## 架构
+| 项目 | 说明 |
+|---|---|
+| 产品定位 | 多服务器备份控制面，而不是新的备份格式或云存储服务 |
+| 执行引擎 | Restic |
+| 控制面 | Go API、PostgreSQL、Vue 3 Web |
+| 数据面 | Linux Agent 在源服务器本地准备数据并直传仓库 |
+| 适用规模 | 个人、多台 VPS、Homelab、小型技术团队 |
+| 主要存储 | Local、SFTP、REST、S3 兼容对象存储及受控 rclone 扩展 |
+| 安全模型 | 一次性 Agent 注册、设备凭据、Secret 加密、管理员 TOTP/通行密钥 |
+| 授权方式 | 公开源码，采用 [PolyForm Noncommercial 1.0.0](./LICENSE)，不授予商业用途 |
 
-```text
-Browser → VaultMesh Web (Nginx/static) → HTTPS API → Control Plane → PostgreSQL
-                                               ↑
-                                               │ HTTPS polling / run reports
-                                               │
-                                         VaultMesh Agent → Restic → Local / SFTP / REST / Object Storage / rclone
-                                               │
-                                               ├─ files
-                                               ├─ docker inspect + mounts
-                                               ├─ mysqldump
-                                               └─ pg_dump
+## VaultMesh 解决什么问题
+
+当服务器数量增加后，独立的 Restic 脚本和 Cron 很难持续回答这些问题：
+
+- 哪台服务器没有按计划完成备份；
+- 哪次运行是完全成功、部分成功、超时还是状态未知；
+- 不同项目的快照应保留多少份、何时清理；
+- 仓库最近是否完成过 Check；
+- 某个恢复点里有什么，以及恢复文件实际写到了哪里；
+- 控制面短时离线时，已有备份计划是否仍能执行。
+
+VaultMesh 把分散的脚本升级为一套声明式、可观察、可恢复的备份控制流程，同时继续让 Restic 负责加密、去重、快照和仓库存储。
+
+## 核心能力
+
+| 领域 | 当前能力 |
+|---|---|
+| 多服务器管理 | 一次性注册令牌、独立设备身份、心跳、配置 Revision、按服务器分组项目 |
+| 数据源 | 文件目录、Docker 挂载、MySQL 逻辑导出、PostgreSQL 逻辑导出，可在一个项目中组合 |
+| 调度 | 5 段 Cron、IANA 时区、随机抖动、最长运行时间、立即备份、暂停/恢复 |
+| 离线自治 | Agent 持久化最后有效配置；控制面离线时继续调度，并通过 Outbox 延迟上报 |
+| 仓库 | 全局存储渠道，与服务器解耦；下发时按 Server ID 派生隔离的 Restic 路径 |
+| 保留策略 | 最多 N 份、Smart、GFS、按时间保留、保护标签、真实仓库 dry-run 预览 |
+| 仓库维护 | Forget、Prune、Check 可使用独立维护窗口，并与备份共享仓库互斥锁 |
+| 快照与恢复 | 快照索引、目录浏览、永久保护、文件/目录恢复到全新隔离目录、禁止覆盖 |
+| 运行事实 | `succeeded`、`partial`、`failed`、`timed_out`、`unknown`，终态记录不可回退 |
+| 账户安全 | 密码、TOTP、一次性恢复码、WebAuthn 通行密钥、敏感操作重新认证 |
+| 前后端分离 | Web 与 API 使用独立镜像、端口和运行时配置，支持精确 Origin CORS |
+
+## 架构与数据流
+
+```mermaid
+flowchart LR
+    B["Browser"] --> W["VaultMesh Web"]
+    W -->|"HTTPS API"| C["Control Plane"]
+    C --> P[("PostgreSQL")]
+
+    A["VaultMesh Agent"] <-->|"配置、命令、心跳、运行上报"| C
+    A --> S["文件 / Docker / MySQL / PostgreSQL"]
+    A --> R["Restic"]
+    R --> O["Local / SFTP / REST / Object Storage / rclone"]
+
+    classDef control fill:#12221d,stroke:#5ee9b5,color:#ffffff;
+    classDef data fill:#101820,stroke:#62a8ff,color:#ffffff;
+    class C,W,P control;
+    class A,S,R,O data;
 ```
 
-Web 与 Control Plane 不共享进程、镜像或静态目录。Web 容器通过 `VAULTMESH_API_BASE_URL` 在启动时生成运行时配置；API 只接受 `VAULTMESH_ALLOWED_ORIGINS` 中精确列出的浏览器来源。两者可以使用同一站点下的不同域名（例如 `vaultmesh.example.com` 与 `api.example.com`），并独立扩缩容和发布。
+关键边界：
 
-备份仓库在控制面中是独立的全局存储渠道。项目分别选择执行服务器和存储渠道；控制面在下发时把渠道基础路径扩展为 `/<server-id>`，避免不同服务器写入同一个 Restic 仓库路径。
+1. 备份数据由 Agent 直接写入仓库，不经过 Control Plane。
+2. Control Plane 保存策略、加密后的 Secret、快照元数据和运行事实。
+3. Agent 不提供任意远程 Shell，只接受有限的强类型任务。
+4. 仓库渠道是全局资源；项目分别选择执行服务器和存储渠道。
+5. 中心短时不可用不会停止 Agent 已经持有的定时计划。
 
-仓库类型、认证字段、Agent 前置条件及其开源依据见 [存储仓库支持矩阵](./docs/STORAGE_PROVIDERS.md)。类型模型以 Restic 官方后端为准，1Panel 与 Kopia 用于产品字段和分类的交叉验证。
+## 适用与不适用场景
 
-备份正文不经过控制面。中心暂时不可用时，Agent 继续执行最后一份已应用配置，并在连接恢复后补报结果。
+| 适合 | 当前不适合 |
+|---|---|
+| 统一管理多台 Linux VPS 的 Restic 备份 | Windows、macOS、Kubernetes 原生备份 |
+| Homelab 的文件、容器挂载和数据库逻辑备份 | 块设备、虚拟机镜像、CDP |
+| 自托管控制面，数据保存在自己的对象存储 | 把 VaultMesh 当作托管云盘或备份数据中转服务 |
+| 希望看到运行、计划、快照、保留和恢复过程 | 自动覆盖生产目录并一键重建完整应用栈 |
+| 能接受先恢复到隔离目录再人工验收 | 当前就需要多管理员 RBAC 或高可用控制面 |
 
-## 一键部署
+## 快速开始
 
-适用于已安装 Git、OpenSSL、Docker Engine 和 Docker Compose v2 的 Linux 主机：
+### 1. 准备控制面主机
+
+一键部署面向 Linux 主机，需要以下工具：
+
+| 依赖 | 要求 |
+|---|---|
+| Git | 用于安装和安全更新仓库 |
+| OpenSSL | 首次生成主密钥和随机密码 |
+| Docker Engine | 运行 Control Plane、Web 和 PostgreSQL |
+| Docker Compose | v2，使用 `docker compose` 命令 |
+
+### 2. 一键安装
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh
 ```
 
-脚本会把公开仓库安装到 `/opt/vaultmesh`，首次运行生成主密钥、PostgreSQL 密码和管理员密码，以权限 `0600` 写入 `/opt/vaultmesh/.env`，随后构建并启动 Control Plane、Web 和 PostgreSQL。重复执行会更新 Git 仓库、保留现有 `.env` 和数据库卷，并重新构建服务；旧版 Token 配置会自动补齐新的账号密码字段，旧 Token 不再参与认证。
+安装脚本会：
 
-默认只监听服务器回环地址。若部署在远程 VPS，先从本机建立隧道：
+- 安装到 `/opt/vaultmesh`；
+- 首次生成管理员密码、PostgreSQL 密码和 `VAULTMESH_MASTER_KEY`；
+- 以 `0600` 权限保存 `/opt/vaultmesh/.env`；
+- 构建并启动 Control Plane、Web 和 PostgreSQL；
+- 重复运行时保留 `.env` 与数据库卷，并执行快进更新。
 
-```bash
-ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 user@your-server
-```
-
-然后浏览器打开 `http://localhost:3000`，使用脚本输出的用户名和密码登录。生产环境应配置可信 HTTPS 反向代理，把 Web Origin 精确写入 `VAULTMESH_ALLOWED_ORIGINS`，把浏览器可访问的 API URL 写入 `VAULTMESH_PUBLIC_API_URL`，并设置 `VAULTMESH_COOKIE_SECURE=true`。
-
-如果不希望直接执行远程脚本，可先下载审阅：
+不希望直接执行远程脚本时，可以先审阅：
 
 ```bash
 curl -fsSLo vaultmesh-install.sh https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh
@@ -78,72 +126,36 @@ less vaultmesh-install.sh
 sudo sh vaultmesh-install.sh
 ```
 
-## 手动启动控制面
+### 3. 打开控制台
 
-复制配置并填写 `VAULTMESH_MASTER_KEY`、`VAULTMESH_ADMIN_PASSWORD` 和 `POSTGRES_PASSWORD`；对应的生成命令已经写在 `.env.example` 中：
+服务默认只绑定回环地址：
 
-```bash
-cp .env.example .env
-$EDITOR .env
-docker compose up -d --build
-```
+| 服务 | 默认地址 |
+|---|---|
+| Web | `http://localhost:3000` |
+| API | `http://localhost:8080` |
 
-管理员首次启动时由环境变量引导创建，随后密码哈希和安全资料持久化到 PostgreSQL；再次修改 `.env` 不会覆盖数据库中的现有密码。登录后可从控制台左下角账户入口进入“个人中心”，在按需弹出的安全步骤中修改密码、启用 TOTP 二步验证、生成一次性恢复码并注册通行密钥，页面不会常驻展示敏感输入框。修改密码或停用二步验证会撤销全部会话；添加或删除通行密钥要求最近 10 分钟内完成过身份验证，超时后才会单独要求当前密码和二步验证码。浏览器使用不可由 JavaScript 读取的 HttpOnly 会话 Cookie，前端不保存管理员认证凭据；当前会话最长 12 小时，Control Plane 重启后需要重新登录。
-
-通行密钥要求浏览器访问的 Origin 与 WebAuthn 配置严格匹配。本地默认值可直接使用；生产环境请配置：
+远程 VPS 可先建立 SSH 隧道：
 
 ```bash
-VAULTMESH_WEBAUTHN_RP_ID=vaultmesh.example.com
-VAULTMESH_WEBAUTHN_RP_ORIGINS=https://vaultmesh.example.com
-VAULTMESH_WEBAUTHN_RP_NAME=VaultMesh
+ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 user@your-server
 ```
 
-`RP_ID` 必须是域名格式，不能是 IP 地址，也不能包含协议或端口。本地 HTTP 通行密钥必须通过 `localhost` 访问；生产环境必须部署在 HTTPS 域名下。
+随后打开 `http://localhost:3000`，使用安装脚本输出的账号密码登录。
 
-## 本地开发
+### 4. 接入第一台 Agent
 
-本地开发要求 Go 1.26.5 或更高的补丁版本以及 Node.js 24；低于 1.26.5 的 Go 标准库包含本项目调用路径可触达的已知安全问题。可不安装 PostgreSQL；省略 `VAULTMESH_DATABASE_URL` 时使用内存存储，进程重启后元数据会丢失。
+Agent 主机的依赖取决于数据源和仓库：
 
-```bash
-export VAULTMESH_ADMIN_USERNAME="admin"
-export VAULTMESH_ADMIN_PASSWORD="$(openssl rand -hex 16)"
-export VAULTMESH_MASTER_KEY="$(openssl rand -base64 32)"
-export VAULTMESH_ALLOWED_ORIGINS="http://localhost:5173"
-export VAULTMESH_COOKIE_SECURE="false"
-# 未显式设置时，WebAuthn RP ID/Origin 会从 ALLOWED_ORIGINS 推导。
-make build
-./bin/vaultmesh-server
-```
+| 功能 | Agent 依赖 |
+|---|---|
+| 所有备份 | Restic 0.17.0 或更高版本 |
+| MySQL | `mysqldump` |
+| PostgreSQL | `pg_dump` |
+| Docker 挂载 | Docker CLI 及访问 Docker daemon/挂载路径的权限 |
+| WebDAV/网盘/rclone | rclone，并在相关 Agent 上预配置同名 remote |
 
-前端热更新：
-
-```bash
-npm --prefix web ci
-npm --prefix web run dev
-```
-
-## 添加 Cloudflare R2
-
-1. 在 Cloudflare R2 创建 Bucket。
-2. 在 R2 API Tokens 中创建限制到该 Bucket 的 `Object Read & Write` Token。
-3. 保存 Account ID、Access Key ID 和只显示一次的 Secret Access Key。
-4. 在 VaultMesh“备份仓库”中选择 Cloudflare R2，填写上述信息、Bucket 和可选目录前缀；Region 使用 `auto`。
-5. 生成并单独保存 Restic 仓库密码。它与 R2 Secret Access Key 用途不同，丢失后无法解密快照。
-
-R2 是 Cloudflare 的对象存储，不是 AWS S3；它提供 S3 兼容 API，因此 VaultMesh/Restic 可以通过标准 S3 Endpoint 与凭据访问。
-
-## 安装 Agent
-
-Agent 主机需要：
-
-- Restic；
-- 使用 WebDAV、OneDrive、Google Drive、Dropbox 或通用 rclone 渠道时需要 rclone，并在每台相关 Agent 上配置同名 remote；
-- MySQL 项目需要 `mysqldump`；
-- PostgreSQL 项目需要 `pg_dump`；
-- Docker 数据源需要 Docker CLI，并要求 Agent 有权访问 Docker daemon 和所选挂载路径；
-- 可出站访问控制面的 HTTPS 443 和目标对象存储。
-
-构建 Agent：
+构建并安装：
 
 ```bash
 make build
@@ -152,7 +164,7 @@ sudo install -m 0644 deploy/systemd/vaultmesh-agent.service /etc/systemd/system/
 sudo install -m 0600 deploy/systemd/vaultmesh-agent.env.example /etc/vaultmesh-agent.env
 ```
 
-在 Web 控制台创建服务器，把一次性令牌填入 `/etc/vaultmesh-agent.env`，然后：
+在 Web 控制台创建“服务器”，把一次性注册令牌和 Control Plane HTTPS 地址写入 `/etc/vaultmesh-agent.env`，然后启动：
 
 ```bash
 sudo systemctl daemon-reload
@@ -160,33 +172,177 @@ sudo systemctl enable --now vaultmesh-agent
 sudo journalctl -u vaultmesh-agent -f
 ```
 
-注册成功后，从环境文件中删除 `VAULTMESH_ENROLLMENT_TOKEN` 并重启服务。设备凭据保存在 `/var/lib/vaultmesh-agent/state.json`，权限为 `0600`。
+注册成功后，从环境文件删除 `VAULTMESH_ENROLLMENT_TOKEN` 并重启 Agent。设备身份保存在 `/var/lib/vaultmesh-agent/state.json`，文件权限为 `0600`。
 
-## 验证
+### 5. 创建第一份备份
 
-```bash
-make check
-```
+按以下顺序配置并验证：
 
-测试覆盖控制面纵向 API、管理员密码持久化与会话撤销、TOTP/一次性恢复码、全局仓库迁移、一次性 Agent 注册、Secret 加解密、Agent 状态恢复、项目暂停/恢复、幂等 Run、Restic 成功/部分成功解析、保留与校验命令、数据库暂存产物和 Docker 挂载清单脱敏。WebAuthn 的协议校验由 Go WebAuthn 库完成，真实设备注册仍应在目标 HTTPS 域名上做一次验收。
+1. 在“备份仓库”创建一个独立测试渠道，例如 Cloudflare R2 的专用 Bucket/Prefix。
+2. 在已在线的服务器下创建备份项目，添加文件、Docker 或数据库数据源。
+3. 选择可视化时间计划或高级 Cron，并设置保留、Prune 和 Check 策略。
+4. 点击“立即备份”，确认运行状态、快照 ID、文件数和字节数。
+5. 进入“快照恢复”，同步快照并恢复一个测试文件到隔离目录，完成真实验收。
+
+备份任务显示成功，不等于恢复已经被证明；第五步不应省略。
+
+## 数据源支持
+
+| 类型 | 实现方式 | 一致性边界 |
+|---|---|---|
+| 文件 | Restic 直接读取配置的绝对路径 | 运行期间仍被修改的文件可能来自不同时间点 |
+| Docker | `docker inspect` 生成脱敏清单，并备份显式容器的 bind mount/named volume | 默认是崩溃一致性，不自动停止容器，不备份 writable layer |
+| MySQL | 在权限收敛的暂存目录执行事务型逻辑导出，再交给 Restic | 需要兼容的 `mysqldump`；恢复到新实例仍需管理员执行 |
+| PostgreSQL | 使用 `pg_dump --format=custom` 生成逻辑导出，再交给 Restic | 需要兼容的 `pg_dump`；恢复到新实例仍需管理员执行 |
+
+数据库容器不应只备份活跃 Volume；应同时配置 MySQL/PostgreSQL 专用数据源。
+
+## 存储支持
+
+| 分类 | 当前支持 |
+|---|---|
+| Restic 原生 | Local、SFTP、REST Server、Amazon S3、S3 Compatible、OpenStack Swift、Backblaze B2、Azure Blob、Google Cloud Storage |
+| S3 厂商预设 | Cloudflare R2、MinIO、Wasabi、阿里云 OSS、腾讯云 COS、华为云 OBS、七牛云 Kodo、Backblaze B2 S3 |
+| rclone 扩展 | 通用 rclone、WebDAV、OneDrive、Google Drive、Dropbox |
+
+S3 是对象存储兼容协议，不等于某一家云厂商。Cloudflare R2、MinIO 和其他兼容产品共享 Restic S3 后端，但 Endpoint、Region 和寻址方式可能不同。
+
+完整字段、认证方式和 Agent 前置条件见 [存储仓库支持矩阵](./docs/STORAGE_PROVIDERS.md)。
+
+## 生产部署要点
+
+### 必要配置
+
+| 变量 | 用途 | 生产要求 |
+|---|---|---|
+| `VAULTMESH_MASTER_KEY` | 加密仓库、数据库来源和账户安全资料 | 随机 32 字节，独立备份，不可丢失 |
+| `POSTGRES_PASSWORD` | Compose PostgreSQL 账号 | 使用随机长密码，仅保存在受保护的 `.env` |
+| `VAULTMESH_ALLOWED_ORIGINS` | 允许访问 API 的 Web Origin | 精确 HTTPS Origin，禁止通配符 |
+| `VAULTMESH_PUBLIC_API_URL` | 浏览器实际访问的 API URL | 使用可信 HTTPS 域名 |
+| `VAULTMESH_COOKIE_SECURE` | 为登录 Cookie 启用 Secure | 公网部署必须为 `true` |
+| `VAULTMESH_WEBAUTHN_RP_ID` | 通行密钥 RP ID | 稳定域名，不包含协议、端口或 IP |
+| `VAULTMESH_WEBAUTHN_RP_ORIGINS` | 通行密钥允许的 Origin | 与实际控制台 HTTPS Origin 一致 |
+
+完整模板见 [.env.example](./.env.example)。
+
+### 上线检查
+
+- Web 和 API 均位于可信 HTTPS 反向代理之后；
+- API 端口没有以明文形式直接暴露公网；
+- 登录接口已在反向代理或 WAF 设置速率限制；
+- 管理员已修改初始密码，并启用 TOTP 或通行密钥；
+- 对象存储凭据限制到专用 Bucket/Prefix；
+- 已备份 PostgreSQL 和包含主密钥的 `/opt/vaultmesh/.env`；
+- 已从真实快照完成文件和数据库恢复演练；
+- 仍保留原有生产备份，直到 VaultMesh 的恢复链路经过持续验证。
+
+> [!WARNING]
+> PostgreSQL 与 `.env` 必须成对备份。只保留数据库、却丢失 `VAULTMESH_MASTER_KEY`，将无法解密已经保存的仓库凭据、数据库密码和账户安全资料。
+
+备份、恢复、升级、回滚和故障处理步骤见 [运维手册](./docs/OPERATIONS.md)。
+
+## 管理员安全
+
+- 管理员通过用户名和密码登录，浏览器只保存 HttpOnly、SameSite 会话 Cookie；
+- 可启用 TOTP 二步验证，并生成仅展示一次的恢复码；
+- 可注册 Touch ID、Windows Hello、设备 PIN 或硬件安全密钥；
+- 添加/删除通行密钥需要最近 10 分钟内完成身份验证；
+- 修改密码或停用二步验证会撤销现有会话；
+- WebAuthn 本地开发必须使用 `localhost`，生产环境必须使用稳定的 HTTPS 域名。
+
+更多要求见 [安全策略](./SECURITY.md)。
 
 ## 当前限制
 
-- 管理端目前只有一个本地管理员账号，尚未实现多用户、RBAC、密码找回和登录审计；
-- 管理会话保存在单个 Control Plane 进程内，进程重启后需要重新登录，尚不支持多副本共享会话；
-- 应用内尚未实现登录限速；公网入口必须在反向代理或 WAF 对登录接口实施限速；
-- 尚未实现快照浏览和恢复 UI；Prune 与完整数据校验虽已可按项目启用，但目前跟随成功备份执行，尚未提供独立维护时间窗；
-- 直接 S3 模式不提供不可变备份保证；
-- Docker 挂载卷默认为崩溃一致性快照，不会自动停止容器；数据库容器应同时配置 MySQL/PostgreSQL 逻辑备份；
-- Agent 当前本地状态使用受权限保护的原子 JSON 文件，后续规模化时可迁移到 SQLite；
-- 尚未发布稳定版本和自动更新通道。
+| 领域 | 当前限制 | 建议 |
+|---|---|---|
+| 发布状态 | 尚未发布稳定版本和自动升级通道 | 固定经过验证的提交，升级前备份控制面 |
+| 管理员 | 单管理员、无 RBAC、无密码找回和完整登录审计 | 保护恢复码，并限制管理端访问来源 |
+| 登录防护 | 应用内尚未实现速率限制 | 在反向代理/WAF 限制登录与 MFA 接口 |
+| 控制面扩展 | 会话仅保存在单个进程，不支持多副本共享 | 当前只运行一个 Control Plane 实例 |
+| 仓库验证 | 保存时只校验字段和 URL；首次 Restic 操作才验证连通性 | 先使用测试 Bucket/Prefix 执行快照操作 |
+| 错过运行 | 当前只支持 `missed_run_policy=skip` | 通过下次任务倒计时和运行历史确认计划 |
+| 告警 | 尚未实现 RPO 违约计算和通知投递 | 使用外部监控检查健康端点和运行记录 |
+| Docker | Volume 默认只有崩溃一致性 | 数据库容器同时配置逻辑导出 |
+| 不可变性 | 保护标签只影响 Restic Forget，不等于 Object Lock | 在存储层配置版本控制/Object Lock/独立删除身份 |
+| 恢复 | 只支持同 Agent 隔离恢复，不自动回写生产路径 | 验收恢复内容后由管理员受控迁移 |
 
-这些限制是显式的开发边界，不应在部署说明或产品页面中被描述为已经支持。
+## 本地开发
 
-## 安全
+要求 Go 1.26.5、Node.js 24 和 npm。省略 `VAULTMESH_DATABASE_URL` 时会使用内存存储，进程重启后开发数据丢失。
 
-请阅读 [SECURITY.md](./SECURITY.md)。不要把控制面直接以明文 HTTP 暴露到公网，不要在日志或 Issue 中提交管理员密码、Agent 设备凭据、Restic 密码、数据库密码或对象存储密钥。
+```bash
+npm --prefix web ci
+make check
+make build
+```
 
-## API
+启动本地 API：
 
-创建仓库渠道以及文件、Docker、MySQL 和 PostgreSQL 项目的请求示例见 [API quick reference](./docs/API.md)。
+```bash
+export VAULTMESH_ADMIN_USERNAME=admin
+export VAULTMESH_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+export VAULTMESH_MASTER_KEY="$(openssl rand -base64 32)"
+export VAULTMESH_ALLOWED_ORIGINS=http://localhost:5173
+export VAULTMESH_COOKIE_SECURE=false
+./bin/vaultmesh-server
+```
+
+另开终端启动前端：
+
+```bash
+npm --prefix web run dev
+```
+
+CI 会执行：
+
+- Go 全量测试和竞态检测；
+- `go vet` 与 Govulncheck；
+- Vue TypeScript 生产构建与 npm 高危漏洞审计；
+- Control Plane、Web、Agent 三个容器镜像构建；
+- 独立 Web/API 容器烟雾测试。
+
+## 仓库结构
+
+| 路径 | 内容 |
+|---|---|
+| `cmd/vaultmesh-server` | Control Plane 入口 |
+| `cmd/vaultmesh-agent` | Linux Agent 入口 |
+| `internal/control` | API、管理员认证和控制面服务 |
+| `internal/agent` | 调度、本地状态、Restic/数据库/Docker 执行 |
+| `internal/store` | Memory/PostgreSQL 数据存储 |
+| `web` | Vue 3 + TypeScript 管理界面 |
+| `deploy/systemd` | Agent systemd Unit 与环境模板 |
+| `docs` | API、仓库、备份策略、恢复和运维文档 |
+
+## 文档导航
+
+| 文档 | 适合解决的问题 |
+|---|---|
+| [项目说明书](./VaultMesh-项目说明书.md) | 产品边界、当前实现、路线图、核心技术难点 |
+| [API Reference](./docs/API.md) | 登录、仓库、项目、快照和恢复接口示例 |
+| [存储仓库支持矩阵](./docs/STORAGE_PROVIDERS.md) | 每类存储需要填写什么、凭据如何配置 |
+| [备份项目策略](./docs/BACKUP_PROJECTS.md) | 数据源、扫描边界、保留、Check 和维护窗口 |
+| [快照浏览与安全恢复](./docs/SNAPSHOT_RECOVERY.md) | 快照同步、目录浏览、保护和隔离恢复 |
+| [运维手册](./docs/OPERATIONS.md) | 控制面备份恢复、升级回滚和故障处理 |
+| [安全策略](./SECURITY.md) | 漏洞报告和生产安全要求 |
+
+## 许可证
+
+VaultMesh 采用 [PolyForm Noncommercial License 1.0.0](./LICENSE)：
+
+- 允许许可证定义范围内的个人学习、研究、实验、测试和爱好用途；
+- 允许符合条款定义的慈善、教育、公共研究、公共安全/健康、环保和政府机构使用；
+- 不授予商业用途；商业部署、托管服务、商业集成或其他不属于 permitted purpose 的使用需要另行取得商业授权；
+- 再分发时必须同时提供许可证条款和 Required Notice（如有）。
+
+非商业限制意味着本项目属于 **source-available（公开源码）**，不属于 OSI 定义的 Open Source Software。具体权利与限制以 [LICENSE](./LICENSE) 原文为准；如需商业授权，请联系仓库所有者。
+
+参考：[PolyForm Noncommercial 官方说明](https://polyformproject.org/licenses/noncommercial/1.0.0)、[OSI Open Source Definition](https://opensource.org/osd)。
+
+## 反馈与贡献
+
+- 普通缺陷和功能建议可通过 GitHub Issues 提交；
+- Pull Request 应保持任务边界清晰，并包含相应测试和文档；
+- 安全问题不要创建公开 Issue，请按照 [SECURITY.md](./SECURITY.md) 私下报告；
+- 提交贡献前请先阅读本仓库许可证；如涉及商业授权或较大范围合作，请先联系仓库所有者确认边界。

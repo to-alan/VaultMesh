@@ -81,9 +81,14 @@ func (s *StateStore) SetIdentity(identity domain.AgentIdentity) error {
 	if s.state.Identity != nil && s.state.Identity.AgentID != identity.AgentID {
 		return errors.New("agent is already enrolled to another identity")
 	}
+	previous := s.state.Identity
 	copy := identity
 	s.state.Identity = &copy
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.state.Identity = previous
+		return err
+	}
+	return nil
 }
 
 func (s *StateStore) Config() domain.AgentConfig {
@@ -98,8 +103,13 @@ func (s *StateStore) SetConfig(config domain.AgentConfig) error {
 	if config.Revision < s.state.Config.Revision {
 		return fmt.Errorf("refusing configuration rollback from revision %d to %d", s.state.Config.Revision, config.Revision)
 	}
+	previous := s.state.Config
 	s.state.Config = cloneAgentConfig(config)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.state.Config = previous
+		return err
+	}
+	return nil
 }
 
 func (s *StateStore) BeginRun(report domain.RunReport) (bool, error) {
@@ -123,12 +133,23 @@ func (s *StateStore) BeginRun(report domain.RunReport) (bool, error) {
 func (s *StateStore) FinishRun(report domain.RunReport) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.state.Runs[report.ID]; !exists {
+	previousRun, exists := s.state.Runs[report.ID]
+	if !exists {
 		return errors.New("cannot finish unknown run")
 	}
+	previousOutbox, hadOutbox := s.state.Outbox[report.ID]
 	s.state.Runs[report.ID] = cloneReport(report)
 	s.state.Outbox[report.ID] = cloneReport(report)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.state.Runs[report.ID] = previousRun
+		if hadOutbox {
+			s.state.Outbox[report.ID] = previousOutbox
+		} else {
+			delete(s.state.Outbox, report.ID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *StateStore) PendingReports() []domain.RunReport {
@@ -185,14 +206,41 @@ func (s *StateStore) saveLocked() error {
 	if err != nil {
 		return fmt.Errorf("encode agent state: %w", err)
 	}
-	temporary := s.path + ".tmp"
-	if err := os.WriteFile(temporary, data, 0o600); err != nil {
+	directory := filepath.Dir(s.path)
+	directoryHandle, err := os.Open(directory)
+	if err != nil {
+		return fmt.Errorf("open agent state directory: %w", err)
+	}
+	defer directoryHandle.Close()
+	temporary, err := os.CreateTemp(directory, "."+filepath.Base(s.path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary agent state: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return fmt.Errorf("secure temporary agent state: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
 		return fmt.Errorf("write agent state: %w", err)
 	}
-	if err := os.Rename(temporary, s.path); err != nil {
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return fmt.Errorf("flush agent state: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close agent state: %w", err)
+	}
+	if err := os.Rename(temporaryPath, s.path); err != nil {
 		return fmt.Errorf("replace agent state: %w", err)
 	}
-	return os.Chmod(s.path, 0o600)
+	// The state file itself is already durable. Directory fsync makes the rename
+	// durable on filesystems that support it; after rename there is no safe
+	// rollback, so a filesystem-specific sync error is best-effort only.
+	_ = directoryHandle.Sync()
+	return nil
 }
 
 func (s *StateStore) pruneHistoryLocked(limit int) {

@@ -27,6 +27,8 @@ type Store struct {
 	repositories map[string]domain.Repository
 	projects     map[string]domain.Project
 	commands     map[string]domain.Command
+	snapshots    map[string]map[string]domain.Snapshot
+	snapshotSync map[string]time.Time
 	accepted     map[string]time.Time
 	completed    map[string]time.Time
 	runs         map[string]domain.RunReport
@@ -41,6 +43,8 @@ func New() *Store {
 		repositories: make(map[string]domain.Repository),
 		projects:     make(map[string]domain.Project),
 		commands:     make(map[string]domain.Command),
+		snapshots:    make(map[string]map[string]domain.Snapshot),
+		snapshotSync: make(map[string]time.Time),
 		accepted:     make(map[string]time.Time),
 		completed:    make(map[string]time.Time),
 		runs:         make(map[string]domain.RunReport),
@@ -271,8 +275,9 @@ func (s *Store) CreateCommand(_ context.Context, command domain.Command) (domain
 		return domain.Command{}, store.ErrConflict
 	}
 	command.ServerID = project.ServerID
+	command.Payload = cloneAnyMap(command.Payload)
 	s.commands[command.ID] = command
-	return command, nil
+	return cloneCommand(command), nil
 }
 
 func (s *Store) ClaimCommands(_ context.Context, serverID string, now, leaseUntil time.Time, limit int) ([]domain.Command, error) {
@@ -292,7 +297,7 @@ func (s *Store) ClaimCommands(_ context.Context, serverID string, now, leaseUnti
 		if command.LeaseUntil != nil && command.LeaseUntil.After(now) {
 			continue
 		}
-		candidates = append(candidates, command)
+		candidates = append(candidates, cloneCommand(command))
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].CreatedAt.Before(candidates[j].CreatedAt) })
 	if len(candidates) > limit {
@@ -309,11 +314,83 @@ func (s *Store) ClaimCommands(_ context.Context, serverID string, now, leaseUnti
 	return candidates, nil
 }
 
+func (s *Store) ReplaceProjectSnapshots(_ context.Context, projectID, serverID string, snapshots []domain.Snapshot, syncedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	project, ok := s.projects[projectID]
+	if !ok || project.ServerID != serverID {
+		return store.ErrNotFound
+	}
+	if latestSync := s.snapshotSync[projectID]; !latestSync.IsZero() && !syncedAt.After(latestSync) {
+		return nil
+	}
+	items := make(map[string]domain.Snapshot, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshot.ID == "" {
+			continue
+		}
+		snapshot.ProjectID = projectID
+		snapshot.ServerID = serverID
+		snapshot.LastSyncedAt = syncedAt
+		items[snapshot.ID] = cloneSnapshot(snapshot)
+	}
+	s.snapshots[projectID] = items
+	s.snapshotSync[projectID] = syncedAt
+	return nil
+}
+
+func (s *Store) ListSnapshots(_ context.Context, projectID string, limit int) ([]domain.Snapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if projectID != "" {
+		if _, ok := s.projects[projectID]; !ok {
+			return nil, store.ErrNotFound
+		}
+	}
+	var result []domain.Snapshot
+	for id, items := range s.snapshots {
+		if projectID != "" && id != projectID {
+			continue
+		}
+		for _, snapshot := range items {
+			result = append(result, cloneSnapshot(snapshot))
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Time.After(result[j].Time) })
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+func (s *Store) GetSnapshot(_ context.Context, projectID, snapshotID string) (domain.Snapshot, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snapshot, ok := s.snapshots[projectID][snapshotID]
+	if !ok {
+		return domain.Snapshot{}, store.ErrNotFound
+	}
+	return cloneSnapshot(snapshot), nil
+}
+
 func (s *Store) UpsertRun(_ context.Context, report domain.RunReport) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existingID, ok := s.runKeys[report.IdempotencyKey]; ok && existingID != report.ID {
 		return store.ErrConflict
+	}
+	if existing, ok := s.runs[report.ID]; ok {
+		if existing.IdempotencyKey != report.IdempotencyKey || existing.ProjectID != report.ProjectID || existing.ServerID != report.ServerID {
+			return store.ErrConflict
+		}
+		if existing.Status != domain.RunRunning {
+			// Terminal run facts are immutable. A delayed duplicate running report
+			// is acknowledged without regressing the stored result.
+			return nil
+		}
 	}
 	project, ok := s.projects[report.ProjectID]
 	if !ok || project.ServerID != report.ServerID {
@@ -339,7 +416,10 @@ func (s *Store) ListRuns(_ context.Context, limit int) ([]domain.RunReport, erro
 		result = append(result, cloneRun(report))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].StartedAt.After(result[j].StartedAt) })
-	if limit > 0 && len(result) > limit {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if len(result) > limit {
 		result = result[:limit]
 	}
 	return result, nil
@@ -356,6 +436,9 @@ func (s *Store) Dashboard(_ context.Context, since time.Time) (domain.Dashboard,
 	}
 	for _, report := range s.runs {
 		if report.StartedAt.Before(since) {
+			continue
+		}
+		if operation, _ := report.Stats["operation"].(string); operation != "" && operation != "backup" {
 			continue
 		}
 		switch report.Status {
@@ -424,6 +507,17 @@ func cloneRun(report domain.RunReport) domain.RunReport {
 	return report
 }
 
+func cloneCommand(command domain.Command) domain.Command {
+	command.Payload = cloneAnyMap(command.Payload)
+	return command
+}
+
+func cloneSnapshot(snapshot domain.Snapshot) domain.Snapshot {
+	snapshot.Paths = append([]string(nil), snapshot.Paths...)
+	snapshot.Tags = append([]string(nil), snapshot.Tags...)
+	return snapshot
+}
+
 func cloneMap(input map[string]string) map[string]string {
 	output := make(map[string]string, len(input))
 	for k, v := range input {
@@ -433,6 +527,9 @@ func cloneMap(input map[string]string) map[string]string {
 }
 
 func cloneAnyMap(input map[string]any) map[string]any {
+	if input == nil {
+		return nil
+	}
 	output := make(map[string]any, len(input))
 	for k, v := range input {
 		output[k] = v

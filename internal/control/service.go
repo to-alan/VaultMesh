@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -21,6 +22,7 @@ import (
 )
 
 const enrollmentTTL = 15 * time.Minute
+const protectedSnapshotTag = "vaultmesh.protected=true"
 
 var allowedRepositoryEnvironment = map[string]struct{}{
 	"AWS_ACCESS_KEY_ID":                {},
@@ -64,6 +66,8 @@ var allowedRepositoryEnvironment = map[string]struct{}{
 	"OS_AUTH_TOKEN":                    {},
 	"SWIFT_DEFAULT_CONTAINER_POLICY":   {},
 }
+
+var fullResticSnapshotID = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 var allowedRepositoryProviders = map[string]struct{}{
 	"local": {}, "sftp": {}, "rest_server": {},
@@ -355,8 +359,8 @@ func (s *Service) CreateProject(ctx context.Context, input domain.Project) (doma
 	if input.Schedule.MaxRuntimeSeconds < 60 || input.Schedule.MaxRuntimeSeconds > 7*24*60*60 {
 		return domain.Project{}, validationError("schedule.max_runtime_seconds", "must be between 60 seconds and 7 days")
 	}
-	if input.Schedule.MissedRunPolicy != "skip" && input.Schedule.MissedRunPolicy != "run_once" {
-		return domain.Project{}, validationError("schedule.missed_run_policy", "must be skip or run_once")
+	if input.Schedule.MissedRunPolicy != "skip" {
+		return domain.Project{}, validationError("schedule.missed_run_policy", "the current version supports only skip")
 	}
 	if input.Schedule.ConcurrencyPolicy != "forbid" {
 		return domain.Project{}, validationError("schedule.concurrency_policy", "the current version supports only forbid")
@@ -365,6 +369,9 @@ func (s *Service) CreateProject(ctx context.Context, input domain.Project) (doma
 		return domain.Project{}, validationError("schedule", err.Error())
 	}
 	if err := validateProjectPolicy(&input.Policy); err != nil {
+		return domain.Project{}, err
+	}
+	if err := validateMaintenancePolicy(&input.Policy); err != nil {
 		return domain.Project{}, err
 	}
 	id, err := randomValue("prj", 10)
@@ -438,6 +445,78 @@ func (s *Service) DesiredConfig(ctx context.Context, serverID string) (domain.Ag
 }
 
 func (s *Service) CreateManualRun(ctx context.Context, projectID string) (domain.Command, error) {
+	return s.createProjectCommand(ctx, projectID, "backup", nil)
+}
+
+func (s *Service) CreateRetentionPreview(ctx context.Context, projectID string) (domain.Command, error) {
+	return s.createProjectCommand(ctx, projectID, "retention_preview", nil)
+}
+
+func (s *Service) RefreshSnapshots(ctx context.Context, projectID string) (domain.Command, error) {
+	return s.createProjectCommand(ctx, projectID, "snapshot_sync", nil)
+}
+
+func (s *Service) SetSnapshotProtected(ctx context.Context, projectID, snapshotID string, protected bool) (domain.Command, error) {
+	if _, err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
+		return domain.Command{}, err
+	}
+	return s.createProjectCommand(ctx, projectID, "snapshot_protect", map[string]any{
+		"snapshot_id": snapshotID,
+		"protected":   protected,
+	})
+}
+
+func (s *Service) BrowseSnapshot(ctx context.Context, projectID, snapshotID, snapshotPath string) (domain.Command, error) {
+	if _, err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
+		return domain.Command{}, err
+	}
+	cleaned, err := normalizeSnapshotPath(snapshotPath)
+	if err != nil {
+		return domain.Command{}, err
+	}
+	return s.createProjectCommand(ctx, projectID, "snapshot_browse", map[string]any{
+		"snapshot_id": snapshotID,
+		"path":        cleaned,
+	})
+}
+
+func (s *Service) RestoreSnapshot(ctx context.Context, projectID, snapshotID, snapshotPath string) (domain.Command, error) {
+	if _, err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
+		return domain.Command{}, err
+	}
+	cleaned, err := normalizeSnapshotPath(snapshotPath)
+	if err != nil {
+		return domain.Command{}, err
+	}
+	return s.createProjectCommand(ctx, projectID, "snapshot_restore", map[string]any{
+		"snapshot_id": snapshotID,
+		"path":        cleaned,
+	})
+}
+
+func (s *Service) snapshotForCommand(ctx context.Context, projectID, snapshotID string) (domain.Snapshot, error) {
+	if !fullResticSnapshotID.MatchString(snapshotID) {
+		return domain.Snapshot{}, validationError("snapshot_id", "must be a full 64-character Restic snapshot ID")
+	}
+	return s.store.GetSnapshot(ctx, projectID, snapshotID)
+}
+
+func normalizeSnapshotPath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = "/"
+	}
+	if strings.ContainsAny(value, "\x00\r\n") || !strings.HasPrefix(value, "/") {
+		return "", validationError("path", "must be an absolute snapshot path")
+	}
+	cleaned := pathpkg.Clean(value)
+	if cleaned == "." || !strings.HasPrefix(cleaned, "/") {
+		return "", validationError("path", "must be an absolute snapshot path")
+	}
+	return cleaned, nil
+}
+
+func (s *Service) createProjectCommand(ctx context.Context, projectID, commandType string, payload map[string]any) (domain.Command, error) {
 	if strings.TrimSpace(projectID) == "" {
 		return domain.Command{}, validationError("project_id", "is required")
 	}
@@ -448,7 +527,8 @@ func (s *Service) CreateManualRun(ctx context.Context, projectID string) (domain
 	return s.store.CreateCommand(ctx, domain.Command{
 		ID:        id,
 		ProjectID: projectID,
-		Type:      "backup",
+		Type:      commandType,
+		Payload:   payload,
 		CreatedAt: s.now(),
 	})
 }
@@ -524,7 +604,10 @@ func prepareDockerSource(source *domain.Source) error {
 	return nil
 }
 
-var resticSize = regexp.MustCompile(`(?i)^[1-9][0-9]*(?:\.[0-9]+)?[kmgt]?$`)
+var (
+	resticSize     = regexp.MustCompile(`(?i)^[1-9][0-9]*(?:\.[0-9]+)?[kmgt]?$`)
+	resticDuration = regexp.MustCompile(`(?i)^(?:[1-9][0-9]*[ymdh])+$`)
+)
 
 func validateProjectPolicy(policy *domain.ProjectPolicy) error {
 	backup := &policy.Backup
@@ -550,7 +633,14 @@ func validateProjectPolicy(policy *domain.ProjectPolicy) error {
 	}
 	backup.ExcludeIfPresent = markers
 
-	retention := policy.Retention
+	retention := &policy.Retention
+	retention.Mode = strings.TrimSpace(retention.Mode)
+	retention.KeepWithin = strings.TrimSpace(retention.KeepWithin)
+	if retention.Mode == "" {
+		// Existing projects predate explicit modes and already use the six GFS
+		// counters, so preserving that behavior is the only safe migration.
+		retention.Mode = "gfs"
+	}
 	counts := []int{retention.KeepLast, retention.KeepHourly, retention.KeepDaily, retention.KeepWeekly, retention.KeepMonthly, retention.KeepYearly}
 	positive := false
 	for _, count := range counts {
@@ -559,8 +649,33 @@ func validateProjectPolicy(policy *domain.ProjectPolicy) error {
 		}
 		positive = positive || count > 0
 	}
-	if retention.Enabled && !positive {
-		return validationError("policy.retention", "at least one keep rule is required when retention is enabled")
+	if retention.Enabled {
+		switch retention.Mode {
+		case "count":
+			if retention.KeepLast <= 0 {
+				return validationError("policy.retention.keep_last", "must be greater than zero in count mode")
+			}
+			retention.KeepHourly, retention.KeepDaily, retention.KeepWeekly, retention.KeepMonthly, retention.KeepYearly = 0, 0, 0, 0, 0
+			retention.KeepWithin = ""
+		case "smart":
+			// Smart retention follows Duplicati's documented 1 week daily,
+			// 4 weeks weekly and 12 months monthly policy. It has no tunable
+			// counters by design.
+			retention.KeepLast, retention.KeepHourly, retention.KeepDaily, retention.KeepWeekly, retention.KeepMonthly, retention.KeepYearly = 0, 0, 0, 0, 0, 0
+			retention.KeepWithin = ""
+		case "gfs":
+			if !positive {
+				return validationError("policy.retention", "at least one keep rule is required in GFS mode")
+			}
+			retention.KeepWithin = ""
+		case "age":
+			if !resticDuration.MatchString(retention.KeepWithin) {
+				return validationError("policy.retention.keep_within", "must be a Restic duration such as 30d, 6m, or 1y")
+			}
+			retention.KeepLast, retention.KeepHourly, retention.KeepDaily, retention.KeepWeekly, retention.KeepMonthly, retention.KeepYearly = 0, 0, 0, 0, 0, 0
+		default:
+			return validationError("policy.retention.mode", "must be count, smart, gfs, or age")
+		}
 	}
 	if retention.Prune && !retention.Enabled {
 		return validationError("policy.retention.prune", "requires retention to be enabled")
@@ -582,6 +697,37 @@ func validateProjectPolicy(policy *domain.ProjectPolicy) error {
 		}
 	default:
 		return validationError("policy.verification.mode", "must be off, metadata, subset, or full")
+	}
+	return nil
+}
+
+func validateMaintenancePolicy(policy *domain.ProjectPolicy) error {
+	maintenance := &policy.Maintenance
+	if !maintenance.Separate {
+		return nil
+	}
+	maintenance.Timezone = strings.TrimSpace(maintenance.Timezone)
+	if maintenance.Timezone == "" {
+		maintenance.Timezone = "UTC"
+	}
+	tasks := []struct {
+		enabled bool
+		field   string
+		value   *string
+	}{
+		{policy.Retention.Enabled, "policy.maintenance.retention_cron", &maintenance.RetentionCron},
+		{policy.Retention.Enabled && policy.Retention.Prune, "policy.maintenance.prune_cron", &maintenance.PruneCron},
+		{policy.Verification.Mode != "off", "policy.maintenance.verification_cron", &maintenance.VerificationCron},
+	}
+	for _, task := range tasks {
+		*task.value = strings.TrimSpace(*task.value)
+		if !task.enabled {
+			*task.value = ""
+			continue
+		}
+		if err := schedule.Validate(*task.value, maintenance.Timezone); err != nil {
+			return validationError(task.field, err.Error())
+		}
 	}
 	return nil
 }
@@ -625,6 +771,9 @@ func validateRepositoryURL(provider, value string) error {
 		if parsed.Scheme != "https" && parsed.Scheme != "http" {
 			return errors.New("S3 endpoint must use http or https")
 		}
+		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return errors.New("credentials, query parameters, and fragments are not allowed in repository URLs; use encrypted credential fields")
+		}
 		if parsed.Scheme == "http" && parsed.Hostname() != "localhost" && parsed.Hostname() != "127.0.0.1" && parsed.Hostname() != "minio" {
 			return errors.New("plain HTTP is allowed only for local MinIO development")
 		}
@@ -643,10 +792,16 @@ func validateRepositoryURL(provider, value string) error {
 		if err != nil || parsed.Scheme != "sftp" || parsed.Host == "" || parsed.User == nil || strings.Trim(parsed.Path, "/") == "" {
 			return errors.New("must use sftp://user@host:port//absolute/path syntax")
 		}
+		if _, hasPassword := parsed.User.Password(); hasPassword || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return errors.New("passwords, query parameters, and fragments are not allowed in repository URLs; use encrypted credential fields")
+		}
 	case "rest_server":
 		parsed, err := url.Parse(strings.TrimPrefix(value, "rest:"))
 		if !strings.HasPrefix(value, "rest:") || err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
 			return errors.New("must be a Restic REST URL beginning with rest:https://")
+		}
+		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return errors.New("credentials, query parameters, and fragments are not allowed in repository URLs; use encrypted credential fields")
 		}
 	case "openstack_swift":
 		if !regexp.MustCompile(`^swift:[^:/]+:/.*`).MatchString(value) {

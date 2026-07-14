@@ -12,7 +12,8 @@ EnvironmentFile=-/etc/vaultmesh-agent.env
 ExecStart=/usr/local/bin/vaultmesh-agent \
   --server ${VAULTMESH_SERVER_URL} \
   --state /var/lib/vaultmesh-agent/state.json \
-  --staging-root /var/lib/vaultmesh-agent/staging
+  --staging-root /var/lib/vaultmesh-agent/staging \
+  --restore-root /var/lib/vaultmesh-agent/restores
 Restart=on-failure
 RestartSec=5s
 UMask=0077

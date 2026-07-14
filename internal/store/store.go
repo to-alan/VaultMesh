@@ -38,6 +38,9 @@ type Store interface {
 	DesiredConfig(context.Context, string) (domain.AgentConfig, error)
 	CreateCommand(context.Context, domain.Command) (domain.Command, error)
 	ClaimCommands(context.Context, string, time.Time, time.Time, int) ([]domain.Command, error)
+	ReplaceProjectSnapshots(context.Context, string, string, []domain.Snapshot, time.Time) error
+	ListSnapshots(context.Context, string, int) ([]domain.Snapshot, error)
+	GetSnapshot(context.Context, string, string) (domain.Snapshot, error)
 
 	UpsertRun(context.Context, domain.RunReport) error
 	ListRuns(context.Context, int) ([]domain.RunReport, error)

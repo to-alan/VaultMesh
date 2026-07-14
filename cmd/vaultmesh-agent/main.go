@@ -32,6 +32,7 @@ func main() {
 	pgDumpPath := flag.String("pg-dump", envOr("VAULTMESH_PG_DUMP_PATH", "pg_dump"), "path to the pg_dump executable")
 	dockerPath := flag.String("docker", envOr("VAULTMESH_DOCKER_PATH", "docker"), "path to the Docker CLI executable")
 	stagingRoot := flag.String("staging-root", os.Getenv("VAULTMESH_STAGING_ROOT"), "parent directory for protected temporary database dumps")
+	restoreRoot := flag.String("restore-root", envOr("VAULTMESH_RESTORE_ROOT", defaultRestoreRoot()), "directory for isolated restore jobs")
 	flag.Parse()
 	if strings.TrimSpace(*serverURL) == "" {
 		logger.Error("control plane URL is required", "flag", "--server")
@@ -78,7 +79,7 @@ func main() {
 		logger.Info("agent enrolled", "agent_id", identity.AgentID)
 	}
 
-	runner := agent.NewRunnerWithTools(*resticPath, *mysqlDumpPath, *pgDumpPath, *dockerPath, *stagingRoot)
+	runner := agent.NewRunnerWithTools(*resticPath, *mysqlDumpPath, *pgDumpPath, *dockerPath, *stagingRoot).SetRestoreRoot(*restoreRoot)
 	manager := agent.NewManager(state, runner, identity, logger)
 	if cached := state.Config(); cached.Revision > 0 || len(cached.Projects) > 0 {
 		if err := manager.Apply(cached); err != nil {
@@ -128,12 +129,14 @@ func fetchCommands(ctx context.Context, client *agent.Client, manager *agent.Man
 		return
 	}
 	for _, command := range commands {
-		if command.Type != "backup" {
+		switch command.Type {
+		case "backup", "retention_preview", "snapshot_sync", "snapshot_protect", "snapshot_browse", "snapshot_restore":
+		default:
 			logger.Error("reject unsupported command", "command_id", command.ID, "type", command.Type)
 			continue
 		}
-		if err := manager.Manual(command.ProjectID, command.ID); err != nil {
-			logger.Warn("defer manual backup command", "command_id", command.ID, "error", err)
+		if err := manager.Manual(command); err != nil {
+			logger.Warn("defer manual command", "command_id", command.ID, "type", command.Type, "error", err)
 		}
 	}
 }
@@ -182,6 +185,17 @@ func defaultStatePath() string {
 		return "vaultmesh-agent-state.json"
 	}
 	return filepath.Join(directory, "vaultmesh-agent", "state.json")
+}
+
+func defaultRestoreRoot() string {
+	if runtime.GOOS == "linux" {
+		return "/var/lib/vaultmesh-agent/restores"
+	}
+	directory, err := os.UserConfigDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "vaultmesh-agent-restores")
+	}
+	return filepath.Join(directory, "vaultmesh-agent", "restores")
 }
 
 func envOr(key, fallback string) string {

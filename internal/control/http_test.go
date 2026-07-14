@@ -127,6 +127,24 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 		SnapshotID:     "snapshot-test",
 	}, http.StatusNoContent, nil)
 	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_test",
+		IdempotencyKey: project.ID + ":different-identity",
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunFailed,
+		ErrorMessage:   "must not replace the original run",
+	}, http.StatusConflict, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_test",
+		IdempotencyKey: project.ID + ":2026-01-01T00:00:00Z",
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		Status:         domain.RunRunning,
+	}, http.StatusNoContent, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
 		ID:             "run_manual",
 		IdempotencyKey: "manual:" + command.ID,
 		ProjectID:      project.ID,
@@ -143,14 +161,159 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 		t.Fatalf("accepted manual command was leased again: %#v", commands.Items)
 	}
 
+	var previewCommand domain.Command
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/retention-preview", adminCookie,
+		nil, http.StatusAccepted, &previewCommand)
+	commands.Items = nil
+	requestJSON(t, handler, http.MethodGet, "/api/v1/agent/commands", identity.Token,
+		nil, http.StatusOK, &commands)
+	if len(commands.Items) != 1 || commands.Items[0].ID != previewCommand.ID || commands.Items[0].Type != "retention_preview" {
+		t.Fatalf("retention preview command was not leased to its agent: %#v", commands.Items)
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_retention_preview",
+		IdempotencyKey: "manual:" + previewCommand.ID,
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunSucceeded,
+		Stats:          map[string]any{"operation": "retention_preview", "snapshots_kept": 2, "snapshots_removed": 1},
+	}, http.StatusNoContent, nil)
+
 	var runs struct {
 		Items []domain.RunReport `json:"items"`
 	}
 	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/runs", adminCookie,
 		nil, http.StatusOK, &runs)
-	if len(runs.Items) != 2 {
+	if len(runs.Items) != 3 {
 		t.Fatalf("unexpected run list: %#v", runs.Items)
 	}
+	for _, report := range runs.Items {
+		if report.ID == "run_test" && report.Status != domain.RunSucceeded {
+			t.Fatalf("delayed running report regressed terminal run: %#v", report)
+		}
+	}
+	var dashboard domain.Dashboard
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/dashboard", adminCookie,
+		nil, http.StatusOK, &dashboard)
+	if dashboard.RunsSucceeded != 2 {
+		t.Fatalf("maintenance operation polluted backup success metrics: %#v", dashboard)
+	}
+
+	var refreshCommand domain.Command
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/snapshots/refresh", adminCookie,
+		nil, http.StatusAccepted, &refreshCommand)
+	commands.Items = nil
+	requestJSON(t, handler, http.MethodGet, "/api/v1/agent/commands", identity.Token,
+		nil, http.StatusOK, &commands)
+	if len(commands.Items) != 1 || commands.Items[0].Type != "snapshot_sync" {
+		t.Fatalf("snapshot refresh command was not leased: %#v", commands.Items)
+	}
+	const snapshotID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_snapshot_sync",
+		IdempotencyKey: "manual:" + refreshCommand.ID,
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunSucceeded,
+		Stats: map[string]any{
+			"operation": "snapshot_sync",
+			"snapshots": []domain.Snapshot{{
+				ID: snapshotID, Time: now, Hostname: "test-vps", Paths: []string{"/etc"},
+				Tags: []string{"vaultmesh.project_id=" + project.ID}, TotalFiles: 12, TotalBytes: 4096,
+			}},
+		},
+	}, http.StatusNoContent, nil)
+	var snapshots struct {
+		Items []domain.Snapshot `json:"items"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/snapshots?project_id="+project.ID, adminCookie,
+		nil, http.StatusOK, &snapshots)
+	if len(snapshots.Items) != 1 || snapshots.Items[0].ID != snapshotID || snapshots.Items[0].ProjectID != project.ID || snapshots.Items[0].ServerID != identity.AgentID {
+		t.Fatalf("snapshot inventory was not indexed safely: %#v", snapshots.Items)
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_snapshot_sync",
+		IdempotencyKey: "manual:" + refreshCommand.ID,
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunSucceeded,
+		Stats:          map[string]any{"operation": "snapshot_sync", "snapshots": []domain.Snapshot{}},
+	}, http.StatusNoContent, nil)
+	snapshots.Items = nil
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/snapshots?project_id="+project.ID, adminCookie,
+		nil, http.StatusOK, &snapshots)
+	if len(snapshots.Items) != 1 || snapshots.Items[0].ID != snapshotID {
+		t.Fatalf("duplicate run mutated the snapshot index: %#v", snapshots.Items)
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_snapshot_sync",
+		IdempotencyKey: project.ID + ":conflicting-snapshot-sync",
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunSucceeded,
+		Stats:          map[string]any{"operation": "snapshot_sync", "snapshots": []domain.Snapshot{}},
+	}, http.StatusConflict, nil)
+	snapshots.Items = nil
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/snapshots?project_id="+project.ID, adminCookie,
+		nil, http.StatusOK, &snapshots)
+	if len(snapshots.Items) != 1 || snapshots.Items[0].ID != snapshotID {
+		t.Fatalf("conflicting run mutated the snapshot index: %#v", snapshots.Items)
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_stale_snapshot_sync",
+		IdempotencyKey: project.ID + ":snapshot_sync:stale",
+		ProjectID:      project.ID,
+		ScheduledAt:    now.Add(-time.Minute),
+		StartedAt:      now.Add(-time.Minute),
+		FinishedAt:     &now,
+		Status:         domain.RunSucceeded,
+		Stats:          map[string]any{"operation": "snapshot_sync", "snapshots": []domain.Snapshot{}},
+	}, http.StatusNoContent, nil)
+	snapshots.Items = nil
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/snapshots?project_id="+project.ID, adminCookie,
+		nil, http.StatusOK, &snapshots)
+	if len(snapshots.Items) != 1 || snapshots.Items[0].ID != snapshotID {
+		t.Fatalf("stale empty inventory replaced a newer snapshot index: %#v", snapshots.Items)
+	}
+
+	tests := []struct {
+		name         string
+		path         string
+		body         any
+		commandType  string
+		payloadKey   string
+		payloadValue any
+	}{
+		{"browse", "/browse", map[string]string{"path": "/etc"}, "snapshot_browse", "path", "/etc"},
+		{"protect", "/protect", map[string]bool{"protected": true}, "snapshot_protect", "protected", true},
+		{"restore", "/restore", map[string]string{"path": "/etc/hosts"}, "snapshot_restore", "path", "/etc/hosts"},
+	}
+	for _, test := range tests {
+		t.Run("snapshot "+test.name+" command", func(t *testing.T) {
+			var issued domain.Command
+			requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/snapshots/"+snapshotID+test.path,
+				adminCookie, test.body, http.StatusAccepted, &issued)
+			commands.Items = nil
+			requestJSON(t, handler, http.MethodGet, "/api/v1/agent/commands", identity.Token,
+				nil, http.StatusOK, &commands)
+			if len(commands.Items) != 1 || commands.Items[0].ID != issued.ID || commands.Items[0].Type != test.commandType {
+				t.Fatalf("unexpected leased command: %#v", commands.Items)
+			}
+			if commands.Items[0].Payload["snapshot_id"] != snapshotID || commands.Items[0].Payload[test.payloadKey] != test.payloadValue {
+				t.Fatalf("command payload was not preserved: %#v", commands.Items[0].Payload)
+			}
+		})
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/snapshots/"+snapshotID+"/browse", adminCookie,
+		map[string]string{"path": "../etc"}, http.StatusUnprocessableEntity, nil)
 }
 
 func TestAdminAPIRequiresLoginSessionAndRejectsBearerToken(t *testing.T) {
@@ -398,7 +561,7 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 
 	preflight := httptest.NewRequest(http.MethodOptions, "/api/v1/dashboard", nil)
 	preflight.Header.Set("Origin", "https://console.example.com")
-	preflight.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodPatch)
 	preflightResponse := httptest.NewRecorder()
 	handler.ServeHTTP(preflightResponse, preflight)
 	if preflightResponse.Code != http.StatusNoContent {
@@ -410,6 +573,9 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 	if got := preflightResponse.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
 		t.Fatalf("unexpected access-control-allow-credentials %q", got)
 	}
+	if got := preflightResponse.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, http.MethodPatch) {
+		t.Fatalf("PATCH is missing from access-control-allow-methods %q", got)
+	}
 
 	forbidden := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	forbidden.Header.Set("Origin", "https://attacker.example.com")
@@ -417,6 +583,44 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 	handler.ServeHTTP(forbiddenResponse, forbidden)
 	if forbiddenResponse.Code != http.StatusForbidden {
 		t.Fatalf("expected forbidden origin to return 403, got %d", forbiddenResponse.Code)
+	}
+}
+
+func TestSnapshotSyncTimeBoundsAgentClockSkew(t *testing.T) {
+	receivedAt := time.Date(2026, time.July, 15, 1, 2, 3, 0, time.UTC)
+	closeFinishedAt := receivedAt.Add(-time.Minute)
+	farFuture := receivedAt.Add(24 * time.Hour)
+	farPast := receivedAt.Add(-24 * time.Hour)
+
+	for name, test := range map[string]struct {
+		finishedAt *time.Time
+		want       time.Time
+	}{
+		"missing":    {want: receivedAt},
+		"nearby":     {finishedAt: &closeFinishedAt, want: closeFinishedAt},
+		"far future": {finishedAt: &farFuture, want: receivedAt},
+		"far past":   {finishedAt: &farPast, want: receivedAt},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := snapshotSyncTime(test.finishedAt, receivedAt); !got.Equal(test.want) {
+				t.Fatalf("snapshotSyncTime() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCreateProjectRejectsUnimplementedMissedRunPolicy(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewService(memory.New(), sealer).CreateProject(context.Background(), domain.Project{
+		ServerID: "srv_test", RepositoryID: "repo_test", Name: "Test",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/etc"}}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC", MissedRunPolicy: "run_once"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "supports only skip") {
+		t.Fatalf("expected run_once to be rejected explicitly, got %v", err)
 	}
 }
 
@@ -586,6 +790,57 @@ func TestProjectCanBePausedAndResumed(t *testing.T) {
 	}
 	if !resumed.Enabled || resumed.NextRunAt == nil || resumed.Revision != 3 {
 		t.Fatalf("unexpected resumed project: %#v", resumed)
+	}
+}
+
+func TestRetentionModesAreValidatedAndNormalized(t *testing.T) {
+	tests := []struct {
+		name      string
+		policy    domain.RetentionPolicy
+		wantError bool
+	}{
+		{name: "count", policy: domain.RetentionPolicy{Enabled: true, Mode: "count", KeepLast: 10}},
+		{name: "smart", policy: domain.RetentionPolicy{Enabled: true, Mode: "smart"}},
+		{name: "gfs", policy: domain.RetentionPolicy{Enabled: true, Mode: "gfs", KeepDaily: 7, KeepMonthly: 12}},
+		{name: "age", policy: domain.RetentionPolicy{Enabled: true, Mode: "age", KeepWithin: "1y6m"}},
+		{name: "count needs limit", policy: domain.RetentionPolicy{Enabled: true, Mode: "count"}, wantError: true},
+		{name: "age needs duration", policy: domain.RetentionPolicy{Enabled: true, Mode: "age", KeepWithin: "90 days"}, wantError: true},
+		{name: "unknown mode", policy: domain.RetentionPolicy{Enabled: true, Mode: "custom", KeepLast: 1}, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			policy := domain.ProjectPolicy{Retention: test.policy}
+			err := validateProjectPolicy(&policy)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateProjectPolicy() error = %v, wantError = %v", err, test.wantError)
+			}
+		})
+	}
+
+	legacy := domain.ProjectPolicy{Retention: domain.RetentionPolicy{Enabled: true, KeepLast: 3, KeepDaily: 7}}
+	if err := validateProjectPolicy(&legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Retention.Mode != "gfs" {
+		t.Fatalf("legacy retention mode was not normalized: %#v", legacy.Retention)
+	}
+
+	separate := domain.ProjectPolicy{
+		Retention:    domain.RetentionPolicy{Enabled: true, Mode: "count", KeepLast: 5, Prune: true},
+		Verification: domain.VerificationPolicy{Mode: "metadata"},
+		Maintenance: domain.MaintenancePolicy{
+			Separate: true, Timezone: "Asia/Shanghai", RetentionCron: "30 3 * * *", PruneCron: "0 4 * * 0", VerificationCron: "0 5 * * 0",
+		},
+	}
+	if err := validateProjectPolicy(&separate); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMaintenancePolicy(&separate); err != nil {
+		t.Fatal(err)
+	}
+	separate.Maintenance.PruneCron = "not a cron"
+	if err := validateMaintenancePolicy(&separate); err == nil {
+		t.Fatal("invalid prune maintenance schedule was accepted")
 	}
 }
 

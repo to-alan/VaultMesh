@@ -32,7 +32,9 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	projectID := "prj_pg_" + suffix
 	repositoryID := "repo_pg_" + suffix
 	commandID := "cmd_pg_" + suffix
-	now := time.Now().UTC()
+	// PostgreSQL timestamptz stores microsecond precision, so keep the fixture at
+	// the same precision before comparing the value read back from the database.
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	admin := domain.AdminAccount{
 		Username: "admin-" + suffix, PasswordHash: []byte("hash-" + suffix),
 		WebAuthnUserID: []byte("user-handle-" + suffix), SecurityData: []byte("v1:security-" + suffix),
@@ -91,13 +93,37 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	if !config.Projects[0].Policy.Backup.OneFileSystem || config.Projects[0].Policy.Retention.KeepDaily != 7 || config.Projects[0].Policy.Verification.ReadDataSubset != "1%" {
 		t.Fatalf("project policy was not persisted: %#v", config.Projects[0].Policy)
 	}
-	_, err = dataStore.CreateCommand(ctx, domain.Command{ID: commandID, ProjectID: projectID, Type: "backup", CreatedAt: now})
+	_, err = dataStore.CreateCommand(ctx, domain.Command{
+		ID: commandID, ProjectID: projectID, Type: "snapshot_browse", CreatedAt: now,
+		Payload: map[string]any{"snapshot_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "path": "/etc"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	commands, err := dataStore.ClaimCommands(ctx, serverID, now, now.Add(time.Minute), 10)
 	if err != nil || len(commands) != 1 {
 		t.Fatalf("unexpected commands: %#v err=%v", commands, err)
+	}
+	if commands[0].Payload["path"] != "/etc" {
+		t.Fatalf("command payload was not persisted: %#v", commands[0].Payload)
+	}
+	const snapshotID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	syncedAt := now.Add(2 * time.Second)
+	if err := dataStore.ReplaceProjectSnapshots(ctx, projectID, serverID, []domain.Snapshot{{
+		ID: snapshotID, Time: now, Hostname: "integration", Paths: []string{"/etc"},
+		Tags: []string{"vaultmesh.project_id=" + projectID}, TotalFiles: 4, TotalBytes: 1024,
+	}}, syncedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.ReplaceProjectSnapshots(ctx, projectID, serverID, nil, syncedAt.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.ReplaceProjectSnapshots(ctx, projectID, serverID, nil, syncedAt); err != nil {
+		t.Fatal(err)
+	}
+	snapshots, err := dataStore.ListSnapshots(ctx, projectID, 10)
+	if err != nil || len(snapshots) != 1 || snapshots[0].ID != snapshotID || !snapshots[0].LastSyncedAt.Equal(syncedAt) {
+		t.Fatalf("snapshot inventory or stale-write guard failed: %#v err=%v", snapshots, err)
 	}
 	report := domain.RunReport{
 		ID: "run_pg_" + suffix, IdempotencyKey: "manual:" + commandID, ProjectID: projectID,
@@ -113,6 +139,18 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	if err := dataStore.UpsertRun(ctx, report); err != nil {
 		t.Fatal(err)
 	}
+	staleRunningReport := report
+	staleRunningReport.Status = domain.RunRunning
+	staleRunningReport.FinishedAt = nil
+	staleRunningReport.SnapshotID = ""
+	if err := dataStore.UpsertRun(ctx, staleRunningReport); err != nil {
+		t.Fatalf("delayed running report was not acknowledged: %v", err)
+	}
+	conflictingReport := report
+	conflictingReport.IdempotencyKey = "conflicting:" + commandID
+	if err := dataStore.UpsertRun(ctx, conflictingReport); err == nil {
+		t.Fatal("same run ID with a different idempotency identity was accepted")
+	}
 	commands, err = dataStore.ClaimCommands(ctx, serverID, now.Add(2*time.Minute), now.Add(3*time.Minute), 10)
 	if err != nil || len(commands) != 0 {
 		t.Fatalf("completed command was reclaimed: %#v err=%v", commands, err)
@@ -120,5 +158,8 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	runs, err := dataStore.ListRuns(ctx, 10)
 	if err != nil || len(runs) == 0 {
 		t.Fatalf("run was not persisted: %#v err=%v", runs, err)
+	}
+	if runs[0].ID == report.ID && runs[0].Status != domain.RunSucceeded {
+		t.Fatalf("delayed report regressed terminal run: %#v", runs[0])
 	}
 }

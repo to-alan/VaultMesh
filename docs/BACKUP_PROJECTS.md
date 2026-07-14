@@ -20,29 +20,36 @@ VaultMesh 的项目模型不自创备份术语。实际执行引擎是 Restic，
 | 数据源 | files、Docker、MySQL、PostgreSQL | 文件直接读取；Docker 生成脱敏清单并解析挂载；数据库先生成受保护的逻辑导出 |
 | 扫描边界 | 文件系统边界、缓存、目录标记、大文件、逐源排除规则 | 转换为 Restic 原生参数，不经过 Shell 解释 |
 | 快照计划 | 5 段 Cron、IANA 时区、随机延迟、最长运行时间 | Agent 离线持有最后一份配置并本地调度 |
-| 保留 | 最近、小时、日、周、月、年、可选 Prune | `forget` 同时按 Agent host 与项目标签过滤 |
-| 校验 | 关闭、仓库结构、抽样数据、完整数据 | 对应 `check`、`--read-data-subset`、`--read-data` |
+| 保留 | 最多 N 份、智能、GFS、按时间、永久保护、可选 Prune | `forget` 按 Agent host 与项目标签过滤，固定 `--group-by host`，并用 `--keep-tag vaultmesh.protected=true` 排除受保护快照 |
+| 校验 | 关闭、仓库结构、抽样数据、完整数据 | 在独立维护窗口执行 `check`、`--read-data-subset`、`--read-data` |
+| 维护窗口 | Forget、Prune、Check 各自的 5 段 Cron | 与备份使用相同仓库互斥锁，但失败不会把成功备份标记为 partial |
 | 运行控制 | 启用、暂停、立即备份 | 暂停会提升服务器配置版本，并从下一份 Agent 配置中移除项目 |
 
-管理界面的初始保留模板为最近 3、每日 7、每周 4、每月 12、每年 3。它只是新建表单的安全起点，不是服务端强制默认值；API 调用方可以明确关闭保留。
+管理界面的初始策略是“最多 14 份”。用户也可以选择 Duplicati Smart Retention 对应的每日 7 天、每周 28 天、每月 1 年，使用六层 GFS 计数，或按 Restic duration 保留一段时间内的全部快照。Restic 的多条 keep 规则按“或”组合，GFS 各字段相加并不等于最终快照总数。
+
+当前错过运行策略固定为 `skip`：Agent 离线跨过计划点时不会在恢复后补跑。`run_once` 尚未具备持久化游标和跨重启幂等语义，因此 API 会明确拒绝该值，避免界面看似保存成功但执行行为不一致。
+
+数据库导出与 Docker 清单位于每次运行新建的受保护暂存目录。Restic 默认按 host 与 paths 分组，会让变化的暂存路径形成不同保留组；VaultMesh 因此先用项目标签选择快照，再显式使用 `--group-by host`。在一个项目对应一个 Agent 的约束下，“最多 N 份”不会因暂存路径变化而失效。
 
 ## 执行与状态
 
-一次计划或手动运行按以下顺序执行：
+新建项目把备份与仓库维护拆成独立任务：
 
 1. 验证仓库；仓库不存在时执行一次初始化。
 2. 在 Agent 本机生成数据库导出和 Docker 清单。
-3. 执行 Restic backup；只有返回完整快照后才进入维护阶段。
-4. 若启用保留，执行带 `--host <agent-id>` 与 `--tag vaultmesh.project_id=<project-id>` 的 forget；只有显式启用时才追加 `--prune`。
-5. 若启用校验，执行结构检查、抽样读取或完整数据读取。
-6. 清理本地暂存文件并上报结果。
+3. 执行 Restic backup，取得快照 ID 后清理本地暂存文件并上报结果。
+4. 到达清理窗口时，执行带 `--host <agent-id>`、`--tag vaultmesh.project_id=<project-id>` 与 `--group-by host` 的 Forget。
+5. 到达空间回收窗口时，独立执行 Prune；到达校验窗口时，独立执行结构检查、抽样读取或完整数据读取。
 
-备份阶段失败时不会执行 Forget、Prune 或 Check。备份已经成功、但后续维护失败时，运行状态为 `partial`，同时保留 `snapshot_id` 和明确的 `retention_failed` 或 `repository_verification_failed` 错误码。这样不会把真实存在的快照误报为完全失败。
+四类操作分别写入运行记录，并通过 `stats.operation` 区分 backup、retention、prune 与 verification。维护任务失败不会改变已经成功的备份状态，也不会污染 Dashboard 的备份成功率。缺少 `maintenance.separate` 的历史项目仍沿用备份后 Forget/Prune/Check，并在维护失败时标记 `partial`，以保证升级兼容。
+
+每次成功备份后，Agent 还会用 Restic JSON 输出刷新该项目的快照索引。管理员可为某份快照添加 `vaultmesh.protected=true` 标签；Restic 修改标签会生成新的快照 ID，因此 Agent 会在操作后立即重新同步索引。保护规则不是控制面的近似判断，而是随后的真实 Forget 命令固定携带 `--keep-tag vaultmesh.protected=true`。
 
 ## 安全和成本边界
 
 - Forget 必须同时带 host 与项目标签；仅按时间清理会误删共享仓库中其他项目的快照。
-- Prune 会独占锁定仓库并可能产生大量读写，默认关闭。当前版本跟随成功备份执行；独立维护时间窗仍是后续能力。
+- 项目卡片的“清理预览”由目标 Agent 对真实仓库执行 `forget --dry-run --json`，只上报将保留/将删除数量，不执行 Forget 或 Prune。它不是浏览器根据日期做的近似估算。
+- Prune 会独占锁定仓库并可能产生大量读写，默认关闭；启用后应安排在每周低峰窗口。
 - 完整数据校验可能读取整个仓库。常规自动化更适合结构检查或小比例抽样，完整读取应在低峰期人工启用。
 - 不提供任意 Shell Hook。虽然 resticprofile、Kopia、borgmatic 等支持动作或 Hook，但在中心化 Agent 产品中直接开放会形成远程命令执行面；后续需要强类型、可审计的动作适配器。
 - Docker 挂载数据默认只有崩溃一致性。数据库容器仍应额外配置 MySQL 或 PostgreSQL 逻辑数据源。

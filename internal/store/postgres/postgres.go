@@ -433,12 +433,16 @@ func (s *Store) DesiredConfig(ctx context.Context, serverID string) (domain.Agen
 }
 
 func (s *Store) CreateCommand(ctx context.Context, command domain.Command) (domain.Command, error) {
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO commands (id, server_id, project_id, type, created_at)
-		SELECT $1, server_id, id, $3, $4
+	payload, err := json.Marshal(command.Payload)
+	if err != nil {
+		return domain.Command{}, err
+	}
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO commands (id, server_id, project_id, type, payload, created_at)
+		SELECT $1, server_id, id, $3, $4, $5
 		FROM projects
 		WHERE id = $2 AND enabled = TRUE
-		RETURNING server_id`, command.ID, command.ProjectID, command.Type, command.CreatedAt).Scan(&command.ServerID)
+		RETURNING server_id`, command.ID, command.ProjectID, command.Type, payload, command.CreatedAt).Scan(&command.ServerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Command{}, store.ErrNotFound
 	}
@@ -467,7 +471,7 @@ func (s *Store) ClaimCommands(ctx context.Context, serverID string, now, leaseUn
 		SET leased_until = $3, attempts = c.attempts + 1
 		FROM picked
 		WHERE c.id = picked.id
-		RETURNING c.id, c.server_id, c.project_id, c.type, c.leased_until, c.attempts, c.created_at`,
+		RETURNING c.id, c.server_id, c.project_id, c.type, c.payload, c.leased_until, c.attempts, c.created_at`,
 		serverID, now, leaseUntil, limit)
 	if err != nil {
 		return nil, err
@@ -476,13 +480,105 @@ func (s *Store) ClaimCommands(ctx context.Context, serverID string, now, leaseUn
 	var result []domain.Command
 	for rows.Next() {
 		var command domain.Command
+		var payload []byte
 		if err := rows.Scan(&command.ID, &command.ServerID, &command.ProjectID, &command.Type,
-			&command.LeaseUntil, &command.Attempts, &command.CreatedAt); err != nil {
+			&payload, &command.LeaseUntil, &command.Attempts, &command.CreatedAt); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(payload, &command.Payload); err != nil {
 			return nil, err
 		}
 		result = append(result, command)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) ReplaceProjectSnapshots(ctx context.Context, projectID, serverID string, snapshots []domain.Snapshot, syncedAt time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var storedServerID string
+	var latestSync *time.Time
+	if err := tx.QueryRow(ctx, `SELECT server_id, snapshot_synced_at FROM projects WHERE id = $1 FOR UPDATE`, projectID).Scan(&storedServerID, &latestSync); errors.Is(err, pgx.ErrNoRows) {
+		return store.ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if storedServerID != serverID {
+		return store.ErrNotFound
+	}
+	if latestSync != nil && !syncedAt.After(*latestSync) {
+		return tx.Commit(ctx)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM snapshots WHERE project_id = $1`, projectID); err != nil {
+		return err
+	}
+	for _, snapshot := range snapshots {
+		paths, err := json.Marshal(snapshot.Paths)
+		if err != nil {
+			return err
+		}
+		tags, err := json.Marshal(snapshot.Tags)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO snapshots
+			(id, project_id, server_id, captured_at, hostname, username, paths, tags,
+			 total_files, total_bytes, protected, last_synced_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+			snapshot.ID, projectID, serverID, snapshot.Time, snapshot.Hostname, snapshot.Username,
+			paths, tags, snapshot.TotalFiles, snapshot.TotalBytes, snapshot.Protected, syncedAt); err != nil {
+			return mapError(err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE projects SET snapshot_synced_at = $2 WHERE id = $1`, projectID, syncedAt); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) ListSnapshots(ctx context.Context, projectID string, limit int) ([]domain.Snapshot, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	query := `SELECT id, project_id, server_id, captured_at, hostname, username, paths, tags,
+	                 total_files, total_bytes, protected, last_synced_at
+	          FROM snapshots`
+	args := []any{}
+	if projectID != "" {
+		query += ` WHERE project_id = $1`
+		args = append(args, projectID)
+	}
+	query += fmt.Sprintf(` ORDER BY captured_at DESC LIMIT $%d`, len(args)+1)
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []domain.Snapshot
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, snapshot)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) GetSnapshot(ctx context.Context, projectID, snapshotID string) (domain.Snapshot, error) {
+	snapshot, err := scanSnapshot(s.pool.QueryRow(ctx, `
+		SELECT id, project_id, server_id, captured_at, hostname, username, paths, tags,
+		       total_files, total_bytes, protected, last_synced_at
+		FROM snapshots WHERE project_id = $1 AND id = $2`, projectID, snapshotID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Snapshot{}, store.ErrNotFound
+	}
+	return snapshot, err
 }
 
 func (s *Store) UpsertRun(ctx context.Context, report domain.RunReport) error {
@@ -504,14 +600,33 @@ func (s *Store) UpsertRun(ctx context.Context, report domain.RunReport) error {
 		 error_code = EXCLUDED.error_code,
 		 error_message = EXCLUDED.error_message,
 		 stats = EXCLUDED.stats,
-		 updated_at = NOW()`, report.ID, report.IdempotencyKey, report.ProjectID, report.ServerID,
+		 updated_at = NOW()
+		 WHERE runs.idempotency_key = EXCLUDED.idempotency_key
+		   AND runs.project_id = EXCLUDED.project_id
+		   AND runs.server_id = EXCLUDED.server_id
+		   AND runs.status = 'running'`, report.ID, report.IdempotencyKey, report.ProjectID, report.ServerID,
 		report.ScheduledAt, report.StartedAt, report.FinishedAt, report.Status,
 		report.SnapshotID, report.ErrorCode, report.ErrorMessage, stats)
 	if err != nil {
 		return mapError(err)
 	}
 	if tag.RowsAffected() == 0 {
-		return store.ErrNotFound
+		var idempotencyKey, projectID, serverID, status string
+		err := s.pool.QueryRow(ctx, `
+			SELECT idempotency_key, project_id, server_id, status
+			FROM runs WHERE id = $1`, report.ID).Scan(&idempotencyKey, &projectID, &serverID, &status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if idempotencyKey != report.IdempotencyKey || projectID != report.ProjectID || serverID != report.ServerID {
+			return store.ErrConflict
+		}
+		// The identity matches and the WHERE clause can only reject an already
+		// terminal run. Treat delayed duplicates as acknowledged no-ops.
+		return nil
 	}
 	if commandID, ok := strings.CutPrefix(report.IdempotencyKey, "manual:"); ok {
 		completed := report.Status != domain.RunRunning
@@ -564,9 +679,9 @@ func (s *Store) Dashboard(ctx context.Context, since time.Time) (domain.Dashboar
 		  (SELECT COUNT(*) FROM servers),
 		  (SELECT COUNT(*) FROM servers WHERE last_seen_at >= NOW() - INTERVAL '90 seconds'),
 		  (SELECT COUNT(*) FROM projects),
-		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND status = $2),
-		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND status IN ($3, $4, $5)),
-		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND status = $6)`,
+		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $2),
+		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status IN ($3, $4, $5)),
+		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $6)`,
 		since, domain.RunSucceeded, domain.RunFailed, domain.RunTimedOut,
 		domain.RunUnknown, domain.RunPartial).Scan(&dashboard.ServersTotal,
 		&dashboard.ServersOnline, &dashboard.ProjectsTotal, &dashboard.RunsSucceeded,
@@ -611,6 +726,23 @@ func scanProject(row scanner) (domain.Project, error) {
 		return domain.Project{}, err
 	}
 	return project, nil
+}
+
+func scanSnapshot(row scanner) (domain.Snapshot, error) {
+	var snapshot domain.Snapshot
+	var paths, tags []byte
+	if err := row.Scan(&snapshot.ID, &snapshot.ProjectID, &snapshot.ServerID, &snapshot.Time,
+		&snapshot.Hostname, &snapshot.Username, &paths, &tags, &snapshot.TotalFiles,
+		&snapshot.TotalBytes, &snapshot.Protected, &snapshot.LastSyncedAt); err != nil {
+		return domain.Snapshot{}, err
+	}
+	if err := json.Unmarshal(paths, &snapshot.Paths); err != nil {
+		return domain.Snapshot{}, err
+	}
+	if err := json.Unmarshal(tags, &snapshot.Tags); err != nil {
+		return domain.Snapshot{}, err
+	}
+	return snapshot, nil
 }
 
 func publicRepository(repository domain.Repository) domain.Repository {

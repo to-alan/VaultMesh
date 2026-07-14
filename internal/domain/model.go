@@ -82,6 +82,18 @@ type ProjectPolicy struct {
 	Backup       BackupPolicy       `json:"backup"`
 	Retention    RetentionPolicy    `json:"retention"`
 	Verification VerificationPolicy `json:"verification"`
+	Maintenance  MaintenancePolicy  `json:"maintenance"`
+}
+
+type MaintenancePolicy struct {
+	// Separate keeps repository maintenance out of the backup critical path.
+	// It is explicit so projects created before this capability retain their
+	// original post-backup behavior until they are edited.
+	Separate         bool   `json:"separate"`
+	Timezone         string `json:"timezone,omitempty"`
+	RetentionCron    string `json:"retention_cron,omitempty"`
+	PruneCron        string `json:"prune_cron,omitempty"`
+	VerificationCron string `json:"verification_cron,omitempty"`
 }
 
 type BackupPolicy struct {
@@ -92,14 +104,18 @@ type BackupPolicy struct {
 }
 
 type RetentionPolicy struct {
-	Enabled     bool `json:"enabled"`
-	KeepLast    int  `json:"keep_last"`
-	KeepHourly  int  `json:"keep_hourly"`
-	KeepDaily   int  `json:"keep_daily"`
-	KeepWeekly  int  `json:"keep_weekly"`
-	KeepMonthly int  `json:"keep_monthly"`
-	KeepYearly  int  `json:"keep_yearly"`
-	Prune       bool `json:"prune"`
+	Enabled bool `json:"enabled"`
+	// Mode is one of count, smart, gfs, or age. Empty values from older
+	// configurations are normalized to gfs by the control plane.
+	Mode        string `json:"mode"`
+	KeepLast    int    `json:"keep_last"`
+	KeepHourly  int    `json:"keep_hourly"`
+	KeepDaily   int    `json:"keep_daily"`
+	KeepWeekly  int    `json:"keep_weekly"`
+	KeepMonthly int    `json:"keep_monthly"`
+	KeepYearly  int    `json:"keep_yearly"`
+	KeepWithin  string `json:"keep_within,omitempty"`
+	Prune       bool   `json:"prune"`
 }
 
 type VerificationPolicy struct {
@@ -171,6 +187,31 @@ type RunReport struct {
 	Stats          map[string]any `json:"stats,omitempty"`
 }
 
+type Snapshot struct {
+	ID           string    `json:"id"`
+	ProjectID    string    `json:"project_id"`
+	ServerID     string    `json:"server_id"`
+	Time         time.Time `json:"time"`
+	Hostname     string    `json:"hostname"`
+	Username     string    `json:"username,omitempty"`
+	Paths        []string  `json:"paths"`
+	Tags         []string  `json:"tags"`
+	TotalFiles   int64     `json:"total_files,omitempty"`
+	TotalBytes   int64     `json:"total_bytes,omitempty"`
+	Protected    bool      `json:"protected"`
+	LastSyncedAt time.Time `json:"last_synced_at"`
+}
+
+type SnapshotEntry struct {
+	Name        string    `json:"name"`
+	Path        string    `json:"path"`
+	Type        string    `json:"type"`
+	Size        int64     `json:"size"`
+	Mode        uint32    `json:"mode,omitempty"`
+	Permissions string    `json:"permissions,omitempty"`
+	ModifiedAt  time.Time `json:"modified_at,omitempty"`
+}
+
 type Dashboard struct {
 	ServersTotal  int `json:"servers_total"`
 	ServersOnline int `json:"servers_online"`
@@ -181,13 +222,14 @@ type Dashboard struct {
 }
 
 type Command struct {
-	ID         string     `json:"id"`
-	ServerID   string     `json:"server_id"`
-	ProjectID  string     `json:"project_id"`
-	Type       string     `json:"type"`
-	LeaseUntil *time.Time `json:"lease_until,omitempty"`
-	Attempts   int        `json:"attempts"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID         string         `json:"id"`
+	ServerID   string         `json:"server_id"`
+	ProjectID  string         `json:"project_id"`
+	Type       string         `json:"type"`
+	Payload    map[string]any `json:"payload,omitempty"`
+	LeaseUntil *time.Time     `json:"lease_until,omitempty"`
+	Attempts   int            `json:"attempts"`
+	CreatedAt  time.Time      `json:"created_at"`
 }
 
 // AdminAccount is the single control-plane administrator identity. SecurityData

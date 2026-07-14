@@ -13,9 +13,9 @@ import {
   repositoryProviderGroups,
   repositoryProviders,
 } from './repositories'
-import type { Dashboard, EnrollmentResult, Passkey, Profile, Project, Repository, Run, Server } from './types'
+import type { Dashboard, EnrollmentResult, Passkey, Profile, Project, Repository, Run, Server, Snapshot, SnapshotEntry } from './types'
 
-type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'runs' | 'profile'
+type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'snapshots' | 'runs' | 'profile'
 type SourceType = 'files' | 'mysql' | 'postgresql' | 'docker'
 type ScheduleMode = 'daily' | 'weekly' | 'custom'
 type SecurityModal = 'password' | 'totp-setup' | 'totp-manage' | 'passkey-add' | 'passkey-delete' | 'reauthenticate' | null
@@ -56,8 +56,10 @@ const success = ref('')
 const nowEpoch = ref(Date.now())
 const lastUpdatedAt = ref<number | null>(null)
 const queuedProjectIDs = ref<Set<string>>(new Set())
+const queuedPreviewProjectIDs = ref<Set<string>>(new Set())
 let clockTimer: number | undefined
 let refreshTimer: number | undefined
+const snapshotPollTimers = new Set<number>()
 
 const dashboard = ref<Dashboard>({
   servers_total: 0,
@@ -71,6 +73,14 @@ const servers = ref<Server[]>([])
 const repositories = ref<Repository[]>([])
 const projects = ref<Project[]>([])
 const runs = ref<Run[]>([])
+const snapshots = ref<Snapshot[]>([])
+const snapshotProjectFilter = ref('')
+const selectedSnapshotID = ref('')
+const selectedSnapshotProjectID = ref('')
+const snapshotBrowsePath = ref('/')
+const pendingRestorePath = ref<string | null>(null)
+const snapshotBrowseCommandID = ref('')
+const snapshotRestoreCommandID = ref('')
 const enrollment = ref<EnrollmentResult | null>(null)
 const profile = ref<Profile>({ username: '', totp_enabled: false, recovery_codes_remaining: 0, passkeys: [], webauthn_available: false, webauthn_rp_id: '' })
 const totpSetup = ref<{ secret: string; qr_code: string } | null>(null)
@@ -111,15 +121,20 @@ const projectForm = reactive({
   exclude_if_present: '.nobackup',
   exclude_larger_than: '',
   retention_enabled: true,
-  keep_last: 3,
+  retention_mode: 'count' as 'count' | 'smart' | 'gfs' | 'age',
+  keep_last: 14,
   keep_hourly: 0,
   keep_daily: 7,
   keep_weekly: 4,
   keep_monthly: 12,
   keep_yearly: 3,
+  keep_within: '90d',
   prune: false,
   verification_mode: 'off' as 'off' | 'metadata' | 'subset' | 'full',
   read_data_subset: '1%',
+  retention_cron: '30 3 * * *',
+  prune_cron: '0 4 * * 0',
+  verification_cron: '0 5 * * 0',
 })
 
 const activeRepositoryProvider = computed(() => repositoryProvider(repositoryForm.provider))
@@ -134,14 +149,28 @@ watch(() => repositoryForm.provider, (provider) => {
   repositoryForm.values = repositoryDefaults(provider)
 })
 
+watch(snapshotProjectFilter, (projectID) => {
+  if (!projectID || selectedSnapshotProjectID.value === projectID) return
+  selectedSnapshotID.value = ''
+  selectedSnapshotProjectID.value = ''
+  snapshotBrowsePath.value = '/'
+  snapshotBrowseCommandID.value = ''
+  snapshotRestoreCommandID.value = ''
+  pendingRestorePath.value = null
+})
+
 const projectNames = computed(() => new Map(projects.value.map((project) => [project.id, project.name])))
+const backupRuns = computed(() => runs.value.filter((run) => {
+  const operation = String(run.stats?.operation || 'backup')
+  return operation === 'backup'
+}))
 const projectCron = computed(buildProjectCron)
 const projectSchedulePreview = computed(() => {
   const jitter = projectForm.jitter_minutes > 0 ? `，最多随机延后 ${projectForm.jitter_minutes} 分钟` : ''
   return `${cronDescription(projectCron.value)} · ${projectForm.timezone}${jitter}`
 })
-const totalRunCount = computed(() => runs.value.length)
-const successfulRunCount = computed(() => runs.value.filter((run) => run.status === 'succeeded').length)
+const totalRunCount = computed(() => backupRuns.value.length)
+const successfulRunCount = computed(() => backupRuns.value.filter((run) => run.status === 'succeeded').length)
 const successRate = computed(() => totalRunCount.value ? Math.round(successfulRunCount.value / totalRunCount.value * 100) : 0)
 const protectedSourceCount = computed(() => projects.value.reduce((total, project) => total + project.sources.length, 0))
 const attentionCount = computed(() => dashboard.value.runs_failed + dashboard.value.runs_partial)
@@ -176,7 +205,7 @@ const runTrend = computed(() => {
     }
   })
   const byDate = new Map(points.map((point) => [point.key, point]))
-  for (const run of runs.value) {
+  for (const run of backupRuns.value) {
     const point = byDate.get(localDateKey(new Date(run.started_at)))
     if (!point) continue
     point.total += 1
@@ -195,10 +224,10 @@ const runTrend = computed(() => {
 })
 
 const runDistribution = computed(() => [
-  { key: 'succeeded', label: '成功', count: runs.value.filter((run) => run.status === 'succeeded').length, color: '#5df0a8' },
-  { key: 'partial', label: '部分成功', count: runs.value.filter((run) => run.status === 'partial').length, color: '#f6c85f' },
-  { key: 'failed', label: '失败/超时', count: runs.value.filter((run) => ['failed', 'timed_out', 'canceled', 'unknown'].includes(run.status)).length, color: '#ff6b73' },
-  { key: 'running', label: '执行中', count: runs.value.filter((run) => run.status === 'running').length, color: '#65b8ff' },
+  { key: 'succeeded', label: '成功', count: backupRuns.value.filter((run) => run.status === 'succeeded').length, color: '#5df0a8' },
+  { key: 'partial', label: '部分成功', count: backupRuns.value.filter((run) => run.status === 'partial').length, color: '#f6c85f' },
+  { key: 'failed', label: '失败/超时', count: backupRuns.value.filter((run) => ['failed', 'timed_out', 'canceled', 'unknown'].includes(run.status)).length, color: '#ff6b73' },
+  { key: 'running', label: '执行中', count: backupRuns.value.filter((run) => run.status === 'running').length, color: '#65b8ff' },
 ])
 
 const runDonutBackground = computed(() => {
@@ -214,7 +243,7 @@ const runDonutBackground = computed(() => {
 })
 
 const projectHealth = computed(() => projects.value.map((project) => {
-  const latest = runs.value.find((run) => run.project_id === project.id)
+  const latest = backupRuns.value.find((run) => run.project_id === project.id)
   return { project, latest, status: latest?.status ?? 'unknown' }
 }).sort((left, right) => healthOrder(left.status) - healthOrder(right.status)))
 
@@ -229,6 +258,55 @@ const projectGroups = computed(() => {
   if (detached.length) groups.push({ id: 'unknown', name: '未知服务器', projects: detached })
   return groups
 })
+
+const filteredSnapshots = computed(() => snapshots.value.filter((snapshot) => (
+  !snapshotProjectFilter.value || snapshot.project_id === snapshotProjectFilter.value
+)))
+const selectedSnapshot = computed(() => snapshots.value.find((snapshot) => (
+  snapshot.id === selectedSnapshotID.value && snapshot.project_id === selectedSnapshotProjectID.value
+)))
+const protectedSnapshotCount = computed(() => snapshots.value.filter((snapshot) => snapshot.protected).length)
+const snapshotStorageBytes = computed(() => snapshots.value.reduce((total, snapshot) => total + Number(snapshot.total_bytes || 0), 0))
+const currentBrowseRun = computed(() => {
+  if (snapshotBrowseCommandID.value) {
+    return runs.value.find((run) => run.idempotency_key === `manual:${snapshotBrowseCommandID.value}`)
+  }
+  if (!selectedSnapshot.value) return undefined
+  return runs.value.find((run) => run.project_id === selectedSnapshot.value?.project_id
+    && run.stats?.operation === 'snapshot_browse'
+    && run.stats?.snapshot_id === selectedSnapshot.value?.id
+    && run.stats?.path === snapshotBrowsePath.value)
+})
+const currentRestoreRun = computed(() => {
+  if (snapshotRestoreCommandID.value) {
+    return runs.value.find((run) => run.idempotency_key === `manual:${snapshotRestoreCommandID.value}`)
+  }
+  if (!selectedSnapshot.value) return undefined
+  return runs.value.find((run) => run.project_id === selectedSnapshot.value?.project_id
+    && run.stats?.operation === 'snapshot_restore'
+    && run.stats?.snapshot_id === selectedSnapshot.value?.id)
+})
+const snapshotEntries = computed<SnapshotEntry[]>(() => {
+  if (currentBrowseRun.value?.status !== 'succeeded') return []
+  const value = currentBrowseRun.value.stats?.entries
+  if (!Array.isArray(value)) return []
+  return value.filter((entry): entry is SnapshotEntry => Boolean(
+    entry && typeof entry === 'object' && typeof entry.path === 'string' && typeof entry.type === 'string',
+  )).sort((left, right) => {
+    if (left.type === 'dir' && right.type !== 'dir') return -1
+    if (right.type === 'dir' && left.type !== 'dir') return 1
+    return left.name.localeCompare(right.name, 'zh-CN')
+  })
+})
+const snapshotBreadcrumbs = computed(() => {
+  const segments = snapshotBrowsePath.value.split('/').filter(Boolean)
+  return [
+    { label: '/', path: '/' },
+    ...segments.map((segment, index) => ({ label: segment, path: `/${segments.slice(0, index + 1).join('/')}` })),
+  ]
+})
+const snapshotBrowsePending = computed(() => Boolean(snapshotBrowseCommandID.value && !currentBrowseRun.value))
+const snapshotRestorePending = computed(() => Boolean(snapshotRestoreCommandID.value && !currentRestoreRun.value))
 
 async function login() {
   error.value = ''
@@ -313,12 +391,13 @@ async function loadAll() {
   loading.value = true
   error.value = ''
   try {
-    const [dashboardResult, serverResult, repositoryResult, projectResult, runResult, profileResult] = await Promise.all([
+    const [dashboardResult, serverResult, repositoryResult, projectResult, runResult, snapshotResult, profileResult] = await Promise.all([
       api<Dashboard>('/api/v1/dashboard'),
       api<{ items: Server[] }>('/api/v1/servers'),
       api<{ items: Repository[] }>('/api/v1/repositories'),
       api<{ items: Project[] }>('/api/v1/projects'),
       api<{ items: Run[] }>('/api/v1/runs?limit=100'),
+      api<{ items: Snapshot[] }>('/api/v1/snapshots?limit=1000'),
       api<Profile>('/api/v1/profile'),
     ])
     dashboard.value = dashboardResult
@@ -326,6 +405,11 @@ async function loadAll() {
     repositories.value = repositoryResult.items ?? []
     projects.value = projectResult.items ?? []
     runs.value = runResult.items ?? []
+    snapshots.value = (snapshotResult.items ?? []).map((snapshot) => ({
+      ...snapshot,
+      paths: snapshot.paths ?? [],
+      tags: snapshot.tags ?? [],
+    }))
     profile.value = profileResult
     lastUpdatedAt.value = Date.now()
     selectDefaults()
@@ -540,6 +624,19 @@ function selectDefaults() {
   if (!repositories.value.some((repository) => repository.id === projectForm.repository_id)) {
     projectForm.repository_id = repositories.value[0]?.id ?? ''
   }
+  if (snapshotProjectFilter.value && !projects.value.some((project) => project.id === snapshotProjectFilter.value)) {
+    snapshotProjectFilter.value = ''
+  }
+  if (selectedSnapshotID.value && !snapshots.value.some((snapshot) => (
+    snapshot.id === selectedSnapshotID.value && snapshot.project_id === selectedSnapshotProjectID.value
+  ))) {
+    selectedSnapshotID.value = ''
+    selectedSnapshotProjectID.value = ''
+    snapshotBrowsePath.value = '/'
+    snapshotBrowseCommandID.value = ''
+    snapshotRestoreCommandID.value = ''
+    pendingRestorePath.value = null
+  }
 }
 
 async function createServer() {
@@ -635,17 +732,26 @@ async function createProject() {
           },
           retention: {
             enabled: projectForm.retention_enabled,
+            mode: projectForm.retention_mode,
             keep_last: Number(projectForm.keep_last),
             keep_hourly: Number(projectForm.keep_hourly),
             keep_daily: Number(projectForm.keep_daily),
             keep_weekly: Number(projectForm.keep_weekly),
             keep_monthly: Number(projectForm.keep_monthly),
             keep_yearly: Number(projectForm.keep_yearly),
+            keep_within: projectForm.keep_within.trim(),
             prune: projectForm.prune,
           },
           verification: {
             mode: projectForm.verification_mode,
             read_data_subset: projectForm.verification_mode === 'subset' ? projectForm.read_data_subset : '',
+          },
+          maintenance: {
+            separate: true,
+            timezone: projectForm.timezone,
+            retention_cron: projectForm.retention_enabled ? projectForm.retention_cron.trim() : '',
+            prune_cron: projectForm.retention_enabled && projectForm.prune ? projectForm.prune_cron.trim() : '',
+            verification_cron: projectForm.verification_mode !== 'off' ? projectForm.verification_cron.trim() : '',
           },
         },
       }),
@@ -727,6 +833,101 @@ async function runNow(project: Project) {
   })
 }
 
+async function previewRetention(project: Project) {
+  await perform(async () => {
+    await api(`/api/v1/projects/${encodeURIComponent(project.id)}/retention-preview`, { method: 'POST' })
+    queuedPreviewProjectIDs.value = new Set([...queuedPreviewProjectIDs.value, project.id])
+    success.value = `已向 ${project.name} 所在 Agent 排队发送只读清理预览；结果会在运行记录和项目卡片中显示。`
+    window.setTimeout(() => {
+      const next = new Set(queuedPreviewProjectIDs.value)
+      next.delete(project.id)
+      queuedPreviewProjectIDs.value = next
+    }, 15000)
+  })
+}
+
+async function refreshSnapshotInventory() {
+  await perform(async () => {
+    const targets = projects.value.filter((project) => project.enabled
+      && (!snapshotProjectFilter.value || project.id === snapshotProjectFilter.value))
+    if (!targets.length) throw new Error('当前筛选下没有可同步的已启用项目')
+    await Promise.all(targets.map((project) => api(`/api/v1/projects/${encodeURIComponent(project.id)}/snapshots/refresh`, {
+      method: 'POST',
+    })))
+    success.value = `已向 ${targets.length} 个项目的 Agent 排队同步快照索引，页面会自动获取结果。`
+    queueSnapshotPolls()
+  })
+}
+
+async function selectSnapshot(snapshot: Snapshot) {
+  selectedSnapshotID.value = snapshot.id
+  selectedSnapshotProjectID.value = snapshot.project_id
+  snapshotProjectFilter.value = snapshot.project_id
+  pendingRestorePath.value = null
+  snapshotRestoreCommandID.value = ''
+  await browseSnapshotPath('/')
+}
+
+async function browseSnapshotPath(path: string) {
+  const snapshot = selectedSnapshot.value
+  if (!snapshot) return
+  await perform(async () => {
+    const command = await api<{ id: string }>(`/api/v1/projects/${encodeURIComponent(snapshot.project_id)}/snapshots/${encodeURIComponent(snapshot.id)}/browse`, {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    })
+    snapshotBrowsePath.value = path
+    snapshotBrowseCommandID.value = command.id
+    pendingRestorePath.value = null
+    success.value = `目录读取已发送给 ${serverName(snapshot.server_id)}，Agent 返回后会自动展示。`
+    queueSnapshotPolls()
+  })
+}
+
+async function toggleSnapshotProtection(snapshot: Snapshot) {
+  await perform(async () => {
+    await api(`/api/v1/projects/${encodeURIComponent(snapshot.project_id)}/snapshots/${encodeURIComponent(snapshot.id)}/protect`, {
+      method: 'POST',
+      body: JSON.stringify({ protected: !snapshot.protected }),
+    })
+    success.value = snapshot.protected
+      ? '已排队取消保护；新的快照索引返回后生效。'
+      : '已排队永久保护；保留策略将跳过这份快照。'
+    queueSnapshotPolls()
+  })
+}
+
+function requestSnapshotRestore(path: string) {
+  pendingRestorePath.value = path
+  snapshotRestoreCommandID.value = ''
+}
+
+async function confirmSnapshotRestore() {
+  const snapshot = selectedSnapshot.value
+  const path = pendingRestorePath.value
+  if (!snapshot || !path) return
+  await perform(async () => {
+    const command = await api<{ id: string }>(`/api/v1/projects/${encodeURIComponent(snapshot.project_id)}/snapshots/${encodeURIComponent(snapshot.id)}/restore`, {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    })
+    snapshotRestoreCommandID.value = command.id
+    pendingRestorePath.value = null
+    success.value = '安全恢复已排队：Agent 只会写入新的隔离目录，并强制禁止覆盖已有文件。'
+    queueSnapshotPolls()
+  })
+}
+
+function queueSnapshotPolls() {
+  for (const delay of [12000, 24000, 36000]) {
+    const timer = window.setTimeout(() => {
+      snapshotPollTimers.delete(timer)
+      if (authenticated.value && !loading.value) void loadAll().catch(showError)
+    }, delay)
+    snapshotPollTimers.add(timer)
+  }
+}
+
 async function toggleProject(project: Project) {
   await perform(async () => {
     const enabled = !project.enabled
@@ -786,6 +987,25 @@ function formatDate(value?: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'medium' }).format(new Date(value))
 }
 
+function formatBytes(value?: number): string {
+  const bytes = Number(value || 0)
+  if (!bytes) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)))
+  const size = bytes / 1024 ** index
+  return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`
+}
+
+function snapshotEntryName(entry: SnapshotEntry): string {
+  return entry.name || entry.path.split('/').filter(Boolean).at(-1) || '/'
+}
+
+function snapshotEntryIcon(entry: SnapshotEntry): string {
+  if (entry.type === 'dir') return '▰'
+  if (entry.type === 'symlink') return '↗'
+  return '▪'
+}
+
 function localDateKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
@@ -820,6 +1040,7 @@ function pageDescription(tab: Tab): string {
     servers: 'Agent 在线状态与配置收敛',
     repositories: 'Restic 目标与凭据边界',
     projects: '数据源、调度策略与下次执行',
+    snapshots: '快照索引、文件浏览与隔离恢复',
     runs: '端到端备份执行证据',
     profile: '密码、二步验证与通行密钥',
   }[tab]
@@ -831,6 +1052,7 @@ function navBadge(tab: Tab): number {
     servers: servers.value.length,
     repositories: repositories.value.length,
     projects: projects.value.length,
+    snapshots: snapshots.value.length,
     runs: runs.value.length,
     profile: profile.value.passkeys.length,
   }[tab]
@@ -874,7 +1096,46 @@ function sourceSummary(source: Project['sources'][number]): string {
 function retentionSummary(project: Project): string {
   const retention = project.policy?.retention
   if (!retention?.enabled) return '不自动清理'
-  return `最近 ${retention.keep_last || 0} / 日 ${retention.keep_daily || 0} / 周 ${retention.keep_weekly || 0} / 月 ${retention.keep_monthly || 0}`
+  switch (retention.mode || 'gfs') {
+    case 'count': return `最多 ${retention.keep_last} 份`
+    case 'smart': return '智能：日 7 / 周 4 / 月 12'
+    case 'age': return `保留最近 ${retention.keep_within}`
+    default: return `GFS · 最近 ${retention.keep_last || 0} / 日 ${retention.keep_daily || 0} / 周 ${retention.keep_weekly || 0} / 月 ${retention.keep_monthly || 0}`
+  }
+}
+
+function latestRetentionPreview(projectID: string): Run | undefined {
+  return runs.value.find((run) => run.project_id === projectID && run.stats?.operation === 'retention_preview')
+}
+
+function retentionPreviewSummary(projectID: string): string {
+  const preview = latestRetentionPreview(projectID)
+  if (!preview) return ''
+  if (preview.status !== 'succeeded') return `预览失败：${preview.error_message || 'Agent 未返回有效结果'}`
+  return `保留 ${Number(preview.stats?.snapshots_kept || 0)} 份 · 将删除 ${Number(preview.stats?.snapshots_removed || 0)} 份 · 未执行删除`
+}
+
+function runOperationLabel(run: Run): string {
+  return {
+    retention_preview: '清理预览',
+    retention: '快照清理',
+    prune: '空间回收',
+    verification: '仓库校验',
+    snapshot_sync: '快照同步',
+    snapshot_protect: '快照保护',
+    snapshot_browse: '目录浏览',
+    snapshot_restore: '安全恢复',
+  }[String(run.stats?.operation || '')] || '备份'
+}
+
+function maintenanceSummary(project: Project): string {
+  const maintenance = project.policy?.maintenance
+  if (!maintenance?.separate) return '备份后执行（兼容模式）'
+  const tasks = []
+  if (project.policy?.retention.enabled) tasks.push(`清理 ${maintenance.retention_cron || '—'}`)
+  if (project.policy?.retention.prune) tasks.push(`Prune ${maintenance.prune_cron || '—'}`)
+  if (project.policy?.verification.mode && project.policy.verification.mode !== 'off') tasks.push(`校验 ${maintenance.verification_cron || '—'}`)
+  return tasks.join(' · ') || '无维护任务'
 }
 
 function verificationSummary(project: Project): string {
@@ -1019,6 +1280,8 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (clockTimer) window.clearInterval(clockTimer)
   if (refreshTimer) window.clearInterval(refreshTimer)
+  snapshotPollTimers.forEach((timer) => window.clearTimeout(timer))
+  snapshotPollTimers.clear()
 })
 </script>
 
@@ -1068,7 +1331,7 @@ onBeforeUnmount(() => {
       <nav aria-label="主导航">
         <button v-for="item in ([
           ['overview', '运行总览', '01'], ['servers', '服务器', '02'], ['repositories', '备份仓库', '03'],
-          ['projects', '备份项目', '04'], ['runs', '运行记录', '05'],
+          ['projects', '备份项目', '04'], ['snapshots', '快照恢复', '05'], ['runs', '运行记录', '06'],
         ] as [Tab, string, string][] )" :key="item[0]" type="button" :class="{ active: activeTab === item[0] }" @click="activeTab = item[0]">
           <span class="nav-index">{{ item[2] }}</span><span class="nav-label">{{ item[1] }}</span><span v-if="navBadge(item[0])" class="nav-badge">{{ navBadge(item[0]) }}</span>
         </button>
@@ -1093,7 +1356,7 @@ onBeforeUnmount(() => {
       <header class="topbar">
         <div>
           <p class="breadcrumb">VAULTMESH <span>/</span> {{ activeTab.toUpperCase() }}</p>
-          <h1>{{ { overview: '备份总览', servers: '服务器', repositories: '备份仓库', projects: '备份项目', runs: '运行记录', profile: '个人中心' }[activeTab] }}</h1>
+          <h1>{{ { overview: '备份总览', servers: '服务器', repositories: '备份仓库', projects: '备份项目', snapshots: '快照恢复', runs: '运行记录', profile: '个人中心' }[activeTab] }}</h1>
           <p class="page-description">{{ pageDescription(activeTab) }}</p>
         </div>
         <div class="topbar-status"><button type="button" class="scope-pill interactive" :disabled="loading" @click="refreshData">{{ loading ? 'SYNCING…' : '刷新实时数据' }}</button><button type="button" class="live-indicator interactive" @click="activeTab = 'servers'"><i></i>{{ dashboard.servers_online }}/{{ dashboard.servers_total }} Agent 在线</button></div>
@@ -1239,7 +1502,7 @@ onBeforeUnmount(() => {
               <article v-for="project in group.projects" :key="project.id" class="project-card" :class="{ 'project-disabled': !project.enabled }">
                 <div class="project-top">
                   <div><strong>{{ project.name }}</strong><small>{{ serverName(project.server_id) }} · {{ repositoryName(project.repository_id) }}</small></div>
-                  <div class="project-actions"><span class="status-pill" :class="project.enabled ? 'online' : 'neutral'">{{ project.enabled ? `Revision ${project.revision}` : '已暂停' }}</span><button type="button" class="text-button" :disabled="loading" @click="toggleProject(project)">{{ project.enabled ? '暂停' : '恢复' }}</button><button type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
+                  <div class="project-actions"><span class="status-pill" :class="project.enabled ? 'online' : 'neutral'">{{ project.enabled ? `Revision ${project.revision}` : '已暂停' }}</span><button type="button" class="text-button" :disabled="loading" @click="toggleProject(project)">{{ project.enabled ? '暂停' : '恢复' }}</button><button v-if="project.policy?.retention.enabled" type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedPreviewProjectIDs.has(project.id)" @click="previewRetention(project)">{{ queuedPreviewProjectIDs.has(project.id) ? '预览排队中' : '清理预览' }}</button><button type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
                 </div>
                 <div class="project-source-list">
                   <span v-for="source in project.sources" :key="source.id" class="source-chip" :class="source.type">{{ sourceSummary(source) }}</span>
@@ -1253,6 +1516,8 @@ onBeforeUnmount(() => {
                   <span><small>校验</small><strong>{{ verificationSummary(project) }}</strong></span>
                   <span><small>扫描</small><strong>{{ scanSummary(project) }}</strong></span>
                 </div>
+                <div class="maintenance-strip"><small>独立维护窗口</small><strong>{{ maintenanceSummary(project) }}</strong></div>
+                <div v-if="latestRetentionPreview(project.id)" class="retention-preview-result" :class="latestRetentionPreview(project.id)?.status"><span>DRY RUN</span><strong>{{ retentionPreviewSummary(project.id) }}</strong><small>{{ formatDate(latestRetentionPreview(project.id)?.finished_at || latestRetentionPreview(project.id)?.started_at || '') }}</small></div>
               </article>
                 </div>
               </section>
@@ -1304,13 +1569,33 @@ onBeforeUnmount(() => {
                 <div class="schedule-preview"><span>计划预览</span><strong>{{ projectSchedulePreview }}</strong><code>{{ projectCron }}</code></div>
               </section>
               <section class="form-section">
-                <div class="section-title"><span>4</span><div><strong>保留与完整性策略</strong><small>备份成功后依次执行 forget/prune 和 check</small></div></div>
+                <div class="section-title"><span>4</span><div><strong>保留与完整性策略</strong><small>使用成熟备份软件的保留模型；创建后可在项目卡片执行只读清理预览</small></div></div>
                 <label class="check-row"><input v-model="projectForm.retention_enabled" type="checkbox" /><span><strong>自动应用快照保留策略</strong><small>仅匹配当前服务器与当前项目标签，不影响仓库内其他项目。</small></span></label>
-                <div v-if="projectForm.retention_enabled" class="retention-grid">
-                  <label>最近<input v-model.number="projectForm.keep_last" type="number" min="0" max="100000" /></label><label>每小时<input v-model.number="projectForm.keep_hourly" type="number" min="0" max="100000" /></label><label>每天<input v-model.number="projectForm.keep_daily" type="number" min="0" max="100000" /></label><label>每周<input v-model.number="projectForm.keep_weekly" type="number" min="0" max="100000" /></label><label>每月<input v-model.number="projectForm.keep_monthly" type="number" min="0" max="100000" /></label><label>每年<input v-model.number="projectForm.keep_yearly" type="number" min="0" max="100000" /></label>
-                </div>
-                <label v-if="projectForm.retention_enabled" class="check-row caution-row"><input v-model="projectForm.prune" type="checkbox" /><span><strong>保留后立即回收存储空间</strong><small><code>prune</code> 会锁定仓库并重写数据，耗时和流量较大；默认关闭。</small></span></label>
+                <template v-if="projectForm.retention_enabled">
+                  <div class="retention-mode-grid" role="radiogroup" aria-label="保留策略模式">
+                    <label :class="{ active: projectForm.retention_mode === 'count' }"><input v-model="projectForm.retention_mode" type="radio" value="count" /><span><strong>最多 N 份</strong><small>简单且可预测，适合高频备份</small></span></label>
+                    <label :class="{ active: projectForm.retention_mode === 'smart' }"><input v-model="projectForm.retention_mode" type="radio" value="smart" /><span><strong>智能保留</strong><small>每日 7、每周 4、每月 12</small></span></label>
+                    <label :class="{ active: projectForm.retention_mode === 'gfs' }"><input v-model="projectForm.retention_mode" type="radio" value="gfs" /><span><strong>高级 GFS</strong><small>按小时/日/周/月/年分层</small></span></label>
+                    <label :class="{ active: projectForm.retention_mode === 'age' }"><input v-model="projectForm.retention_mode" type="radio" value="age" /><span><strong>按时间保留</strong><small>保留指定时间范围内的全部快照</small></span></label>
+                  </div>
+                  <label v-if="projectForm.retention_mode === 'count'">最多保留快照数<input v-model.number="projectForm.keep_last" type="number" min="1" max="100000" required /><small class="field-help">当前项目无论备份路径是否变化，最终最多保留最近 N 份快照。</small></label>
+                  <div v-else-if="projectForm.retention_mode === 'smart'" class="smart-retention-note"><strong>Duplicati Smart Retention</strong><span>最近一周每天一份、最近四周每周一份、最近十二个月每月一份。规则按“或”组合，重叠快照只计算一次。</span></div>
+                  <div v-else-if="projectForm.retention_mode === 'gfs'" class="retention-grid">
+                    <label>最近<input v-model.number="projectForm.keep_last" type="number" min="0" max="100000" /></label><label>每小时<input v-model.number="projectForm.keep_hourly" type="number" min="0" max="100000" /></label><label>每天<input v-model.number="projectForm.keep_daily" type="number" min="0" max="100000" /></label><label>每周<input v-model.number="projectForm.keep_weekly" type="number" min="0" max="100000" /></label><label>每月<input v-model.number="projectForm.keep_monthly" type="number" min="0" max="100000" /></label><label>每年<input v-model.number="projectForm.keep_yearly" type="number" min="0" max="100000" /></label>
+                  </div>
+                  <label v-else>保留时间范围<input v-model.trim="projectForm.keep_within" required pattern="(?:[1-9][0-9]*[ymdh])+" placeholder="例如 90d、6m、1y" /><small class="field-help">Restic duration：<code>h</code> 小时、<code>d</code> 天、<code>m</code> 月、<code>y</code> 年，可组合为 <code>1y6m</code>。</small></label>
+                </template>
+                <label v-if="projectForm.retention_enabled" class="check-row caution-row"><input v-model="projectForm.prune" type="checkbox" /><span><strong>定期回收未引用空间</strong><small><code>prune</code> 会锁定仓库并重写数据，启用后只在下方独立维护窗口执行，不阻塞备份。</small></span></label>
                 <div class="form-row"><label>仓库校验<select v-model="projectForm.verification_mode"><option value="off">关闭</option><option value="metadata">检查仓库结构</option><option value="subset">抽样读取数据</option><option value="full">读取全部数据（高成本）</option></select></label><label v-if="projectForm.verification_mode === 'subset'">抽样比例<select v-model="projectForm.read_data_subset"><option value="1%">1%</option><option value="5%">5%</option><option value="10%">10%</option><option value="25%">25%</option></select></label></div>
+                <div class="maintenance-window">
+                  <div><strong>独立维护窗口</strong><small>Forget、Prune、Check 使用项目时区单独调度；仓库级互斥锁会避免它们与备份并发。</small></div>
+                  <div class="maintenance-cron-grid">
+                    <label v-if="projectForm.retention_enabled">清理快照 Cron<input v-model.trim="projectForm.retention_cron" required placeholder="30 3 * * *" /><small class="field-help">只执行 Forget，不回收数据块。</small></label>
+                    <label v-if="projectForm.retention_enabled && projectForm.prune">空间回收 Cron<input v-model.trim="projectForm.prune_cron" required placeholder="0 4 * * 0" /><small class="field-help">建议每周低峰期执行。</small></label>
+                    <label v-if="projectForm.verification_mode !== 'off'">仓库校验 Cron<input v-model.trim="projectForm.verification_cron" required placeholder="0 5 * * 0" /><small class="field-help">完整读取应安排在流量低峰。</small></label>
+                  </div>
+                  <code>{{ projectForm.timezone }}</code>
+                </div>
                 <p class="policy-reference">字段与执行语义直接采用 <a href="https://restic.readthedocs.io/en/stable/040_backup.html" target="_blank" rel="noreferrer">Restic backup</a>、<a href="https://restic.readthedocs.io/en/stable/060_forget.html" target="_blank" rel="noreferrer">forget/prune</a> 和 <a href="https://kopia.io/docs/reference/command-line/common/policy-set/" target="_blank" rel="noreferrer">Kopia policy</a> 的成熟模型。</p>
               </section>
               <button class="primary" :disabled="loading || !servers.length || !repositories.length">创建并下发</button>
@@ -1319,12 +1604,86 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
+      <template v-else-if="activeTab === 'snapshots'">
+        <section class="snapshot-overview panel">
+          <div class="panel-heading compact-heading">
+            <div><p class="eyebrow">RECOVERY INDEX</p><h2>可恢复快照</h2></div>
+            <div class="snapshot-toolbar">
+              <label>项目筛选<select v-model="snapshotProjectFilter"><option value="">全部项目</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }} · {{ serverName(project.server_id) }}</option></select></label>
+              <button type="button" class="primary compact-action" :disabled="loading || !projects.length" @click="refreshSnapshotInventory">从 Agent 同步</button>
+            </div>
+          </div>
+          <div class="snapshot-metrics">
+            <article><span>INDEXED</span><strong>{{ snapshots.length }}</strong><small>已索引快照</small></article>
+            <article><span>PROTECTED</span><strong>{{ protectedSnapshotCount }}</strong><small>不受自动清理影响</small></article>
+            <article><span>LOGICAL SIZE</span><strong>{{ formatBytes(snapshotStorageBytes) }}</strong><small>快照摘要中的原始数据量</small></article>
+            <article><span>PROJECTS</span><strong>{{ new Set(snapshots.map((snapshot) => snapshot.project_id)).size }}</strong><small>已有恢复点的项目</small></article>
+          </div>
+        </section>
+
+        <div class="snapshot-workspace">
+          <section class="panel snapshot-catalog">
+            <div class="panel-heading compact-heading"><div><p class="eyebrow">SNAPSHOT CATALOG</p><h2>恢复点</h2></div><span class="sample-size">{{ filteredSnapshots.length }} ITEMS</span></div>
+            <div v-if="!filteredSnapshots.length" class="empty-state snapshot-empty">
+              <strong>还没有快照索引</strong>
+              <span>点击“从 Agent 同步”。索引只保存快照元数据，备份内容仍留在 Restic 仓库。</span>
+            </div>
+            <div v-else class="snapshot-list">
+              <article v-for="snapshot in filteredSnapshots" :key="`${snapshot.project_id}:${snapshot.id}`" :class="{ active: selectedSnapshotID === snapshot.id && selectedSnapshotProjectID === snapshot.project_id }">
+                <button type="button" class="snapshot-select" @click="selectSnapshot(snapshot)">
+                  <span class="snapshot-state" :class="{ protected: snapshot.protected }">{{ snapshot.protected ? '◆' : '●' }}</span>
+                  <span><strong>{{ formatDate(snapshot.time) }}</strong><small>{{ projectNames.get(snapshot.project_id) ?? snapshot.project_id }} · {{ serverName(snapshot.server_id) }}</small></span>
+                  <code>{{ snapshot.id.slice(0, 12) }}</code>
+                </button>
+                <div class="snapshot-facts"><span>{{ Number(snapshot.total_files || 0).toLocaleString() }} 文件</span><span>{{ formatBytes(snapshot.total_bytes) }}</span><span>{{ snapshot.paths.length }} 根路径</span></div>
+                <div class="snapshot-card-footer"><span :title="snapshot.paths.join(', ')">{{ snapshot.paths.join(', ') || '/' }}</span><button type="button" class="text-button" :disabled="loading" @click="toggleSnapshotProtection(snapshot)">{{ snapshot.protected ? '取消保护' : '永久保护' }}</button></div>
+              </article>
+            </div>
+          </section>
+
+          <section class="panel snapshot-browser">
+            <div v-if="!selectedSnapshot" class="snapshot-browser-placeholder">
+              <span class="restore-glyph">↺</span><h2>选择一个恢复点</h2><p>选择左侧快照后，VaultMesh 会让对应 Agent 读取仓库目录。控制面不会下载或缓存备份内容。</p>
+            </div>
+            <template v-else>
+              <header class="snapshot-browser-header">
+                <div><p class="eyebrow">POINT-IN-TIME BROWSER</p><h2>{{ projectNames.get(selectedSnapshot.project_id) }} <code>{{ selectedSnapshot.id.slice(0, 12) }}</code></h2><small>{{ formatDate(selectedSnapshot.time) }} · {{ selectedSnapshot.hostname || serverName(selectedSnapshot.server_id) }}</small></div>
+                <div class="browser-actions"><span class="protection-badge" :class="{ active: selectedSnapshot.protected }">{{ selectedSnapshot.protected ? '◆ 已保护' : '普通快照' }}</span><button type="button" class="ghost compact" :disabled="loading" @click="browseSnapshotPath(snapshotBrowsePath)">重新读取</button><button type="button" class="primary compact-action" :disabled="loading" @click="requestSnapshotRestore(snapshotBrowsePath)">恢复当前目录</button></div>
+              </header>
+
+              <div class="snapshot-breadcrumbs" role="navigation" aria-label="快照路径">
+                <button v-for="(crumb, index) in snapshotBreadcrumbs" :key="crumb.path" type="button" :disabled="loading || index === snapshotBreadcrumbs.length - 1" @click="browseSnapshotPath(crumb.path)">{{ crumb.label }}</button>
+              </div>
+
+              <div v-if="snapshotBrowsePending" class="operation-state running"><i></i><div><strong>Agent 正在读取仓库目录</strong><small>命令 {{ snapshotBrowseCommandID }} · 通常在 10–30 秒内返回</small></div></div>
+              <div v-else-if="currentBrowseRun?.status && currentBrowseRun.status !== 'succeeded'" class="operation-state failed"><i></i><div><strong>目录读取失败</strong><small>{{ currentBrowseRun.error_message || 'Agent 未返回可解析的 Restic 目录结果' }}</small></div></div>
+              <div v-else-if="!currentBrowseRun" class="empty-state compact-empty">点击“重新读取”获取当前目录。</div>
+              <div v-else-if="!snapshotEntries.length" class="empty-state compact-empty">这个目录是空的。</div>
+              <div v-else class="table-wrap snapshot-file-table"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>权限</th><th>修改时间</th><th></th></tr></thead><tbody>
+                <tr v-for="entry in snapshotEntries" :key="entry.path"><td><button v-if="entry.type === 'dir'" type="button" class="file-name directory" :disabled="loading" @click="browseSnapshotPath(entry.path)"><span>{{ snapshotEntryIcon(entry) }}</span>{{ snapshotEntryName(entry) }}</button><span v-else class="file-name"><span>{{ snapshotEntryIcon(entry) }}</span>{{ snapshotEntryName(entry) }}</span></td><td><span class="source-chip">{{ entry.type === 'dir' ? '目录' : entry.type === 'symlink' ? '链接' : '文件' }}</span></td><td>{{ entry.type === 'dir' ? '—' : formatBytes(entry.size) }}</td><td><code>{{ entry.permissions || '—' }}</code></td><td>{{ formatDate(entry.modified_at) }}</td><td><button type="button" class="text-button" @click="requestSnapshotRestore(entry.path)">恢复</button></td></tr>
+              </tbody></table></div>
+
+              <section v-if="pendingRestorePath" class="restore-confirmation">
+                <div><span class="warning-symbol small">!</span><div><strong>确认隔离恢复</strong><p>将 <code>{{ pendingRestorePath }}</code> 恢复到该 Agent 的新任务目录。系统强制使用 <code>--overwrite never</code>，不会写回原始路径，也不会覆盖已有恢复任务。</p></div></div>
+                <div><button type="button" class="ghost" @click="pendingRestorePath = null">取消</button><button type="button" class="primary" :disabled="loading" @click="confirmSnapshotRestore">确认创建恢复任务</button></div>
+              </section>
+
+              <div v-if="snapshotRestorePending" class="operation-state running restore-state"><i></i><div><strong>安全恢复正在 Agent 上执行</strong><small>命令 {{ snapshotRestoreCommandID }} · 完成后这里会显示实际隔离目录</small></div></div>
+              <div v-else-if="currentRestoreRun?.status === 'succeeded'" class="restore-result"><span>✓</span><div><strong>恢复完成</strong><small>{{ Number(currentRestoreRun.stats?.files_restored || 0).toLocaleString() }} 个文件 · {{ formatBytes(Number(currentRestoreRun.stats?.bytes_restored || 0)) }}</small><code>{{ currentRestoreRun.stats?.restore_target }}</code></div></div>
+              <div v-else-if="currentRestoreRun?.status && currentRestoreRun.status !== 'succeeded'" class="operation-state failed restore-state"><i></i><div><strong>恢复失败</strong><small>{{ currentRestoreRun.error_message || '请检查 Agent 与仓库日志' }}</small></div></div>
+
+              <footer class="snapshot-safety-note"><strong>安全边界</strong><span>目录读取和恢复均在项目所属 Agent 执行；控制面仅保存索引、命令状态和审计结果。恢复始终进入 <code>VAULTMESH_RESTORE_ROOT/&lt;command-id&gt;</code>。</span></footer>
+            </template>
+          </section>
+        </div>
+      </template>
+
       <template v-else-if="activeTab === 'runs'">
         <section class="panel">
           <div class="panel-heading"><div><p class="eyebrow">RUN HISTORY</p><h2>最近 100 次运行</h2></div></div>
           <div v-if="!runs.length" class="empty-state">尚无运行记录。</div>
-          <div v-else class="table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>开始时间</th><th>快照</th><th>错误</th></tr></thead><tbody>
-            <tr v-for="run in runs" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ run.id }}</small></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td>{{ formatDate(run.started_at) }}</td><td><code>{{ run.snapshot_id ? run.snapshot_id.slice(0, 16) : '—' }}</code></td><td class="error-cell">{{ run.error_message || '—' }}</td></tr>
+          <div v-else class="table-wrap"><table><thead><tr><th>项目</th><th>类型</th><th>状态</th><th>开始时间</th><th>快照 / 预览结果</th><th>错误</th></tr></thead><tbody>
+            <tr v-for="run in runs" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ run.id }}</small></td><td><span class="source-chip">{{ runOperationLabel(run) }}</span></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td>{{ formatDate(run.started_at) }}</td><td><code v-if="run.snapshot_id">{{ run.snapshot_id.slice(0, 16) }}</code><span v-else-if="run.stats?.operation === 'retention_preview'">保留 {{ Number(run.stats?.snapshots_kept || 0) }} · 删除 {{ Number(run.stats?.snapshots_removed || 0) }}</span><span v-else-if="run.stats?.operation === 'snapshot_restore'">{{ run.stats?.restore_target || run.stats?.path }}</span><span v-else-if="run.stats?.snapshot_id"><code>{{ String(run.stats.snapshot_id).slice(0, 16) }}</code></span><span v-else>—</span></td><td class="error-cell">{{ run.error_message || '—' }}</td></tr>
           </tbody></table></div>
         </section>
       </template>
