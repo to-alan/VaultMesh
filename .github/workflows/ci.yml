@@ -67,15 +67,20 @@ jobs:
       - run: docker build --file Dockerfile.web --tag vaultmesh-web:ci .
       - name: Smoke test independent containers
         run: |
+          cleanup() {
+            docker rm --force vaultmesh-control-ci vaultmesh-web-ci >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
           docker run --detach --name vaultmesh-control-ci --publish 127.0.0.1:18081:8080 \
             --env VAULTMESH_ADMIN_TOKEN --env VAULTMESH_MASTER_KEY --env VAULTMESH_ALLOWED_ORIGINS \
             vaultmesh-control:ci
           docker run --detach --name vaultmesh-web-ci --publish 127.0.0.1:18080:80 \
             --env VAULTMESH_API_BASE_URL=https://api.example.test vaultmesh-web:ci
-          for attempt in $(seq 1 20); do
-            curl --fail --silent http://127.0.0.1:18081/healthz && break
-            sleep 1
-          done
-          curl --fail --silent --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18080/config.js | grep --fixed-strings 'https://api.example.test'
+          curl --fail --silent --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:18081/healthz
+          web_config=$(curl --fail --silent --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:18080/config.js) || {
+            docker logs vaultmesh-web-ci
+            exit 1
+          }
+          printf '%s\n' "$web_config"
+          printf '%s\n' "$web_config" | grep --fixed-strings 'https://api.example.test'
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18081/)" = "404"
-          docker rm --force vaultmesh-control-ci vaultmesh-web-ci
