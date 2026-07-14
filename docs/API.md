@@ -8,6 +8,8 @@ Authorization: Bearer <VAULTMESH_ADMIN_TOKEN>
 
 Agent endpoints use the device token returned by one-time enrollment. Secrets are accepted only over HTTPS in production.
 
+The API service does not serve the Web application. Configure the independently deployed Web origin in `VAULTMESH_ALLOWED_ORIGINS` and set the Web container's `VAULTMESH_API_BASE_URL` to the browser-visible API URL. Origins are matched exactly; wildcard CORS is intentionally unsupported.
+
 ## Create a server and enrollment token
 
 ```http

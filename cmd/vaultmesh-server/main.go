@@ -60,7 +60,7 @@ func main() {
 	defer dataStore.Close()
 
 	service := control.NewService(dataStore, sealer)
-	handler := control.NewHTTPServer(service, logger, config.AdminToken, config.WebDir).Handler()
+	handler := control.NewHTTPServer(service, logger, config.AdminToken, config.AllowedOrigins).Handler()
 	server := &http.Server{
 		Addr:              config.ListenAddress,
 		Handler:           handler,

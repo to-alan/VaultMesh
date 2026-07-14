@@ -15,6 +15,7 @@ Please include the affected component, reproduction steps, expected impact, and 
 ## Deployment requirements
 
 - Expose the control plane only through HTTPS.
+- Serve the Web console and API as separate origins, and list only exact Web origins in `VAULTMESH_ALLOWED_ORIGINS`; never use a wildcard origin.
 - Keep `VAULTMESH_MASTER_KEY` separate from the PostgreSQL backup.
 - Use a unique repository and storage credential scope for each server.
 - Remove the one-time enrollment token from the Agent environment after enrollment.

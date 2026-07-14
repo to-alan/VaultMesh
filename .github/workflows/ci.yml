@@ -51,3 +51,31 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci --no-audit --no-fund
       - run: npm run build
+
+  containers:
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_PASSWORD: vaultmesh_ci_postgres
+      VAULTMESH_ADMIN_TOKEN: vaultmesh-ci-administrator-token
+      VAULTMESH_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      VAULTMESH_ALLOWED_ORIGINS: http://127.0.0.1:3000
+      VAULTMESH_PUBLIC_API_URL: http://127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker compose config --quiet
+      - run: docker build --tag vaultmesh-control:ci .
+      - run: docker build --file Dockerfile.web --tag vaultmesh-web:ci .
+      - name: Smoke test independent containers
+        run: |
+          docker run --detach --name vaultmesh-control-ci --publish 127.0.0.1:18081:8080 \
+            --env VAULTMESH_ADMIN_TOKEN --env VAULTMESH_MASTER_KEY --env VAULTMESH_ALLOWED_ORIGINS \
+            vaultmesh-control:ci
+          docker run --detach --name vaultmesh-web-ci --publish 127.0.0.1:18080:80 \
+            --env VAULTMESH_API_BASE_URL=https://api.example.test vaultmesh-web:ci
+          for attempt in $(seq 1 20); do
+            curl --fail --silent http://127.0.0.1:18081/healthz && break
+            sleep 1
+          done
+          curl --fail --silent --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18080/config.js | grep --fixed-strings 'https://api.example.test'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:18081/)" = "404"
+          docker rm --force vaultmesh-control-ci vaultmesh-web-ci

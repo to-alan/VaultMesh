@@ -9,8 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -23,20 +21,24 @@ import (
 const maxRequestBody = 1 << 20
 
 type HTTPServer struct {
-	service       *Service
-	logger        *slog.Logger
-	adminTokenSum [32]byte
-	webDir        string
+	service        *Service
+	logger         *slog.Logger
+	adminTokenSum  [32]byte
+	allowedOrigins map[string]struct{}
 }
 
 type agentContextKey struct{}
 
-func NewHTTPServer(service *Service, logger *slog.Logger, adminToken, webDir string) *HTTPServer {
+func NewHTTPServer(service *Service, logger *slog.Logger, adminToken string, allowedOrigins []string) *HTTPServer {
+	origins := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		origins[origin] = struct{}{}
+	}
 	return &HTTPServer{
-		service:       service,
-		logger:        logger,
-		adminTokenSum: sha256.Sum256([]byte(adminToken)),
-		webDir:        webDir,
+		service:        service,
+		logger:         logger,
+		adminTokenSum:  sha256.Sum256([]byte(adminToken)),
+		allowedOrigins: origins,
 	}
 }
 
@@ -61,8 +63,8 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("GET /api/v1/agent/commands", s.agent(http.HandlerFunc(s.agentCommands)))
 	mux.Handle("POST /api/v1/agent/runs", s.agent(http.HandlerFunc(s.agentRun)))
 
-	mux.Handle("/", s.staticHandler())
-	return s.securityHeaders(s.logging(mux))
+	mux.HandleFunc("/", s.notFound)
+	return s.securityHeaders(s.cors(s.logging(mux)))
 }
 
 func (s *HTTPServer) health(w http.ResponseWriter, r *http.Request) {
@@ -284,31 +286,36 @@ func (s *HTTPServer) agent(next http.Handler) http.Handler {
 	})
 }
 
-func (s *HTTPServer) staticHandler() http.Handler {
-	index := filepath.Join(s.webDir, "index.html")
-	if s.webDir == "" {
-		return http.HandlerFunc(s.notFound)
-	}
-	if _, err := os.Stat(index); err != nil {
-		return http.HandlerFunc(s.notFound)
-	}
-	files := http.FileServer(http.Dir(s.webDir))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") {
-			s.notFound(w, r)
-			return
-		}
-		path := filepath.Join(s.webDir, filepath.Clean(r.URL.Path))
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			files.ServeHTTP(w, r)
-			return
-		}
-		http.ServeFile(w, r, index)
-	})
-}
-
 func (s *HTTPServer) notFound(w http.ResponseWriter, _ *http.Request) {
 	s.writeError(w, http.StatusNotFound, "not_found", "resource not found", nil)
+}
+
+func (s *HTTPServer) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" {
+			if _, allowed := s.allowedOrigins[origin]; !allowed {
+				s.writeError(w, http.StatusForbidden, "origin_forbidden", "request origin is not allowed", nil)
+				return
+			}
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+			w.Header().Set("Access-Control-Max-Age", "600")
+			w.Header().Add("Vary", "Origin")
+			w.Header().Add("Vary", "Access-Control-Request-Method")
+			w.Header().Add("Vary", "Access-Control-Request-Headers")
+		}
+		if r.Method == http.MethodOptions {
+			if origin == "" {
+				s.writeError(w, http.StatusBadRequest, "origin_required", "CORS preflight requires an Origin header", nil)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *HTTPServer) securityHeaders(next http.Handler) http.Handler {
@@ -316,7 +323,6 @@ func (s *HTTPServer) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}

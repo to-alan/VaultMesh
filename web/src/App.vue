@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { APIError, api, getToken, setToken } from './api'
+import { APIError, api, getAPIBaseURL, getToken, setToken } from './api'
 import type { Dashboard, EnrollmentResult, Project, Repository, Run, Server } from './types'
 
 type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'runs'
@@ -24,6 +24,7 @@ let sourceSequence = 0
 
 const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 const commonTimezones = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Tokyo', 'UTC', 'Europe/London', 'America/New_York']
+const apiBaseURL = getAPIBaseURL()
 
 const tokenInput = ref('')
 const authenticated = ref(Boolean(getToken()))
@@ -80,6 +81,71 @@ const projectSchedulePreview = computed(() => {
   const jitter = projectForm.jitter_minutes > 0 ? `，最多随机延后 ${projectForm.jitter_minutes} 分钟` : ''
   return `${cronDescription(projectCron.value)} · ${projectForm.timezone}${jitter}`
 })
+const totalRunCount = computed(() => runs.value.length)
+const successfulRunCount = computed(() => runs.value.filter((run) => run.status === 'succeeded').length)
+const successRate = computed(() => totalRunCount.value ? Math.round(successfulRunCount.value / totalRunCount.value * 100) : 0)
+const protectedSourceCount = computed(() => projects.value.reduce((total, project) => total + project.sources.length, 0))
+const attentionCount = computed(() => dashboard.value.runs_failed + dashboard.value.runs_partial)
+const onlineRate = computed(() => dashboard.value.servers_total
+  ? Math.round(dashboard.value.servers_online / dashboard.value.servers_total * 100)
+  : 0)
+
+const runTrend = computed(() => {
+  const points = Array.from({ length: 7 }, (_, index) => {
+    const date = new Date()
+    date.setHours(0, 0, 0, 0)
+    date.setDate(date.getDate() - (6 - index))
+    return {
+      key: localDateKey(date),
+      label: `${date.getMonth() + 1}/${date.getDate()}`,
+      succeeded: 0,
+      partial: 0,
+      failed: 0,
+      total: 0,
+    }
+  })
+  const byDate = new Map(points.map((point) => [point.key, point]))
+  for (const run of runs.value) {
+    const point = byDate.get(localDateKey(new Date(run.started_at)))
+    if (!point) continue
+    point.total += 1
+    if (run.status === 'succeeded') point.succeeded += 1
+    else if (run.status === 'partial') point.partial += 1
+    else point.failed += 1
+  }
+  const max = Math.max(1, ...points.map((point) => point.total))
+  return points.map((point) => ({
+    ...point,
+    succeededHeight: point.succeeded / max * 100,
+    partialHeight: point.partial / max * 100,
+    failedHeight: point.failed / max * 100,
+    totalHeight: point.total / max * 100,
+  }))
+})
+
+const runDistribution = computed(() => [
+  { key: 'succeeded', label: '成功', count: runs.value.filter((run) => run.status === 'succeeded').length, color: '#5df0a8' },
+  { key: 'partial', label: '部分成功', count: runs.value.filter((run) => run.status === 'partial').length, color: '#f6c85f' },
+  { key: 'failed', label: '失败/超时', count: runs.value.filter((run) => ['failed', 'timed_out', 'canceled', 'unknown'].includes(run.status)).length, color: '#ff6b73' },
+  { key: 'running', label: '执行中', count: runs.value.filter((run) => run.status === 'running').length, color: '#65b8ff' },
+])
+
+const runDonutBackground = computed(() => {
+  const total = runDistribution.value.reduce((sum, item) => sum + item.count, 0)
+  if (!total) return 'conic-gradient(#22312d 0 100%)'
+  let cursor = 0
+  const segments = runDistribution.value.filter((item) => item.count > 0).map((item) => {
+    const start = cursor
+    cursor += item.count / total * 100
+    return `${item.color} ${start}% ${cursor}%`
+  })
+  return `conic-gradient(${segments.join(', ')})`
+})
+
+const projectHealth = computed(() => projects.value.map((project) => {
+  const latest = runs.value.find((run) => run.project_id === project.id)
+  return { project, latest, status: latest?.status ?? 'unknown' }
+}).sort((left, right) => healthOrder(left.status) - healthOrder(right.status)))
 
 async function login() {
   error.value = ''
@@ -293,6 +359,44 @@ function formatDate(value?: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'medium' }).format(new Date(value))
 }
 
+function localDateKey(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+function healthOrder(status: string): number {
+  if (['failed', 'timed_out', 'unknown'].includes(status)) return 0
+  if (['partial', 'running'].includes(status)) return 1
+  return 2
+}
+
+function formatDuration(run: Run): string {
+  if (!run.finished_at) return run.status === 'running' ? '执行中' : '—'
+  const seconds = Math.max(0, Math.round((new Date(run.finished_at).getTime() - new Date(run.started_at).getTime()) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}m ${seconds % 60}s`
+}
+
+function pageDescription(tab: Tab): string {
+  return {
+    overview: '运行态势、成功率与风险信号',
+    servers: 'Agent 在线状态与配置收敛',
+    repositories: 'Restic 目标与凭据边界',
+    projects: '数据源、调度策略与下次执行',
+    runs: '端到端备份执行证据',
+  }[tab]
+}
+
+function navBadge(tab: Tab): number {
+  return {
+    overview: attentionCount.value,
+    servers: servers.value.length,
+    repositories: repositories.value.length,
+    projects: projects.value.length,
+    runs: runs.value.length,
+  }[tab]
+}
+
 function serverName(id: string): string {
   return servers.value.find((server) => server.id === id)?.name ?? id
 }
@@ -355,7 +459,7 @@ function statusLabel(status: string): string {
 }
 
 function installCommand(result: EnrollmentResult): string {
-  return `sudo vaultmesh-agent --server ${window.location.origin} --enrollment-token ${result.enrollment_token}`
+  return `sudo vaultmesh-agent --server ${apiBaseURL} --enrollment-token ${result.enrollment_token}`
 }
 
 onMounted(async () => {
@@ -390,18 +494,24 @@ onMounted(async () => {
     <aside class="sidebar">
       <div class="brand-row">
         <div class="brand-mark small" aria-hidden="true"><span></span><span></span><span></span></div>
-        <div><strong>VaultMesh</strong><small>Control Plane</small></div>
+        <div><strong>VaultMesh</strong><small>Operations Console</small></div>
       </div>
+      <p class="nav-caption">WORKSPACE</p>
       <nav aria-label="主导航">
         <button v-for="item in ([
-          ['overview', '总览'], ['servers', '服务器'], ['repositories', '备份仓库'],
-          ['projects', '备份项目'], ['runs', '运行记录'],
-        ] as [Tab, string][] )" :key="item[0]" :class="{ active: activeTab === item[0] }" @click="activeTab = item[0]">
-          <span class="nav-dot"></span>{{ item[1] }}
+          ['overview', '运行总览', '01'], ['servers', '服务器', '02'], ['repositories', '备份仓库', '03'],
+          ['projects', '备份项目', '04'], ['runs', '运行记录', '05'],
+        ] as [Tab, string, string][] )" :key="item[0]" :class="{ active: activeTab === item[0] }" @click="activeTab = item[0]">
+          <span class="nav-index">{{ item[2] }}</span><span class="nav-label">{{ item[1] }}</span><span v-if="navBadge(item[0])" class="nav-badge">{{ navBadge(item[0]) }}</span>
         </button>
       </nav>
+      <div class="sidebar-system">
+        <div><span class="system-pulse"></span><strong>API 已连接</strong></div>
+        <code>{{ apiBaseURL.replace(/^https?:\/\//, '') }}</code>
+        <small>Control Plane 与 Web 独立运行</small>
+      </div>
       <div class="sidebar-footer">
-        <button class="ghost" @click="loadAll" :disabled="loading">刷新数据</button>
+        <button class="ghost" @click="loadAll" :disabled="loading">{{ loading ? '同步中…' : '刷新' }}</button>
         <button class="ghost" @click="logout">退出</button>
       </div>
     </aside>
@@ -409,32 +519,79 @@ onMounted(async () => {
     <section class="workspace">
       <header class="topbar">
         <div>
-          <p class="eyebrow">BACKUP HEALTH</p>
+          <p class="breadcrumb">VAULTMESH <span>/</span> {{ activeTab.toUpperCase() }}</p>
           <h1>{{ { overview: '备份总览', servers: '服务器', repositories: '备份仓库', projects: '备份项目', runs: '运行记录' }[activeTab] }}</h1>
+          <p class="page-description">{{ pageDescription(activeTab) }}</p>
         </div>
-        <span class="live-indicator"><i></i>{{ dashboard.servers_online }}/{{ dashboard.servers_total }} Agent 在线</span>
+        <div class="topbar-status"><span class="scope-pill">LIVE DATA · 100 RUNS</span><span class="live-indicator"><i></i>{{ dashboard.servers_online }}/{{ dashboard.servers_total }} Agent 在线</span></div>
       </header>
 
       <p v-if="error" class="message error">{{ error }}</p>
       <p v-if="success" class="message success">{{ success }}</p>
 
       <template v-if="activeTab === 'overview'">
-        <div class="metric-grid">
-          <article class="metric"><span>服务器</span><strong>{{ dashboard.servers_total }}</strong><small>{{ dashboard.servers_online }} 台在线</small></article>
-          <article class="metric"><span>备份项目</span><strong>{{ dashboard.projects_total }}</strong><small>已纳入统一策略</small></article>
-          <article class="metric good"><span>24 小时成功</span><strong>{{ dashboard.runs_succeeded }}</strong><small>形成有效快照</small></article>
-          <article class="metric bad"><span>需要关注</span><strong>{{ dashboard.runs_failed + dashboard.runs_partial }}</strong><small>{{ dashboard.runs_partial }} 次部分成功</small></article>
+        <div class="overview-strip">
+          <div><span class="operational-dot"></span><strong>Backup operations</strong><small>基于最近 100 次运行和当前 Agent 心跳聚合</small></div>
+          <span>最近刷新 · {{ new Intl.DateTimeFormat('zh-CN', { timeStyle: 'medium' }).format(new Date()) }}</span>
         </div>
-        <section class="panel">
-          <div class="panel-heading"><div><p class="eyebrow">LATEST ACTIVITY</p><h2>最近运行</h2></div><button class="text-button" @click="activeTab = 'runs'">查看全部</button></div>
-          <div v-if="!runs.length" class="empty-state">尚无运行记录。创建服务器、仓库和项目后，Agent 将按计划执行。</div>
-          <div v-else class="run-list">
-            <article v-for="run in runs.slice(0, 6)" :key="run.id" class="run-row">
-              <span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span>
-              <div><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ formatDate(run.started_at) }}</small></div>
-              <code>{{ run.snapshot_id ? run.snapshot_id.slice(0, 12) : run.error_code || '—' }}</code>
-            </article>
-          </div>
+        <div class="metric-grid dense-metrics">
+          <article class="metric"><header><span>AGENT HEALTH</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ dashboard.servers_online }}<small>/{{ dashboard.servers_total }}</small></strong><em>{{ onlineRate }}%</em></div><footer>在线节点 <span>{{ dashboard.servers_total - dashboard.servers_online }} 异常</span></footer></article>
+          <article class="metric"><header><span>SUCCESS RATE</span><i class="metric-signal" :class="successRate >= 95 ? 'good' : successRate >= 80 ? 'warn' : 'bad'"></i></header><div class="metric-value"><strong>{{ successRate }}<small>%</small></strong><em>{{ successfulRunCount }}/{{ totalRunCount }}</em></div><footer>最近 100 次 <span>{{ totalRunCount ? '有效样本' : '等待数据' }}</span></footer></article>
+          <article class="metric"><header><span>24H SNAPSHOTS</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ dashboard.runs_succeeded }}</strong><em>success</em></div><footer>有效快照 <span>{{ dashboard.runs_partial }} 次部分成功</span></footer></article>
+          <article class="metric"><header><span>PROTECTED SOURCES</span><i class="metric-signal"></i></header><div class="metric-value"><strong>{{ protectedSourceCount }}</strong><em>{{ projects.length }} projects</em></div><footer>文件与数据库 <span>{{ repositories.length }} 个仓库</span></footer></article>
+          <article class="metric" :class="{ alert: attentionCount > 0 }"><header><span>NEEDS ATTENTION</span><i class="metric-signal" :class="attentionCount ? 'bad' : 'good'"></i></header><div class="metric-value"><strong>{{ attentionCount }}</strong><em>24 hours</em></div><footer>失败或部分成功 <span>{{ attentionCount ? '需要处理' : '状态正常' }}</span></footer></article>
+        </div>
+
+        <div class="dashboard-grid primary-dashboard">
+          <section class="panel trend-panel">
+            <div class="panel-heading compact-heading"><div><p class="eyebrow">RUN TELEMETRY</p><h2>7 日运行趋势</h2></div><div class="chart-legend"><span class="succeeded">成功</span><span class="partial">部分</span><span class="failed">失败</span></div></div>
+            <div class="stacked-chart">
+              <div class="chart-axis"><span>MAX</span><span>50%</span><span>0</span></div>
+              <div class="chart-plot">
+                <div class="chart-grid-lines"><i></i><i></i><i></i></div>
+                <div v-for="point in runTrend" :key="point.key" class="chart-column">
+                  <div class="bar-total" :title="`${point.label}: ${point.total} 次`">
+                    <span class="bar-segment failed" :style="{ height: `${point.failedHeight}%` }"></span>
+                    <span class="bar-segment partial" :style="{ height: `${point.partialHeight}%` }"></span>
+                    <span class="bar-segment succeeded" :style="{ height: `${point.succeededHeight}%` }"></span>
+                  </div>
+                  <strong>{{ point.total }}</strong><small>{{ point.label }}</small>
+                </div>
+              </div>
+            </div>
+            <div class="chart-summary"><span>7 日总运行 <strong>{{ runTrend.reduce((sum, point) => sum + point.total, 0) }}</strong></span><span>成功 <strong class="good-text">{{ runTrend.reduce((sum, point) => sum + point.succeeded, 0) }}</strong></span><span>异常 <strong class="bad-text">{{ runTrend.reduce((sum, point) => sum + point.failed + point.partial, 0) }}</strong></span></div>
+          </section>
+
+          <section class="panel distribution-panel">
+            <div class="panel-heading compact-heading"><div><p class="eyebrow">OUTCOME MIX</p><h2>运行结果</h2></div><span class="sample-size">N={{ totalRunCount }}</span></div>
+            <div class="donut-layout">
+              <div class="donut-chart" :style="{ background: runDonutBackground }"><div><strong>{{ successRate }}%</strong><small>成功率</small></div></div>
+              <div class="distribution-list"><div v-for="item in runDistribution" :key="item.key"><i :style="{ background: item.color }"></i><span>{{ item.label }}</span><strong>{{ item.count }}</strong><small>{{ totalRunCount ? Math.round(item.count / totalRunCount * 100) : 0 }}%</small></div></div>
+            </div>
+            <div class="micro-sparkline" aria-label="每日运行量"><i v-for="point in runTrend" :key="point.key" :style="{ height: `${Math.max(point.total ? 10 : 3, point.totalHeight)}%` }"></i></div>
+          </section>
+        </div>
+
+        <div class="dashboard-grid secondary-dashboard">
+          <section class="panel health-panel">
+            <div class="panel-heading compact-heading"><div><p class="eyebrow">PROTECTION MATRIX</p><h2>项目健康度</h2></div><button class="text-button" @click="activeTab = 'projects'">管理项目 →</button></div>
+            <div v-if="!projectHealth.length" class="empty-state compact-empty">尚未创建备份项目。</div>
+            <div v-else class="table-wrap"><table class="dense-table"><thead><tr><th>项目</th><th>数据源</th><th>最近结果</th><th>耗时</th><th>下次计划</th></tr></thead><tbody>
+              <tr v-for="row in projectHealth" :key="row.project.id"><td><strong>{{ row.project.name }}</strong><small>{{ serverName(row.project.server_id) }}</small></td><td><div class="source-dots"><i v-for="source in row.project.sources" :key="source.id" :class="source.type" :title="sourceSummary(source)"></i><span>{{ row.project.sources.length }}</span></div></td><td><span class="status-pill" :class="row.status">{{ row.latest ? statusLabel(row.status) : '无运行' }}</span><small>{{ row.latest ? formatDate(row.latest.started_at) : '等待首次执行' }}</small></td><td>{{ row.latest ? formatDuration(row.latest) : '—' }}</td><td><strong>{{ formatNextRun(row.project) }}</strong><small>{{ cronDescription(row.project.schedule.cron) }}</small></td></tr>
+            </tbody></table></div>
+          </section>
+
+          <section class="panel infrastructure-panel">
+            <div class="panel-heading compact-heading"><div><p class="eyebrow">INFRASTRUCTURE</p><h2>Agent 状态</h2></div><button class="text-button" @click="activeTab = 'servers'">全部 →</button></div>
+            <div v-if="!servers.length" class="empty-state compact-empty">暂无 Agent。</div>
+            <div v-else class="server-density-list"><article v-for="server in servers.slice(0, 6)" :key="server.id"><span class="server-state" :class="server.status"></span><div><strong>{{ server.name }}</strong><small>{{ server.hostname || '尚未注册' }} · {{ server.agent_version || '—' }}</small></div><div class="revision-meter"><span><i :style="{ width: `${server.desired_revision ? Math.min(100, server.applied_revision / server.desired_revision * 100) : 100}%` }"></i></span><small>rev {{ server.applied_revision }}/{{ server.desired_revision }}</small></div></article></div>
+          </section>
+        </div>
+
+        <section class="panel recent-panel">
+          <div class="panel-heading compact-heading"><div><p class="eyebrow">EVENT STREAM</p><h2>最近运行</h2></div><button class="text-button" @click="activeTab = 'runs'">查看 100 条记录 →</button></div>
+          <div v-if="!runs.length" class="empty-state compact-empty">尚无运行记录。图表会在 Agent 上报首个结果后自动生成。</div>
+          <div v-else class="recent-run-grid"><article v-for="run in runs.slice(0, 8)" :key="run.id"><span class="status-line" :class="run.status"></span><div><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ formatDate(run.started_at) }}</small></div><span class="status-copy">{{ statusLabel(run.status) }}</span><code>{{ formatDuration(run) }}</code></article></div>
         </section>
       </template>
 

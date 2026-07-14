@@ -26,7 +26,7 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 	}
 	service := NewService(dataStore, sealer)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := NewHTTPServer(service, logger, "a-very-long-administrator-token", "").Handler()
+	handler := NewHTTPServer(service, logger, "a-very-long-administrator-token", []string{"https://console.example.com"}).Handler()
 
 	var enrollment domain.EnrollmentResult
 	requestJSON(t, handler, http.MethodPost, "/api/v1/servers", "a-very-long-administrator-token",
@@ -147,12 +147,41 @@ func TestAdminAPIRejectsMissingToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), "a-very-long-administrator-token", "").Handler()
+	handler := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), "a-very-long-administrator-token", nil).Handler()
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/servers", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", response.Code)
+	}
+}
+
+func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{3}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(),
+		"a-very-long-administrator-token", []string{"https://console.example.com"}).Handler()
+
+	preflight := httptest.NewRequest(http.MethodOptions, "/api/v1/dashboard", nil)
+	preflight.Header.Set("Origin", "https://console.example.com")
+	preflight.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	preflightResponse := httptest.NewRecorder()
+	handler.ServeHTTP(preflightResponse, preflight)
+	if preflightResponse.Code != http.StatusNoContent {
+		t.Fatalf("expected allowed preflight to return 204, got %d", preflightResponse.Code)
+	}
+	if got := preflightResponse.Header().Get("Access-Control-Allow-Origin"); got != "https://console.example.com" {
+		t.Fatalf("unexpected access-control-allow-origin %q", got)
+	}
+
+	forbidden := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	forbidden.Header.Set("Origin", "https://attacker.example.com")
+	forbiddenResponse := httptest.NewRecorder()
+	handler.ServeHTTP(forbiddenResponse, forbidden)
+	if forbiddenResponse.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden origin to return 403, got %d", forbiddenResponse.Code)
 	}
 }
 
