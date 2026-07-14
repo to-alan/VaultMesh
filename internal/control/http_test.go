@@ -215,6 +215,17 @@ func TestDatabaseSourcePasswordIsSealedAtRestAndDeliveredOnlyToAgent(t *testing.
 	}
 }
 
+func TestPublicProjectIncludesNextRunInConfiguredTimezone(t *testing.T) {
+	now := time.Date(2026, time.July, 14, 1, 0, 0, 0, time.UTC)
+	project := publicProject(domain.Project{
+		Schedule: domain.Schedule{Cron: "30 2 * * *", Timezone: "Asia/Shanghai"},
+	}, now)
+	want := time.Date(2026, time.July, 14, 18, 30, 0, 0, time.UTC)
+	if project.NextRunAt == nil || !project.NextRunAt.Equal(want) {
+		t.Fatalf("unexpected next run: got %v, want %v", project.NextRunAt, want)
+	}
+}
+
 func requestJSON(t *testing.T, handler http.Handler, method, path, token string, input any, expectedStatus int, output any) {
 	t.Helper()
 	var body io.Reader

@@ -164,8 +164,9 @@ func (s *HTTPServer) listProjects(w http.ResponseWriter, r *http.Request) {
 		s.handleServiceError(w, err)
 		return
 	}
+	now := s.service.now()
 	for projectIndex := range items {
-		items[projectIndex] = publicProject(items[projectIndex])
+		items[projectIndex] = publicProject(items[projectIndex], now)
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }

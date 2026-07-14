@@ -69,16 +69,17 @@ type Schedule struct {
 }
 
 type Project struct {
-	ID           string    `json:"id"`
-	ServerID     string    `json:"server_id"`
-	RepositoryID string    `json:"repository_id"`
-	Name         string    `json:"name"`
-	Enabled      bool      `json:"enabled"`
-	Sources      []Source  `json:"sources"`
-	Schedule     Schedule  `json:"schedule"`
-	Revision     int64     `json:"revision"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID           string     `json:"id"`
+	ServerID     string     `json:"server_id"`
+	RepositoryID string     `json:"repository_id"`
+	Name         string     `json:"name"`
+	Enabled      bool       `json:"enabled"`
+	Sources      []Source   `json:"sources"`
+	Schedule     Schedule   `json:"schedule"`
+	Revision     int64      `json:"revision"`
+	NextRunAt    *time.Time `json:"next_run_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
 type AgentProject struct {

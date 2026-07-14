@@ -61,6 +61,7 @@ export interface Project {
   sources: Source[]
   schedule: Schedule
   revision: number
+  next_run_at?: string
   created_at: string
   updated_at: string
 }

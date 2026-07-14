@@ -4,6 +4,26 @@ import { APIError, api, getToken, setToken } from './api'
 import type { Dashboard, EnrollmentResult, Project, Repository, Run, Server } from './types'
 
 type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'runs'
+type SourceType = 'files' | 'mysql' | 'postgresql'
+type ScheduleMode = 'daily' | 'weekly' | 'custom'
+
+interface ProjectSourceDraft {
+  key: number
+  type: SourceType
+  required: boolean
+  paths: string
+  excludes: string
+  host: string
+  port: number
+  username: string
+  password: string
+  database: string
+}
+
+let sourceSequence = 0
+
+const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+const commonTimezones = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Tokyo', 'UTC', 'Europe/London', 'America/New_York']
 
 const tokenInput = ref('')
 const authenticated = ref(Boolean(getToken()))
@@ -40,11 +60,14 @@ const projectForm = reactive({
   server_id: '',
   repository_id: '',
   name: '',
-  paths: '/etc',
-  excludes: '',
-  cron: '0 2 * * *',
+  sources: [newProjectSource('files')] as ProjectSourceDraft[],
+  schedule_mode: 'daily' as ScheduleMode,
+  schedule_time: '02:00',
+  weekday: '1',
+  custom_cron: '0 2 * * *',
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-  jitter_seconds: 300,
+  jitter_minutes: 5,
+  max_runtime_hours: 6,
 })
 
 const repositoriesForProject = computed(() =>
@@ -52,6 +75,11 @@ const repositoriesForProject = computed(() =>
 )
 
 const projectNames = computed(() => new Map(projects.value.map((project) => [project.id, project.name])))
+const projectCron = computed(buildProjectCron)
+const projectSchedulePreview = computed(() => {
+  const jitter = projectForm.jitter_minutes > 0 ? `，最多随机延后 ${projectForm.jitter_minutes} 分钟` : ''
+  return `${cronDescription(projectCron.value)} · ${projectForm.timezone}${jitter}`
+})
 
 async function login() {
   error.value = ''
@@ -144,29 +172,86 @@ async function createRepository() {
 
 async function createProject() {
   await perform(async () => {
-    const paths = lines(projectForm.paths)
-    const excludes = lines(projectForm.excludes)
+    const sources = projectForm.sources.map((source) => {
+      if (source.type === 'files') {
+        return {
+          type: source.type,
+          paths: lines(source.paths),
+          excludes: lines(source.excludes),
+          required: source.required,
+        }
+      }
+      return {
+        type: source.type,
+        database: {
+          host: source.host,
+          port: Number(source.port),
+          username: source.username,
+          password: source.password,
+          database: source.database,
+        },
+        required: source.required,
+      }
+    })
     await api<Project>('/api/v1/projects', {
       method: 'POST',
       body: JSON.stringify({
         server_id: projectForm.server_id,
         repository_id: projectForm.repository_id,
         name: projectForm.name,
-        sources: [{ type: 'files', paths, excludes, required: true }],
+        sources,
         schedule: {
-          cron: projectForm.cron,
+          cron: projectCron.value,
           timezone: projectForm.timezone,
-          jitter_seconds: Number(projectForm.jitter_seconds),
-          max_runtime_seconds: 21600,
+          jitter_seconds: Number(projectForm.jitter_minutes) * 60,
+          max_runtime_seconds: Number(projectForm.max_runtime_hours) * 3600,
           missed_run_policy: 'skip',
           concurrency_policy: 'forbid',
         },
       }),
     })
     projectForm.name = ''
+    projectForm.sources = [newProjectSource('files')]
     await loadAll()
     success.value = '项目已创建，Agent 将在下一次同步时应用配置。'
   })
+}
+
+function newProjectSource(type: SourceType): ProjectSourceDraft {
+  sourceSequence += 1
+  return {
+    key: sourceSequence,
+    type,
+    required: true,
+    paths: '/etc',
+    excludes: '',
+    host: '127.0.0.1',
+    port: type === 'mysql' ? 3306 : 5432,
+    username: '',
+    password: '',
+    database: '',
+  }
+}
+
+function addProjectSource(type: SourceType) {
+  projectForm.sources.push(newProjectSource(type))
+}
+
+function removeProjectSource(index: number) {
+  if (projectForm.sources.length > 1) projectForm.sources.splice(index, 1)
+}
+
+function changeSourceType(source: ProjectSourceDraft) {
+  source.port = source.type === 'mysql' ? 3306 : source.type === 'postgresql' ? 5432 : 0
+}
+
+function buildProjectCron(): string {
+  if (projectForm.schedule_mode === 'custom') return projectForm.custom_cron.trim()
+  const match = /^(\d{2}):(\d{2})$/.exec(projectForm.schedule_time)
+  const hour = Number(match?.[1] ?? 2)
+  const minute = Number(match?.[2] ?? 0)
+  if (projectForm.schedule_mode === 'weekly') return `${minute} ${hour} * * ${projectForm.weekday}`
+  return `${minute} ${hour} * * *`
 }
 
 async function runNow(project: Project) {
@@ -210,6 +295,54 @@ function formatDate(value?: string): string {
 
 function serverName(id: string): string {
   return servers.value.find((server) => server.id === id)?.name ?? id
+}
+
+function repositoryName(id: string): string {
+  return repositories.value.find((repository) => repository.id === id)?.name ?? id
+}
+
+function sourceTypeLabel(type: SourceType): string {
+  return { files: '文件与目录', mysql: 'MySQL', postgresql: 'PostgreSQL' }[type]
+}
+
+function sourceSummary(source: Project['sources'][number]): string {
+  if (source.type === 'files') {
+    const paths = source.paths ?? []
+    const visible = paths.slice(0, 2).join(', ')
+    return `文件 · ${visible || '未配置路径'}${paths.length > 2 ? ` +${paths.length - 2}` : ''}`
+  }
+  const database = source.database
+  if (!database) return sourceTypeLabel(source.type)
+  return `${sourceTypeLabel(source.type)} · ${database.database}@${database.host}:${database.port}`
+}
+
+function cronDescription(cron: string): string {
+  const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(cron)
+  if (daily) return `每天 ${clock(daily[2], daily[1])}`
+  const weekly = /^(\d{1,2}) (\d{1,2}) \* \* ([0-6])$/.exec(cron)
+  if (weekly) return `每${weekdays[Number(weekly[3])]} ${clock(weekly[2], weekly[1])}`
+  return `Cron ${cron}`
+}
+
+function clock(hour: string, minute: string): string {
+  return `${hour.padStart(2, '0')}:${minute.padStart(2, '0')}`
+}
+
+function formatNextRun(project: Project): string {
+  if (!project.next_run_at) return '等待 Agent 应用计划'
+  try {
+    return new Intl.DateTimeFormat('zh-CN', {
+      timeZone: project.schedule.timezone,
+      month: 'numeric',
+      day: 'numeric',
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(new Date(project.next_run_at))
+  } catch {
+    return formatDate(project.next_run_at)
+  }
 }
 
 function statusLabel(status: string): string {
@@ -350,21 +483,61 @@ onMounted(async () => {
       </template>
 
       <template v-else-if="activeTab === 'projects'">
-        <div class="content-grid">
+        <div class="content-grid projects-grid">
           <section class="panel">
             <div class="panel-heading"><div><p class="eyebrow">DESIRED STATE</p><h2>项目列表</h2></div></div>
             <div v-if="!projects.length" class="empty-state">尚未创建备份项目。</div>
-            <div v-else class="card-list"><article v-for="project in projects" :key="project.id" class="project-card"><div class="project-top"><div><strong>{{ project.name }}</strong><small>{{ serverName(project.server_id) }}</small></div><div class="project-actions"><span class="status-pill online">Revision {{ project.revision }}</span><button class="ghost compact" :disabled="loading" @click="runNow(project)">立即备份</button></div></div><div class="project-meta"><span>{{ project.schedule.cron }}</span><span>{{ project.schedule.timezone }}</span><span>{{ project.sources.flatMap((source) => source.paths ?? []).join(', ') || '数据库逻辑备份' }}</span></div></article></div>
+            <div v-else class="card-list">
+              <article v-for="project in projects" :key="project.id" class="project-card">
+                <div class="project-top">
+                  <div><strong>{{ project.name }}</strong><small>{{ serverName(project.server_id) }} · {{ repositoryName(project.repository_id) }}</small></div>
+                  <div class="project-actions"><span class="status-pill online">Revision {{ project.revision }}</span><button class="ghost compact" :disabled="loading" @click="runNow(project)">立即备份</button></div>
+                </div>
+                <div class="project-source-list">
+                  <span v-for="source in project.sources" :key="source.id" class="source-chip" :class="source.type">{{ sourceSummary(source) }}</span>
+                </div>
+                <div class="schedule-overview">
+                  <div><small>执行计划</small><strong>{{ cronDescription(project.schedule.cron) }}</strong><span>{{ project.schedule.timezone }}<template v-if="project.schedule.jitter_seconds"> · 最多延后 {{ Math.round(project.schedule.jitter_seconds / 60) }} 分钟</template></span></div>
+                  <div class="next-run"><small>下次计划</small><strong>{{ formatNextRun(project) }}</strong><span>最长运行 {{ Math.round(project.schedule.max_runtime_seconds / 3600) }} 小时</span></div>
+                </div>
+              </article>
+            </div>
           </section>
-          <aside class="panel form-panel wide-form"><p class="eyebrow">NEW PROJECT</p><h2>创建文件备份</h2>
+          <aside class="panel form-panel project-builder"><p class="eyebrow">NEW PROJECT</p><h2>创建备份项目</h2><p class="form-intro">一个项目可以组合文件、MySQL 和 PostgreSQL 数据源，并在同一个 Restic 快照中归档。</p>
             <form @submit.prevent="createProject">
-              <label>服务器<select v-model="projectForm.server_id" required @change="selectDefaults"><option value="" disabled>选择服务器</option><option v-for="server in servers" :key="server.id" :value="server.id">{{ server.name }}</option></select></label>
-              <label>仓库<select v-model="projectForm.repository_id" required><option value="" disabled>选择当前服务器的仓库</option><option v-for="repository in repositoriesForProject" :key="repository.id" :value="repository.id">{{ repository.name }}</option></select></label>
-              <label>项目名称<input v-model="projectForm.name" required placeholder="System Configuration" /></label>
-              <label>绝对路径（每行一个）<textarea v-model="projectForm.paths" rows="3" required></textarea></label>
-              <label>排除规则（每行一个）<textarea v-model="projectForm.excludes" rows="2" placeholder="/etc/ssl/private/**"></textarea></label>
-              <div class="form-row"><label>Cron<input v-model="projectForm.cron" required /></label><label>时区<input v-model="projectForm.timezone" required /></label></div>
-              <label>随机延迟（秒）<input v-model.number="projectForm.jitter_seconds" type="number" min="0" max="3600" /></label>
+              <section class="form-section">
+                <div class="section-title"><span>1</span><div><strong>基础信息</strong><small>选择 Agent 和快照写入位置</small></div></div>
+                <div class="form-row"><label>服务器<select v-model="projectForm.server_id" required @change="selectDefaults"><option value="" disabled>选择服务器</option><option v-for="server in servers" :key="server.id" :value="server.id">{{ server.name }}</option></select></label><label>备份仓库<select v-model="projectForm.repository_id" required><option value="" disabled>选择当前服务器的仓库</option><option v-for="repository in repositoriesForProject" :key="repository.id" :value="repository.id">{{ repository.name }}</option></select></label></div>
+                <label>项目名称<input v-model="projectForm.name" required maxlength="100" placeholder="例如：应用数据每日备份" /></label>
+              </section>
+
+              <section class="form-section">
+                <div class="section-title"><span>2</span><div><strong>备份内容</strong><small>可添加多个数据源；任一数据源失败会标记本次任务失败</small></div></div>
+                <article v-for="(source, index) in projectForm.sources" :key="source.key" class="source-editor">
+                  <header><strong>数据源 {{ index + 1 }}</strong><button v-if="projectForm.sources.length > 1" type="button" class="text-button danger-text" @click="removeProjectSource(index)">移除</button></header>
+                  <label>类型<select v-model="source.type" @change="changeSourceType(source)"><option value="files">文件与目录</option><option value="mysql">MySQL 逻辑备份</option><option value="postgresql">PostgreSQL 逻辑备份</option></select></label>
+                  <template v-if="source.type === 'files'">
+                    <label>绝对路径（每行一个）<textarea v-model="source.paths" rows="3" required placeholder="/etc&#10;/opt/app"></textarea></label>
+                    <label>排除规则（每行一个）<textarea v-model="source.excludes" rows="2" placeholder="/opt/app/cache/**"></textarea></label>
+                  </template>
+                  <template v-else>
+                    <div class="database-note"><strong>{{ sourceTypeLabel(source.type) }} 逻辑备份</strong><span>Agent 将执行 {{ source.type === 'mysql' ? 'mysqldump' : 'pg_dump' }}，临时凭据和产物仅保存在目标服务器。</span></div>
+                    <div class="form-row database-host"><label>数据库地址<input v-model="source.host" required placeholder="127.0.0.1" /></label><label>端口<input v-model.number="source.port" required type="number" min="1" max="65535" /></label></div>
+                    <div class="form-row"><label>数据库名称<input v-model="source.database" required placeholder="application" /></label><label>备份用户<input v-model="source.username" required autocomplete="off" placeholder="vaultmesh_backup" /></label></div>
+                    <label>数据库密码<input v-model="source.password" required type="password" autocomplete="new-password" /><small class="field-help">提交后使用主密钥加密，管理 API 不会再次返回明文。</small></label>
+                  </template>
+                </article>
+                <div class="source-add-row"><span>添加数据源</span><button type="button" class="ghost compact" @click="addProjectSource('files')">+ 文件</button><button type="button" class="ghost compact" @click="addProjectSource('mysql')">+ MySQL</button><button type="button" class="ghost compact" @click="addProjectSource('postgresql')">+ PostgreSQL</button></div>
+              </section>
+
+              <section class="form-section">
+                <div class="section-title"><span>3</span><div><strong>执行计划</strong><small>所有时间均按所选时区解释</small></div></div>
+                <div class="form-row"><label>计划类型<select v-model="projectForm.schedule_mode"><option value="daily">每天</option><option value="weekly">每周</option><option value="custom">高级 Cron</option></select></label><label v-if="projectForm.schedule_mode !== 'custom'">开始时间<input v-model="projectForm.schedule_time" type="time" required /></label><label v-else>Cron（5 段）<input v-model="projectForm.custom_cron" required placeholder="0 2 * * *" /></label></div>
+                <div v-if="projectForm.schedule_mode === 'weekly'" class="weekday-grid" role="group" aria-label="选择星期"><button v-for="(day, index) in weekdays" :key="day" type="button" :class="{ active: projectForm.weekday === String(index) }" @click="projectForm.weekday = String(index)">{{ day }}</button></div>
+                <label>时区<input v-model="projectForm.timezone" required list="timezone-options" /><datalist id="timezone-options"><option v-for="timezone in commonTimezones" :key="timezone" :value="timezone" /></datalist></label>
+                <div class="form-row"><label>随机延迟<select v-model.number="projectForm.jitter_minutes"><option :value="0">不延迟</option><option :value="5">最多 5 分钟</option><option :value="10">最多 10 分钟</option><option :value="30">最多 30 分钟</option><option :value="60">最多 60 分钟</option></select></label><label>最长运行时间<select v-model.number="projectForm.max_runtime_hours"><option :value="1">1 小时</option><option :value="3">3 小时</option><option :value="6">6 小时</option><option :value="12">12 小时</option><option :value="24">24 小时</option></select></label></div>
+                <div class="schedule-preview"><span>计划预览</span><strong>{{ projectSchedulePreview }}</strong><code>{{ projectCron }}</code></div>
+              </section>
               <button class="primary" :disabled="loading || !repositoriesForProject.length">创建并下发</button>
             </form>
           </aside>

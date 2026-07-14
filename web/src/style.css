@@ -67,8 +67,11 @@ nav button.active .nav-dot { border-color: var(--accent); background: var(--acce
 .panel-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; }
 .panel h2 { margin: 5px 0 0; font-size: 20px; letter-spacing: -.02em; }
 .content-grid { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(310px, .7fr); gap: 18px; align-items: start; }
+.content-grid.projects-grid { grid-template-columns: minmax(420px, 1fr) minmax(520px, 1.08fr); }
 .content-grid > .panel + .panel { margin-top: 0; }
 .form-panel { position: sticky; top: 24px; }
+.project-builder { position: static; }
+.form-intro { margin: 9px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 
 form { display: grid; gap: 15px; margin-top: 22px; }
 label { display: grid; gap: 7px; color: #b4c8c0; font-size: 12px; font-weight: 600; }
@@ -76,6 +79,29 @@ input, select, textarea { width: 100%; color: #ecfff7; border: 1px solid #294039
 input:focus, select:focus, textarea:focus { border-color: #4e9c7f; box-shadow: 0 0 0 3px rgba(106,247,177,.08); }
 textarea { resize: vertical; line-height: 1.5; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.form-section { display: grid; gap: 14px; padding: 17px; border: 1px solid #1f352e; border-radius: 12px; background: rgba(8, 18, 15, .65); }
+.section-title { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
+.section-title > span { width: 26px; height: 26px; display: grid; flex: 0 0 auto; place-items: center; color: var(--accent); border: 1px solid #2f654e; border-radius: 50%; background: #0c2a1e; font-size: 11px; font-weight: 800; }
+.section-title strong, .section-title small { display: block; }
+.section-title strong { color: #e8fff5; font-size: 13px; }
+.section-title small { margin-top: 2px; color: var(--muted); font-size: 10px; font-weight: 400; }
+.source-editor { display: grid; gap: 13px; padding: 14px; border: 1px solid #294039; border-radius: 10px; background: #0a1512; }
+.source-editor header { display: flex; align-items: center; justify-content: space-between; }
+.source-editor header strong { font-size: 12px; }
+.text-button.danger-text { color: var(--danger); padding: 2px 0; font-size: 11px; }
+.database-host { grid-template-columns: minmax(0, 1fr) 112px; }
+.database-note { display: grid; gap: 4px; padding: 11px 12px; color: #b8d3c9; border-left: 2px solid #4f9678; border-radius: 7px; background: #10231c; }
+.database-note strong { font-size: 11px; }
+.database-note span, .field-help { color: var(--muted); font-size: 10px; font-weight: 400; line-height: 1.5; }
+.source-add-row { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.source-add-row > span { margin-right: 3px; color: var(--muted); font-size: 10px; }
+.weekday-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
+.weekday-grid button { padding: 8px 3px; color: var(--muted); border: 1px solid #294039; border-radius: 7px; background: #08120f; font-size: 10px; }
+.weekday-grid button.active { color: #062016; border-color: var(--accent); background: var(--accent); font-weight: 800; }
+.schedule-preview { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 13px; border: 1px solid #2a5846; border-radius: 9px; background: #0c261b; }
+.schedule-preview span { grid-column: 1 / -1; color: var(--accent); font-size: 9px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+.schedule-preview strong { color: #dcf9ec; font-size: 11px; line-height: 1.5; }
+.schedule-preview code { align-self: center; padding: 3px 6px; border-radius: 5px; background: #081710; white-space: nowrap; }
 .primary { padding: 11px 16px; color: #042117; border: 1px solid #87ffc2; border-radius: 9px; background: var(--accent); font-weight: 800; }
 .primary:hover { background: #8cffc7; }
 .ghost, .text-button { color: #bdd0c8; border: 1px solid var(--border); border-radius: 8px; background: transparent; padding: 8px 11px; }
@@ -116,12 +142,25 @@ td small { margin-top: 4px; color: var(--muted); font-size: 10px; }
 .ghost.compact { padding: 5px 8px; font-size: 11px; }
 .project-top strong, .project-top small { display: block; }
 .project-top small { margin-top: 4px; color: var(--muted); font-size: 11px; }
-.project-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-.project-meta span { padding: 5px 8px; color: #9fb5ad; border-radius: 6px; background: #11231d; font-size: 11px; }
+.project-source-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 15px; }
+.source-chip { padding: 6px 9px; color: #a9c4ba; border: 1px solid #29453b; border-radius: 999px; background: #10231d; font-size: 10px; }
+.source-chip.mysql { color: #f2ce87; border-color: #5d4c29; background: #241f10; }
+.source-chip.postgresql { color: #9ac9f6; border-color: #31506c; background: #10202e; }
+.schedule-overview { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; padding-top: 14px; border-top: 1px solid #1c302a; }
+.schedule-overview > div { display: grid; gap: 3px; }
+.schedule-overview small { color: var(--muted); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+.schedule-overview strong { color: #e0f7ed; font-size: 12px; }
+.schedule-overview span { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.schedule-overview .next-run { padding-left: 12px; border-left: 1px solid #20352e; }
+.schedule-overview .next-run strong { color: var(--accent); }
+
+@media (max-width: 1300px) {
+  .content-grid.projects-grid { grid-template-columns: 1fr; }
+}
 
 @media (max-width: 1050px) {
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
-  .content-grid { grid-template-columns: 1fr; }
+  .content-grid, .content-grid.projects-grid { grid-template-columns: 1fr; }
   .form-panel { position: static; }
 }
 
@@ -148,4 +187,7 @@ td small { margin-top: 4px; color: var(--muted); font-size: 10px; }
   .topbar { display: block; }
   .live-indicator { margin-top: 14px; }
   .run-row { grid-template-columns: 1fr; }
+  .schedule-overview { grid-template-columns: 1fr; }
+  .schedule-overview .next-run { padding: 12px 0 0; border-top: 1px solid #20352e; border-left: 0; }
+  .weekday-grid { grid-template-columns: repeat(4, 1fr); }
 }

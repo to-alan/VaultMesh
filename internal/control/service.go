@@ -223,7 +223,7 @@ func (s *Service) CreateProject(ctx context.Context, input domain.Project) (doma
 	if err != nil {
 		return domain.Project{}, err
 	}
-	return publicProject(created), nil
+	return publicProject(created, s.now()), nil
 }
 
 func (s *Service) DesiredConfig(ctx context.Context, serverID string) (domain.AgentConfig, error) {
@@ -390,7 +390,13 @@ func validateSourcePath(value string) (string, error) {
 	return cleaned, nil
 }
 
-func publicProject(project domain.Project) domain.Project {
+func publicProject(project domain.Project, now time.Time) domain.Project {
+	if location, err := time.LoadLocation(project.Schedule.Timezone); err == nil {
+		if parsed, err := schedule.Parser.Parse(project.Schedule.Cron); err == nil {
+			next := parsed.Next(now.In(location)).UTC()
+			project.NextRunAt = &next
+		}
+	}
 	for index := range project.Sources {
 		project.Sources[index].SecretCiphertext = ""
 		if project.Sources[index].Database != nil {
