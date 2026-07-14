@@ -100,21 +100,41 @@ Content-Type: application/json
     },
     "retention": {
       "enabled": true,
-      "keep_last": 3,
+      "mode": "count",
+      "keep_last": 14,
       "keep_hourly": 0,
       "keep_daily": 7,
       "keep_weekly": 4,
       "keep_monthly": 12,
       "keep_yearly": 3,
+      "keep_within": "",
       "prune": false
     },
     "verification": {
       "mode": "subset",
       "read_data_subset": "1%"
+    },
+    "maintenance": {
+      "separate": true,
+      "timezone": "Asia/Shanghai",
+      "retention_cron": "30 3 * * *",
+      "prune_cron": "0 4 * * 0",
+      "verification_cron": "0 5 * * 0"
     }
   }
 }
 ```
+
+`policy.retention.mode` 支持：
+
+- `count`：仅使用 `keep_last`，表示当前项目最多保留最近 N 份；
+- `smart`：每日 7 天、每周 1 个月、每月 1 年；
+- `gfs`：使用 `keep_last/hourly/daily/weekly/monthly/yearly`；
+- `age`：使用 `keep_within`，例如 `90d`、`6m`、`1y6m`。
+
+创建项目后可调用 `POST /api/v1/projects/{projectID}/retention-preview`。Control Plane 会向对应 Agent 投递只读任务，Agent 执行 Restic `forget --dry-run --json`；结果以 `stats.operation = retention_preview` 写入运行记录，包含 `snapshots_kept` 与 `snapshots_removed`。
+
+新项目应设置 `policy.maintenance.separate = true`。启用保留时必须提供 `retention_cron`；启用 Prune 或仓库校验时分别提供 `prune_cron`、`verification_cron`。三个任务共享项目的仓库互斥锁与最长运行时间，但不再处于备份成功路径内。缺少 `maintenance` 的旧项目继续使用备份后维护语义，避免升级后静默停止原有策略。
 
 ## Create a MySQL logical-backup project
 
@@ -151,7 +171,7 @@ Use a dedicated database user with the minimum privileges required by `mysqldump
 
 The password is replaced by AES-GCM ciphertext before the project JSON is persisted. The Agent writes a root-only temporary client option file, performs a single-transaction logical dump, backs up the artifact with Restic, and removes the staging directory.
 
-`policy.backup` maps directly to Restic backup options. After a successful snapshot, retention is scoped by both Agent host and `vaultmesh.project_id`; optional verification then checks the repository. A post-backup maintenance failure returns `partial` while preserving the snapshot ID. See [backup project policies](./BACKUP_PROJECTS.md) for the complete contract.
+`policy.backup` maps directly to Restic backup options. For new projects, retention is scoped by Agent host and `vaultmesh.project_id`, while Forget, Prune, and optional verification run in independent maintenance windows. Legacy projects without `maintenance.separate` retain their original post-backup behavior. See [backup project policies](./BACKUP_PROJECTS.md) for the complete contract.
 
 Pause or resume a project without deleting its history:
 

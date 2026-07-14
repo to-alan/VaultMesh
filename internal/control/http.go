@@ -75,6 +75,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("POST /api/v1/projects", s.admin(http.HandlerFunc(s.createProject)))
 	mux.Handle("PATCH /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.updateProject)))
 	mux.Handle("POST /api/v1/projects/{projectID}/run", s.admin(http.HandlerFunc(s.createManualRun)))
+	mux.Handle("POST /api/v1/projects/{projectID}/retention-preview", s.admin(http.HandlerFunc(s.createRetentionPreview)))
 	mux.Handle("GET /api/v1/runs", s.admin(http.HandlerFunc(s.listRuns)))
 
 	mux.Handle("POST /api/v1/agent/heartbeat", s.agent(http.HandlerFunc(s.agentHeartbeat)))
@@ -282,6 +283,15 @@ func (s *HTTPServer) updateProject(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) createManualRun(w http.ResponseWriter, r *http.Request) {
 	command, err := s.service.CreateManualRun(r.Context(), r.PathValue("projectID"))
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, command)
+}
+
+func (s *HTTPServer) createRetentionPreview(w http.ResponseWriter, r *http.Request) {
+	command, err := s.service.CreateRetentionPreview(r.Context(), r.PathValue("projectID"))
 	if err != nil {
 		s.handleServiceError(w, err)
 		return

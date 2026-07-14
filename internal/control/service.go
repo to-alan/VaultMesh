@@ -367,6 +367,9 @@ func (s *Service) CreateProject(ctx context.Context, input domain.Project) (doma
 	if err := validateProjectPolicy(&input.Policy); err != nil {
 		return domain.Project{}, err
 	}
+	if err := validateMaintenancePolicy(&input.Policy); err != nil {
+		return domain.Project{}, err
+	}
 	id, err := randomValue("prj", 10)
 	if err != nil {
 		return domain.Project{}, err
@@ -438,6 +441,14 @@ func (s *Service) DesiredConfig(ctx context.Context, serverID string) (domain.Ag
 }
 
 func (s *Service) CreateManualRun(ctx context.Context, projectID string) (domain.Command, error) {
+	return s.createProjectCommand(ctx, projectID, "backup")
+}
+
+func (s *Service) CreateRetentionPreview(ctx context.Context, projectID string) (domain.Command, error) {
+	return s.createProjectCommand(ctx, projectID, "retention_preview")
+}
+
+func (s *Service) createProjectCommand(ctx context.Context, projectID, commandType string) (domain.Command, error) {
 	if strings.TrimSpace(projectID) == "" {
 		return domain.Command{}, validationError("project_id", "is required")
 	}
@@ -448,7 +459,7 @@ func (s *Service) CreateManualRun(ctx context.Context, projectID string) (domain
 	return s.store.CreateCommand(ctx, domain.Command{
 		ID:        id,
 		ProjectID: projectID,
-		Type:      "backup",
+		Type:      commandType,
 		CreatedAt: s.now(),
 	})
 }
@@ -524,7 +535,10 @@ func prepareDockerSource(source *domain.Source) error {
 	return nil
 }
 
-var resticSize = regexp.MustCompile(`(?i)^[1-9][0-9]*(?:\.[0-9]+)?[kmgt]?$`)
+var (
+	resticSize     = regexp.MustCompile(`(?i)^[1-9][0-9]*(?:\.[0-9]+)?[kmgt]?$`)
+	resticDuration = regexp.MustCompile(`(?i)^(?:[1-9][0-9]*[ymdh])+$`)
+)
 
 func validateProjectPolicy(policy *domain.ProjectPolicy) error {
 	backup := &policy.Backup
@@ -550,7 +564,14 @@ func validateProjectPolicy(policy *domain.ProjectPolicy) error {
 	}
 	backup.ExcludeIfPresent = markers
 
-	retention := policy.Retention
+	retention := &policy.Retention
+	retention.Mode = strings.TrimSpace(retention.Mode)
+	retention.KeepWithin = strings.TrimSpace(retention.KeepWithin)
+	if retention.Mode == "" {
+		// Existing projects predate explicit modes and already use the six GFS
+		// counters, so preserving that behavior is the only safe migration.
+		retention.Mode = "gfs"
+	}
 	counts := []int{retention.KeepLast, retention.KeepHourly, retention.KeepDaily, retention.KeepWeekly, retention.KeepMonthly, retention.KeepYearly}
 	positive := false
 	for _, count := range counts {
@@ -559,8 +580,33 @@ func validateProjectPolicy(policy *domain.ProjectPolicy) error {
 		}
 		positive = positive || count > 0
 	}
-	if retention.Enabled && !positive {
-		return validationError("policy.retention", "at least one keep rule is required when retention is enabled")
+	if retention.Enabled {
+		switch retention.Mode {
+		case "count":
+			if retention.KeepLast <= 0 {
+				return validationError("policy.retention.keep_last", "must be greater than zero in count mode")
+			}
+			retention.KeepHourly, retention.KeepDaily, retention.KeepWeekly, retention.KeepMonthly, retention.KeepYearly = 0, 0, 0, 0, 0
+			retention.KeepWithin = ""
+		case "smart":
+			// Smart retention follows Duplicati's documented 1 week daily,
+			// 4 weeks weekly and 12 months monthly policy. It has no tunable
+			// counters by design.
+			retention.KeepLast, retention.KeepHourly, retention.KeepDaily, retention.KeepWeekly, retention.KeepMonthly, retention.KeepYearly = 0, 0, 0, 0, 0, 0
+			retention.KeepWithin = ""
+		case "gfs":
+			if !positive {
+				return validationError("policy.retention", "at least one keep rule is required in GFS mode")
+			}
+			retention.KeepWithin = ""
+		case "age":
+			if !resticDuration.MatchString(retention.KeepWithin) {
+				return validationError("policy.retention.keep_within", "must be a Restic duration such as 30d, 6m, or 1y")
+			}
+			retention.KeepLast, retention.KeepHourly, retention.KeepDaily, retention.KeepWeekly, retention.KeepMonthly, retention.KeepYearly = 0, 0, 0, 0, 0, 0
+		default:
+			return validationError("policy.retention.mode", "must be count, smart, gfs, or age")
+		}
 	}
 	if retention.Prune && !retention.Enabled {
 		return validationError("policy.retention.prune", "requires retention to be enabled")
@@ -582,6 +628,37 @@ func validateProjectPolicy(policy *domain.ProjectPolicy) error {
 		}
 	default:
 		return validationError("policy.verification.mode", "must be off, metadata, subset, or full")
+	}
+	return nil
+}
+
+func validateMaintenancePolicy(policy *domain.ProjectPolicy) error {
+	maintenance := &policy.Maintenance
+	if !maintenance.Separate {
+		return nil
+	}
+	maintenance.Timezone = strings.TrimSpace(maintenance.Timezone)
+	if maintenance.Timezone == "" {
+		maintenance.Timezone = "UTC"
+	}
+	tasks := []struct {
+		enabled bool
+		field   string
+		value   *string
+	}{
+		{policy.Retention.Enabled, "policy.maintenance.retention_cron", &maintenance.RetentionCron},
+		{policy.Retention.Enabled && policy.Retention.Prune, "policy.maintenance.prune_cron", &maintenance.PruneCron},
+		{policy.Verification.Mode != "off", "policy.maintenance.verification_cron", &maintenance.VerificationCron},
+	}
+	for _, task := range tasks {
+		*task.value = strings.TrimSpace(*task.value)
+		if !task.enabled {
+			*task.value = ""
+			continue
+		}
+		if err := schedule.Validate(*task.value, maintenance.Timezone); err != nil {
+			return validationError(task.field, err.Error())
+		}
 	}
 	return nil
 }

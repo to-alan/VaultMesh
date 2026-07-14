@@ -143,13 +143,39 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 		t.Fatalf("accepted manual command was leased again: %#v", commands.Items)
 	}
 
+	var previewCommand domain.Command
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/retention-preview", adminCookie,
+		nil, http.StatusAccepted, &previewCommand)
+	commands.Items = nil
+	requestJSON(t, handler, http.MethodGet, "/api/v1/agent/commands", identity.Token,
+		nil, http.StatusOK, &commands)
+	if len(commands.Items) != 1 || commands.Items[0].ID != previewCommand.ID || commands.Items[0].Type != "retention_preview" {
+		t.Fatalf("retention preview command was not leased to its agent: %#v", commands.Items)
+	}
+	requestJSON(t, handler, http.MethodPost, "/api/v1/agent/runs", identity.Token, domain.RunReport{
+		ID:             "run_retention_preview",
+		IdempotencyKey: "manual:" + previewCommand.ID,
+		ProjectID:      project.ID,
+		ScheduledAt:    now,
+		StartedAt:      now,
+		FinishedAt:     &finished,
+		Status:         domain.RunSucceeded,
+		Stats:          map[string]any{"operation": "retention_preview", "snapshots_kept": 2, "snapshots_removed": 1},
+	}, http.StatusNoContent, nil)
+
 	var runs struct {
 		Items []domain.RunReport `json:"items"`
 	}
 	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/runs", adminCookie,
 		nil, http.StatusOK, &runs)
-	if len(runs.Items) != 2 {
+	if len(runs.Items) != 3 {
 		t.Fatalf("unexpected run list: %#v", runs.Items)
+	}
+	var dashboard domain.Dashboard
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/dashboard", adminCookie,
+		nil, http.StatusOK, &dashboard)
+	if dashboard.RunsSucceeded != 2 {
+		t.Fatalf("maintenance operation polluted backup success metrics: %#v", dashboard)
 	}
 }
 
@@ -586,6 +612,57 @@ func TestProjectCanBePausedAndResumed(t *testing.T) {
 	}
 	if !resumed.Enabled || resumed.NextRunAt == nil || resumed.Revision != 3 {
 		t.Fatalf("unexpected resumed project: %#v", resumed)
+	}
+}
+
+func TestRetentionModesAreValidatedAndNormalized(t *testing.T) {
+	tests := []struct {
+		name      string
+		policy    domain.RetentionPolicy
+		wantError bool
+	}{
+		{name: "count", policy: domain.RetentionPolicy{Enabled: true, Mode: "count", KeepLast: 10}},
+		{name: "smart", policy: domain.RetentionPolicy{Enabled: true, Mode: "smart"}},
+		{name: "gfs", policy: domain.RetentionPolicy{Enabled: true, Mode: "gfs", KeepDaily: 7, KeepMonthly: 12}},
+		{name: "age", policy: domain.RetentionPolicy{Enabled: true, Mode: "age", KeepWithin: "1y6m"}},
+		{name: "count needs limit", policy: domain.RetentionPolicy{Enabled: true, Mode: "count"}, wantError: true},
+		{name: "age needs duration", policy: domain.RetentionPolicy{Enabled: true, Mode: "age", KeepWithin: "90 days"}, wantError: true},
+		{name: "unknown mode", policy: domain.RetentionPolicy{Enabled: true, Mode: "custom", KeepLast: 1}, wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			policy := domain.ProjectPolicy{Retention: test.policy}
+			err := validateProjectPolicy(&policy)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateProjectPolicy() error = %v, wantError = %v", err, test.wantError)
+			}
+		})
+	}
+
+	legacy := domain.ProjectPolicy{Retention: domain.RetentionPolicy{Enabled: true, KeepLast: 3, KeepDaily: 7}}
+	if err := validateProjectPolicy(&legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Retention.Mode != "gfs" {
+		t.Fatalf("legacy retention mode was not normalized: %#v", legacy.Retention)
+	}
+
+	separate := domain.ProjectPolicy{
+		Retention:    domain.RetentionPolicy{Enabled: true, Mode: "count", KeepLast: 5, Prune: true},
+		Verification: domain.VerificationPolicy{Mode: "metadata"},
+		Maintenance: domain.MaintenancePolicy{
+			Separate: true, Timezone: "Asia/Shanghai", RetentionCron: "30 3 * * *", PruneCron: "0 4 * * 0", VerificationCron: "0 5 * * 0",
+		},
+	}
+	if err := validateProjectPolicy(&separate); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMaintenancePolicy(&separate); err != nil {
+		t.Fatal(err)
+	}
+	separate.Maintenance.PruneCron = "not a cron"
+	if err := validateMaintenancePolicy(&separate); err == nil {
+		t.Fatal("invalid prune maintenance schedule was accepted")
 	}
 }
 

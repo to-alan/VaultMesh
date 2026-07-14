@@ -56,6 +56,7 @@ const success = ref('')
 const nowEpoch = ref(Date.now())
 const lastUpdatedAt = ref<number | null>(null)
 const queuedProjectIDs = ref<Set<string>>(new Set())
+const queuedPreviewProjectIDs = ref<Set<string>>(new Set())
 let clockTimer: number | undefined
 let refreshTimer: number | undefined
 
@@ -111,15 +112,20 @@ const projectForm = reactive({
   exclude_if_present: '.nobackup',
   exclude_larger_than: '',
   retention_enabled: true,
-  keep_last: 3,
+  retention_mode: 'count' as 'count' | 'smart' | 'gfs' | 'age',
+  keep_last: 14,
   keep_hourly: 0,
   keep_daily: 7,
   keep_weekly: 4,
   keep_monthly: 12,
   keep_yearly: 3,
+  keep_within: '90d',
   prune: false,
   verification_mode: 'off' as 'off' | 'metadata' | 'subset' | 'full',
   read_data_subset: '1%',
+  retention_cron: '30 3 * * *',
+  prune_cron: '0 4 * * 0',
+  verification_cron: '0 5 * * 0',
 })
 
 const activeRepositoryProvider = computed(() => repositoryProvider(repositoryForm.provider))
@@ -635,17 +641,26 @@ async function createProject() {
           },
           retention: {
             enabled: projectForm.retention_enabled,
+            mode: projectForm.retention_mode,
             keep_last: Number(projectForm.keep_last),
             keep_hourly: Number(projectForm.keep_hourly),
             keep_daily: Number(projectForm.keep_daily),
             keep_weekly: Number(projectForm.keep_weekly),
             keep_monthly: Number(projectForm.keep_monthly),
             keep_yearly: Number(projectForm.keep_yearly),
+            keep_within: projectForm.keep_within.trim(),
             prune: projectForm.prune,
           },
           verification: {
             mode: projectForm.verification_mode,
             read_data_subset: projectForm.verification_mode === 'subset' ? projectForm.read_data_subset : '',
+          },
+          maintenance: {
+            separate: true,
+            timezone: projectForm.timezone,
+            retention_cron: projectForm.retention_enabled ? projectForm.retention_cron.trim() : '',
+            prune_cron: projectForm.retention_enabled && projectForm.prune ? projectForm.prune_cron.trim() : '',
+            verification_cron: projectForm.verification_mode !== 'off' ? projectForm.verification_cron.trim() : '',
           },
         },
       }),
@@ -724,6 +739,19 @@ async function runNow(project: Project) {
       next.delete(project.id)
       queuedProjectIDs.value = next
     }, 5000)
+  })
+}
+
+async function previewRetention(project: Project) {
+  await perform(async () => {
+    await api(`/api/v1/projects/${encodeURIComponent(project.id)}/retention-preview`, { method: 'POST' })
+    queuedPreviewProjectIDs.value = new Set([...queuedPreviewProjectIDs.value, project.id])
+    success.value = `已向 ${project.name} 所在 Agent 排队发送只读清理预览；结果会在运行记录和项目卡片中显示。`
+    window.setTimeout(() => {
+      const next = new Set(queuedPreviewProjectIDs.value)
+      next.delete(project.id)
+      queuedPreviewProjectIDs.value = next
+    }, 15000)
   })
 }
 
@@ -874,7 +902,42 @@ function sourceSummary(source: Project['sources'][number]): string {
 function retentionSummary(project: Project): string {
   const retention = project.policy?.retention
   if (!retention?.enabled) return '不自动清理'
-  return `最近 ${retention.keep_last || 0} / 日 ${retention.keep_daily || 0} / 周 ${retention.keep_weekly || 0} / 月 ${retention.keep_monthly || 0}`
+  switch (retention.mode || 'gfs') {
+    case 'count': return `最多 ${retention.keep_last} 份`
+    case 'smart': return '智能：日 7 / 周 4 / 月 12'
+    case 'age': return `保留最近 ${retention.keep_within}`
+    default: return `GFS · 最近 ${retention.keep_last || 0} / 日 ${retention.keep_daily || 0} / 周 ${retention.keep_weekly || 0} / 月 ${retention.keep_monthly || 0}`
+  }
+}
+
+function latestRetentionPreview(projectID: string): Run | undefined {
+  return runs.value.find((run) => run.project_id === projectID && run.stats?.operation === 'retention_preview')
+}
+
+function retentionPreviewSummary(projectID: string): string {
+  const preview = latestRetentionPreview(projectID)
+  if (!preview) return ''
+  if (preview.status !== 'succeeded') return `预览失败：${preview.error_message || 'Agent 未返回有效结果'}`
+  return `保留 ${Number(preview.stats?.snapshots_kept || 0)} 份 · 将删除 ${Number(preview.stats?.snapshots_removed || 0)} 份 · 未执行删除`
+}
+
+function runOperationLabel(run: Run): string {
+  return {
+    retention_preview: '清理预览',
+    retention: '快照清理',
+    prune: '空间回收',
+    verification: '仓库校验',
+  }[String(run.stats?.operation || '')] || '备份'
+}
+
+function maintenanceSummary(project: Project): string {
+  const maintenance = project.policy?.maintenance
+  if (!maintenance?.separate) return '备份后执行（兼容模式）'
+  const tasks = []
+  if (project.policy?.retention.enabled) tasks.push(`清理 ${maintenance.retention_cron || '—'}`)
+  if (project.policy?.retention.prune) tasks.push(`Prune ${maintenance.prune_cron || '—'}`)
+  if (project.policy?.verification.mode && project.policy.verification.mode !== 'off') tasks.push(`校验 ${maintenance.verification_cron || '—'}`)
+  return tasks.join(' · ') || '无维护任务'
 }
 
 function verificationSummary(project: Project): string {
@@ -1239,7 +1302,7 @@ onBeforeUnmount(() => {
               <article v-for="project in group.projects" :key="project.id" class="project-card" :class="{ 'project-disabled': !project.enabled }">
                 <div class="project-top">
                   <div><strong>{{ project.name }}</strong><small>{{ serverName(project.server_id) }} · {{ repositoryName(project.repository_id) }}</small></div>
-                  <div class="project-actions"><span class="status-pill" :class="project.enabled ? 'online' : 'neutral'">{{ project.enabled ? `Revision ${project.revision}` : '已暂停' }}</span><button type="button" class="text-button" :disabled="loading" @click="toggleProject(project)">{{ project.enabled ? '暂停' : '恢复' }}</button><button type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
+                  <div class="project-actions"><span class="status-pill" :class="project.enabled ? 'online' : 'neutral'">{{ project.enabled ? `Revision ${project.revision}` : '已暂停' }}</span><button type="button" class="text-button" :disabled="loading" @click="toggleProject(project)">{{ project.enabled ? '暂停' : '恢复' }}</button><button v-if="project.policy?.retention.enabled" type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedPreviewProjectIDs.has(project.id)" @click="previewRetention(project)">{{ queuedPreviewProjectIDs.has(project.id) ? '预览排队中' : '清理预览' }}</button><button type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
                 </div>
                 <div class="project-source-list">
                   <span v-for="source in project.sources" :key="source.id" class="source-chip" :class="source.type">{{ sourceSummary(source) }}</span>
@@ -1253,6 +1316,8 @@ onBeforeUnmount(() => {
                   <span><small>校验</small><strong>{{ verificationSummary(project) }}</strong></span>
                   <span><small>扫描</small><strong>{{ scanSummary(project) }}</strong></span>
                 </div>
+                <div class="maintenance-strip"><small>独立维护窗口</small><strong>{{ maintenanceSummary(project) }}</strong></div>
+                <div v-if="latestRetentionPreview(project.id)" class="retention-preview-result" :class="latestRetentionPreview(project.id)?.status"><span>DRY RUN</span><strong>{{ retentionPreviewSummary(project.id) }}</strong><small>{{ formatDate(latestRetentionPreview(project.id)?.finished_at || latestRetentionPreview(project.id)?.started_at || '') }}</small></div>
               </article>
                 </div>
               </section>
@@ -1304,13 +1369,33 @@ onBeforeUnmount(() => {
                 <div class="schedule-preview"><span>计划预览</span><strong>{{ projectSchedulePreview }}</strong><code>{{ projectCron }}</code></div>
               </section>
               <section class="form-section">
-                <div class="section-title"><span>4</span><div><strong>保留与完整性策略</strong><small>备份成功后依次执行 forget/prune 和 check</small></div></div>
+                <div class="section-title"><span>4</span><div><strong>保留与完整性策略</strong><small>使用成熟备份软件的保留模型；创建后可在项目卡片执行只读清理预览</small></div></div>
                 <label class="check-row"><input v-model="projectForm.retention_enabled" type="checkbox" /><span><strong>自动应用快照保留策略</strong><small>仅匹配当前服务器与当前项目标签，不影响仓库内其他项目。</small></span></label>
-                <div v-if="projectForm.retention_enabled" class="retention-grid">
-                  <label>最近<input v-model.number="projectForm.keep_last" type="number" min="0" max="100000" /></label><label>每小时<input v-model.number="projectForm.keep_hourly" type="number" min="0" max="100000" /></label><label>每天<input v-model.number="projectForm.keep_daily" type="number" min="0" max="100000" /></label><label>每周<input v-model.number="projectForm.keep_weekly" type="number" min="0" max="100000" /></label><label>每月<input v-model.number="projectForm.keep_monthly" type="number" min="0" max="100000" /></label><label>每年<input v-model.number="projectForm.keep_yearly" type="number" min="0" max="100000" /></label>
-                </div>
-                <label v-if="projectForm.retention_enabled" class="check-row caution-row"><input v-model="projectForm.prune" type="checkbox" /><span><strong>保留后立即回收存储空间</strong><small><code>prune</code> 会锁定仓库并重写数据，耗时和流量较大；默认关闭。</small></span></label>
+                <template v-if="projectForm.retention_enabled">
+                  <div class="retention-mode-grid" role="radiogroup" aria-label="保留策略模式">
+                    <label :class="{ active: projectForm.retention_mode === 'count' }"><input v-model="projectForm.retention_mode" type="radio" value="count" /><span><strong>最多 N 份</strong><small>简单且可预测，适合高频备份</small></span></label>
+                    <label :class="{ active: projectForm.retention_mode === 'smart' }"><input v-model="projectForm.retention_mode" type="radio" value="smart" /><span><strong>智能保留</strong><small>每日 7、每周 4、每月 12</small></span></label>
+                    <label :class="{ active: projectForm.retention_mode === 'gfs' }"><input v-model="projectForm.retention_mode" type="radio" value="gfs" /><span><strong>高级 GFS</strong><small>按小时/日/周/月/年分层</small></span></label>
+                    <label :class="{ active: projectForm.retention_mode === 'age' }"><input v-model="projectForm.retention_mode" type="radio" value="age" /><span><strong>按时间保留</strong><small>保留指定时间范围内的全部快照</small></span></label>
+                  </div>
+                  <label v-if="projectForm.retention_mode === 'count'">最多保留快照数<input v-model.number="projectForm.keep_last" type="number" min="1" max="100000" required /><small class="field-help">当前项目无论备份路径是否变化，最终最多保留最近 N 份快照。</small></label>
+                  <div v-else-if="projectForm.retention_mode === 'smart'" class="smart-retention-note"><strong>Duplicati Smart Retention</strong><span>最近一周每天一份、最近四周每周一份、最近十二个月每月一份。规则按“或”组合，重叠快照只计算一次。</span></div>
+                  <div v-else-if="projectForm.retention_mode === 'gfs'" class="retention-grid">
+                    <label>最近<input v-model.number="projectForm.keep_last" type="number" min="0" max="100000" /></label><label>每小时<input v-model.number="projectForm.keep_hourly" type="number" min="0" max="100000" /></label><label>每天<input v-model.number="projectForm.keep_daily" type="number" min="0" max="100000" /></label><label>每周<input v-model.number="projectForm.keep_weekly" type="number" min="0" max="100000" /></label><label>每月<input v-model.number="projectForm.keep_monthly" type="number" min="0" max="100000" /></label><label>每年<input v-model.number="projectForm.keep_yearly" type="number" min="0" max="100000" /></label>
+                  </div>
+                  <label v-else>保留时间范围<input v-model.trim="projectForm.keep_within" required pattern="(?:[1-9][0-9]*[ymdh])+" placeholder="例如 90d、6m、1y" /><small class="field-help">Restic duration：<code>h</code> 小时、<code>d</code> 天、<code>m</code> 月、<code>y</code> 年，可组合为 <code>1y6m</code>。</small></label>
+                </template>
+                <label v-if="projectForm.retention_enabled" class="check-row caution-row"><input v-model="projectForm.prune" type="checkbox" /><span><strong>定期回收未引用空间</strong><small><code>prune</code> 会锁定仓库并重写数据，启用后只在下方独立维护窗口执行，不阻塞备份。</small></span></label>
                 <div class="form-row"><label>仓库校验<select v-model="projectForm.verification_mode"><option value="off">关闭</option><option value="metadata">检查仓库结构</option><option value="subset">抽样读取数据</option><option value="full">读取全部数据（高成本）</option></select></label><label v-if="projectForm.verification_mode === 'subset'">抽样比例<select v-model="projectForm.read_data_subset"><option value="1%">1%</option><option value="5%">5%</option><option value="10%">10%</option><option value="25%">25%</option></select></label></div>
+                <div class="maintenance-window">
+                  <div><strong>独立维护窗口</strong><small>Forget、Prune、Check 使用项目时区单独调度；仓库级互斥锁会避免它们与备份并发。</small></div>
+                  <div class="maintenance-cron-grid">
+                    <label v-if="projectForm.retention_enabled">清理快照 Cron<input v-model.trim="projectForm.retention_cron" required placeholder="30 3 * * *" /><small class="field-help">只执行 Forget，不回收数据块。</small></label>
+                    <label v-if="projectForm.retention_enabled && projectForm.prune">空间回收 Cron<input v-model.trim="projectForm.prune_cron" required placeholder="0 4 * * 0" /><small class="field-help">建议每周低峰期执行。</small></label>
+                    <label v-if="projectForm.verification_mode !== 'off'">仓库校验 Cron<input v-model.trim="projectForm.verification_cron" required placeholder="0 5 * * 0" /><small class="field-help">完整读取应安排在流量低峰。</small></label>
+                  </div>
+                  <code>{{ projectForm.timezone }}</code>
+                </div>
                 <p class="policy-reference">字段与执行语义直接采用 <a href="https://restic.readthedocs.io/en/stable/040_backup.html" target="_blank" rel="noreferrer">Restic backup</a>、<a href="https://restic.readthedocs.io/en/stable/060_forget.html" target="_blank" rel="noreferrer">forget/prune</a> 和 <a href="https://kopia.io/docs/reference/command-line/common/policy-set/" target="_blank" rel="noreferrer">Kopia policy</a> 的成熟模型。</p>
               </section>
               <button class="primary" :disabled="loading || !servers.length || !repositories.length">创建并下发</button>
@@ -1323,8 +1408,8 @@ onBeforeUnmount(() => {
         <section class="panel">
           <div class="panel-heading"><div><p class="eyebrow">RUN HISTORY</p><h2>最近 100 次运行</h2></div></div>
           <div v-if="!runs.length" class="empty-state">尚无运行记录。</div>
-          <div v-else class="table-wrap"><table><thead><tr><th>项目</th><th>状态</th><th>开始时间</th><th>快照</th><th>错误</th></tr></thead><tbody>
-            <tr v-for="run in runs" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ run.id }}</small></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td>{{ formatDate(run.started_at) }}</td><td><code>{{ run.snapshot_id ? run.snapshot_id.slice(0, 16) : '—' }}</code></td><td class="error-cell">{{ run.error_message || '—' }}</td></tr>
+          <div v-else class="table-wrap"><table><thead><tr><th>项目</th><th>类型</th><th>状态</th><th>开始时间</th><th>快照 / 预览结果</th><th>错误</th></tr></thead><tbody>
+            <tr v-for="run in runs" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ run.id }}</small></td><td><span class="source-chip">{{ runOperationLabel(run) }}</span></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td>{{ formatDate(run.started_at) }}</td><td><code v-if="run.snapshot_id">{{ run.snapshot_id.slice(0, 16) }}</code><span v-else-if="run.stats?.operation === 'retention_preview'">保留 {{ Number(run.stats?.snapshots_kept || 0) }} · 删除 {{ Number(run.stats?.snapshots_removed || 0) }}</span><span v-else>—</span></td><td class="error-cell">{{ run.error_message || '—' }}</td></tr>
           </tbody></table></div>
         </section>
       </template>

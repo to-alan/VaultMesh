@@ -113,6 +113,7 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 		}
 	}
 	stats := map[string]any{
+		"operation":             "backup",
 		"files_new":             summary.FilesNew,
 		"files_changed":         summary.FilesChanged,
 		"files_unmodified":      summary.FilesUnmodified,
@@ -140,30 +141,101 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 	if summary.SnapshotID == "" {
 		return RunResult{Status: domain.RunFailed, ErrorCode: "snapshot_missing", ErrorMessage: "restic did not return a snapshot ID", Stats: stats}
 	}
-	if result := r.applyPostBackupPolicy(ctx, agentID, project, summary.SnapshotID, stats); result != nil {
-		return *result
+	if !project.Policy.Maintenance.Separate {
+		if result := r.applyPostBackupPolicy(ctx, agentID, project, summary.SnapshotID, stats); result != nil {
+			return *result
+		}
 	}
 	return RunResult{Status: domain.RunSucceeded, SnapshotID: summary.SnapshotID, Stats: stats}
+}
+
+// PreviewRetention asks Restic to evaluate the exact repository policy without
+// deleting snapshots or reclaiming data. It intentionally bypasses repository
+// initialization: previewing a missing repository must be a read-only failure.
+func (r *Runner) PreviewRetention(ctx context.Context, agentID string, project domain.AgentProject) RunResult {
+	stats := map[string]any{"operation": "retention_preview", "dry_run": true}
+	if !project.Policy.Retention.Enabled {
+		return RunResult{Status: domain.RunFailed, ErrorCode: "retention_disabled", ErrorMessage: "retention is disabled for this project", Stats: stats}
+	}
+	args := retentionArguments(agentID, project.ID, project.Policy.Retention, true)
+	exitCode, kept, removed, errorOutput, err, parseErr := runForgetPreview(ctx, repositoryEnvironment(project.Repository), r.resticPath, resticArguments(project.Repository, args...)...)
+	stats["restic_exit_code"] = exitCode
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return RunResult{Status: domain.RunTimedOut, ErrorCode: "max_runtime_exceeded", ErrorMessage: "retention preview exceeded the configured maximum runtime", Stats: stats}
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return RunResult{Status: domain.RunCanceled, ErrorCode: "canceled", ErrorMessage: "retention preview was canceled", Stats: stats}
+	}
+	if err != nil || exitCode != 0 {
+		if errorOutput == "" && err != nil {
+			errorOutput = err.Error()
+		}
+		return RunResult{Status: domain.RunFailed, ErrorCode: "retention_preview_failed", ErrorMessage: redact(truncate(errorOutput, 4096), project.Repository), Stats: stats}
+	}
+	if parseErr != nil {
+		return RunResult{Status: domain.RunFailed, ErrorCode: "invalid_retention_preview", ErrorMessage: parseErr.Error(), Stats: stats}
+	}
+	stats["snapshots_kept"] = kept
+	stats["snapshots_removed"] = removed
+	return RunResult{Status: domain.RunSucceeded, Stats: stats}
+}
+
+func (r *Runner) ApplyRetention(ctx context.Context, agentID string, project domain.AgentProject) RunResult {
+	stats := map[string]any{"operation": "retention"}
+	if !project.Policy.Retention.Enabled {
+		return RunResult{Status: domain.RunFailed, ErrorCode: "retention_disabled", ErrorMessage: "retention is disabled for this project", Stats: stats}
+	}
+	args := retentionArguments(agentID, project.ID, project.Policy.Retention, false)
+	return r.runMaintenanceCommand(ctx, project.Repository, args, "retention", "retention_failed", stats)
+}
+
+func (r *Runner) Prune(ctx context.Context, project domain.AgentProject) RunResult {
+	stats := map[string]any{"operation": "prune"}
+	if !project.Policy.Retention.Prune {
+		return RunResult{Status: domain.RunFailed, ErrorCode: "prune_disabled", ErrorMessage: "prune is disabled for this project", Stats: stats}
+	}
+	return r.runMaintenanceCommand(ctx, project.Repository, []string{"prune"}, "prune", "prune_failed", stats)
+}
+
+func (r *Runner) Verify(ctx context.Context, project domain.AgentProject) RunResult {
+	verification := project.Policy.Verification
+	stats := map[string]any{"operation": "verification", "verification_mode": verification.Mode}
+	if verification.Mode == "" || verification.Mode == "off" {
+		return RunResult{Status: domain.RunFailed, ErrorCode: "verification_disabled", ErrorMessage: "repository verification is disabled for this project", Stats: stats}
+	}
+	args := []string{"check"}
+	switch verification.Mode {
+	case "subset":
+		args = append(args, "--read-data-subset="+verification.ReadDataSubset)
+	case "full":
+		args = append(args, "--read-data")
+	}
+	return r.runMaintenanceCommand(ctx, project.Repository, args, "verification", "repository_verification_failed", stats)
+}
+
+func (r *Runner) runMaintenanceCommand(ctx context.Context, repository domain.Repository, args []string, operation, errorCode string, stats map[string]any) RunResult {
+	exitCode, output, err := runCommand(ctx, repositoryEnvironment(repository), r.resticPath, resticArguments(repository, args...)...)
+	stats["restic_exit_code"] = exitCode
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return RunResult{Status: domain.RunTimedOut, ErrorCode: "max_runtime_exceeded", ErrorMessage: operation + " exceeded the configured maximum runtime", Stats: stats}
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return RunResult{Status: domain.RunCanceled, ErrorCode: "canceled", ErrorMessage: operation + " was canceled", Stats: stats}
+	}
+	if err != nil || exitCode != 0 {
+		if output == "" && err != nil {
+			output = err.Error()
+		}
+		return RunResult{Status: domain.RunFailed, ErrorCode: errorCode, ErrorMessage: redact(truncate(output, 4096), repository), Stats: stats}
+	}
+	return RunResult{Status: domain.RunSucceeded, Stats: stats}
 }
 
 func (r *Runner) applyPostBackupPolicy(ctx context.Context, agentID string, project domain.AgentProject, snapshotID string, stats map[string]any) *RunResult {
 	environment := repositoryEnvironment(project.Repository)
 	retention := project.Policy.Retention
 	if retention.Enabled {
-		args := []string{"forget", "--host", agentID, "--tag", "vaultmesh.project_id=" + project.ID}
-		keep := []struct {
-			name  string
-			value int
-		}{
-			{"--keep-last", retention.KeepLast}, {"--keep-hourly", retention.KeepHourly},
-			{"--keep-daily", retention.KeepDaily}, {"--keep-weekly", retention.KeepWeekly},
-			{"--keep-monthly", retention.KeepMonthly}, {"--keep-yearly", retention.KeepYearly},
-		}
-		for _, item := range keep {
-			if item.value > 0 {
-				args = append(args, item.name, strconv.Itoa(item.value))
-			}
-		}
+		args := retentionArguments(agentID, project.ID, retention, false)
 		if retention.Prune {
 			args = append(args, "--prune")
 		}
@@ -217,6 +289,45 @@ func (r *Runner) applyPostBackupPolicy(ctx context.Context, agentID string, proj
 		}
 	}
 	return nil
+}
+
+func retentionArguments(agentID, projectID string, retention domain.RetentionPolicy, dryRun bool) []string {
+	// Restic defaults to grouping snapshots by host and paths. Database dumps
+	// and Docker manifests use a protected random staging directory, so paths
+	// legitimately change between runs. The project tag already isolates the
+	// selection; grouping by host keeps all runs for that project in one policy
+	// group without allowing a changing temporary path to bypass retention.
+	args := []string{"forget", "--host", agentID, "--tag", "vaultmesh.project_id=" + projectID, "--group-by", "host"}
+	if dryRun {
+		args = append(args, "--dry-run", "--json")
+	}
+	switch retention.Mode {
+	case "count":
+		args = append(args, "--keep-last", strconv.Itoa(retention.KeepLast))
+	case "smart":
+		args = append(args,
+			"--keep-within-daily", "7d",
+			"--keep-within-weekly", "28d",
+			"--keep-within-monthly", "1y",
+		)
+	case "age":
+		args = append(args, "--keep-within", retention.KeepWithin)
+	default: // gfs and legacy configurations with an empty mode.
+		keep := []struct {
+			name  string
+			value int
+		}{
+			{"--keep-last", retention.KeepLast}, {"--keep-hourly", retention.KeepHourly},
+			{"--keep-daily", retention.KeepDaily}, {"--keep-weekly", retention.KeepWeekly},
+			{"--keep-monthly", retention.KeepMonthly}, {"--keep-yearly", retention.KeepYearly},
+		}
+		for _, item := range keep {
+			if item.value > 0 {
+				args = append(args, item.name, strconv.Itoa(item.value))
+			}
+		}
+	}
+	return args
 }
 
 func (r *Runner) ensureRepository(ctx context.Context, repository domain.Repository) *RunResult {
@@ -607,6 +718,94 @@ func runCommand(ctx context.Context, environment []string, executable string, ar
 		return exitError.ExitCode(), strings.TrimSpace(output.String()), err
 	}
 	return -1, strings.TrimSpace(output.String()), err
+}
+
+func runForgetPreview(ctx context.Context, environment []string, executable string, args ...string) (exitCode, kept, removed int, errorOutput string, runErr, parseErr error) {
+	command := exec.CommandContext(ctx, executable, args...)
+	command.Env = environment
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return -1, 0, 0, "", err, nil
+	}
+	var stderr limitedBuffer
+	stderr.limit = 16 << 10
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		return -1, 0, 0, stderr.String(), err, nil
+	}
+	kept, removed, parseErr = countForgetPreview(json.NewDecoder(stdout))
+	if parseErr != nil {
+		// Keep draining stdout so a Restic process with more output cannot block
+		// while Wait is collecting its exit status.
+		_, _ = io.Copy(io.Discard, stdout)
+	}
+	runErr = command.Wait()
+	exitCode = 0
+	if runErr != nil {
+		var exitError *exec.ExitError
+		if errors.As(runErr, &exitError) {
+			exitCode = exitError.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	return exitCode, kept, removed, strings.TrimSpace(stderr.String()), runErr, parseErr
+}
+
+func countForgetPreview(decoder *json.Decoder) (int, int, error) {
+	var walk func(string) (int, int, error)
+	walk = func(field string) (int, int, error) {
+		token, err := decoder.Token()
+		if err != nil {
+			return 0, 0, err
+		}
+		delimiter, isDelimiter := token.(json.Delim)
+		if !isDelimiter {
+			return 0, 0, nil
+		}
+		kept, removed := 0, 0
+		switch delimiter {
+		case '[':
+			for decoder.More() {
+				childKept, childRemoved, err := walk("")
+				if err != nil {
+					return 0, 0, err
+				}
+				if field == "keep" {
+					kept++
+				} else if field == "remove" {
+					removed++
+				} else {
+					kept += childKept
+					removed += childRemoved
+				}
+			}
+		case '{':
+			for decoder.More() {
+				key, err := decoder.Token()
+				if err != nil {
+					return 0, 0, err
+				}
+				childKept, childRemoved, err := walk(key.(string))
+				if err != nil {
+					return 0, 0, err
+				}
+				kept += childKept
+				removed += childRemoved
+			}
+		default:
+			return 0, 0, fmt.Errorf("unexpected JSON delimiter %q", delimiter)
+		}
+		if _, err := decoder.Token(); err != nil {
+			return 0, 0, err
+		}
+		return kept, removed, nil
+	}
+	kept, removed, err := walk("")
+	if err != nil {
+		return 0, 0, fmt.Errorf("decode Restic retention preview: %w", err)
+	}
+	return kept, removed, nil
 }
 
 func requireNonEmptyFile(path string) error {

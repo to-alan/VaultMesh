@@ -107,11 +107,151 @@ func TestRunnerAppliesBackupRetentionAndVerificationPolicy(t *testing.T) {
 	commands := string(logged)
 	for _, expected := range []string{
 		"backup --json --host srv_policy --tag vaultmesh.project_id=prj_policy --one-file-system --exclude-caches --exclude-if-present .nobackup --exclude-larger-than 2G",
-		"forget --host srv_policy --tag vaultmesh.project_id=prj_policy --keep-last 3 --keep-daily 7 --keep-weekly 4 --prune",
+		"forget --host srv_policy --tag vaultmesh.project_id=prj_policy --group-by host --keep-last 3 --keep-daily 7 --keep-weekly 4 --prune",
 		"check --read-data-subset=5%",
 	} {
 		if !strings.Contains(commands, expected) {
 			t.Fatalf("missing command %q in:\n%s", expected, commands)
+		}
+	}
+}
+
+func TestRetentionArgumentsCompileSupportedModes(t *testing.T) {
+	tests := []struct {
+		name      string
+		policy    domain.RetentionPolicy
+		expected  []string
+		forbidden []string
+	}{
+		{
+			name:      "hard count",
+			policy:    domain.RetentionPolicy{Mode: "count", KeepLast: 12},
+			expected:  []string{"--group-by host", "--keep-last 12"},
+			forbidden: []string{"--keep-daily"},
+		},
+		{
+			name:      "smart",
+			policy:    domain.RetentionPolicy{Mode: "smart"},
+			expected:  []string{"--keep-within-daily 7d", "--keep-within-weekly 28d", "--keep-within-monthly 1y"},
+			forbidden: []string{"--keep-last"},
+		},
+		{
+			name:      "age",
+			policy:    domain.RetentionPolicy{Mode: "age", KeepWithin: "6m"},
+			expected:  []string{"--keep-within 6m"},
+			forbidden: []string{"--keep-monthly"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			actual := strings.Join(retentionArguments("srv", "prj", test.policy, true), " ")
+			for _, expected := range append([]string{"--host srv", "--tag vaultmesh.project_id=prj", "--dry-run --json"}, test.expected...) {
+				if !strings.Contains(actual, expected) {
+					t.Fatalf("missing %q in %q", expected, actual)
+				}
+			}
+			for _, forbidden := range test.forbidden {
+				if strings.Contains(actual, forbidden) {
+					t.Fatalf("unexpected %q in %q", forbidden, actual)
+				}
+			}
+		})
+	}
+}
+
+func TestRunnerPreviewsRetentionWithoutDeletingSnapshots(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell script")
+	}
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "restic.log")
+	t.Setenv("FAKE_RESTIC_LOG", logPath)
+	restic := filepath.Join(directory, "fake-restic")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"$FAKE_RESTIC_LOG\"\n" +
+		"printf '%s\\n' 'repository warning on stderr' >&2\n" +
+		"printf '%s\\n' '[{\"host\":\"srv\",\"keep\":[{\"id\":\"a\"},{\"id\":\"b\"}],\"remove\":[{\"id\":\"c\"}]}]'\n"
+	if err := os.WriteFile(restic, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.AgentProject{
+		Project:    domain.Project{ID: "prj", Policy: domain.ProjectPolicy{Retention: domain.RetentionPolicy{Enabled: true, Mode: "count", KeepLast: 2, Prune: true}}},
+		Repository: domain.Repository{ID: "repo", URL: "/tmp/repository", Password: "secret"},
+	}
+	result := NewRunner(restic).PreviewRetention(context.Background(), "srv", project)
+	if result.Status != domain.RunSucceeded || result.Stats["snapshots_kept"] != 2 || result.Stats["snapshots_removed"] != 1 {
+		t.Fatalf("unexpected preview result: %#v", result)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := string(logged)
+	if !strings.Contains(command, "forget --host srv --tag vaultmesh.project_id=prj --group-by host --dry-run --json --keep-last 2") {
+		t.Fatalf("unexpected preview command: %s", command)
+	}
+	if strings.Contains(command, "--prune") {
+		t.Fatalf("preview must never prune: %s", command)
+	}
+}
+
+func TestRunnerSeparatesBackupFromRepositoryMaintenance(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell script")
+	}
+	directory := t.TempDir()
+	logPath := filepath.Join(directory, "restic.log")
+	t.Setenv("FAKE_RESTIC_LOG", logPath)
+	restic := filepath.Join(directory, "fake-restic")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"$FAKE_RESTIC_LOG\"\n" +
+		"case \"$1\" in\n" +
+		"  snapshots) printf '%s\\n' '[]';;\n" +
+		"  backup) printf '%s\\n' '{\"message_type\":\"summary\",\"snapshot_id\":\"separate123\"}';;\n" +
+		"  forget|prune|check) exit 0;;\n" +
+		"  *) exit 12;;\n" +
+		"esac\n"
+	if err := os.WriteFile(restic, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.AgentProject{
+		Project: domain.Project{
+			ID: "prj", Sources: []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+			Policy: domain.ProjectPolicy{
+				Retention:    domain.RetentionPolicy{Enabled: true, Mode: "count", KeepLast: 5, Prune: true},
+				Verification: domain.VerificationPolicy{Mode: "subset", ReadDataSubset: "5%"},
+				Maintenance:  domain.MaintenancePolicy{Separate: true},
+			},
+		},
+		Repository: domain.Repository{ID: "repo", URL: "/tmp/repository", Password: "secret"},
+	}
+	if result := NewRunner(restic).Execute(context.Background(), "srv", project); result.Status != domain.RunSucceeded {
+		t.Fatalf("backup failed: %#v", result)
+	}
+	logged, _ := os.ReadFile(logPath)
+	if strings.Contains(string(logged), "forget ") || strings.Contains(string(logged), "prune ") || strings.Contains(string(logged), "check ") {
+		t.Fatalf("backup unexpectedly ran maintenance:\n%s", logged)
+	}
+
+	runner := NewRunner(restic)
+	for name, result := range map[string]RunResult{
+		"retention":    runner.ApplyRetention(context.Background(), "srv", project),
+		"prune":        runner.Prune(context.Background(), project),
+		"verification": runner.Verify(context.Background(), project),
+	} {
+		if result.Status != domain.RunSucceeded || result.Stats["operation"] != name {
+			t.Fatalf("%s failed: %#v", name, result)
+		}
+	}
+	logged, _ = os.ReadFile(logPath)
+	commands := string(logged)
+	for _, expected := range []string{
+		"forget --host srv --tag vaultmesh.project_id=prj --group-by host --keep-last 5",
+		"prune",
+		"check --read-data-subset=5%",
+	} {
+		if !strings.Contains(commands, expected) {
+			t.Fatalf("missing maintenance command %q in:\n%s", expected, commands)
 		}
 	}
 }

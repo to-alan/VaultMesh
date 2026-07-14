@@ -36,28 +36,36 @@ func NewManager(state *StateStore, runner *Runner, identity domain.AgentIdentity
 }
 
 func (m *Manager) Apply(config domain.AgentConfig) error {
-	type preparedCron struct {
-		cron    *cron.Cron
-		project domain.AgentProject
-	}
-	prepared := make([]preparedCron, 0, len(config.Projects))
+	prepared := make([]*cron.Cron, 0, len(config.Projects)*2)
 	for _, project := range config.Projects {
-		if err := schedule.Validate(project.Schedule.Cron, project.Schedule.Timezone); err != nil {
-			return fmt.Errorf("project %s schedule: %w", project.ID, err)
-		}
-		location, err := time.LoadLocation(project.Schedule.Timezone)
+		backupCron, err := m.operationCron(project, project.Schedule.Cron, project.Schedule.Timezone, "backup")
 		if err != nil {
 			return err
 		}
-		projectCopy := project
-		cronRunner := cron.New(cron.WithLocation(location), cron.WithParser(schedule.Parser))
-		if _, err := cronRunner.AddFunc(project.Schedule.Cron, func() {
-			scheduledAt := time.Now().UTC().Truncate(time.Minute)
-			go m.execute(projectCopy, scheduledAt)
-		}); err != nil {
-			return fmt.Errorf("register project %s schedule: %w", project.ID, err)
+		prepared = append(prepared, backupCron)
+		maintenance := project.Policy.Maintenance
+		if !maintenance.Separate {
+			continue
 		}
-		prepared = append(prepared, preparedCron{cron: cronRunner, project: project})
+		tasks := []struct {
+			enabled    bool
+			expression string
+			operation  string
+		}{
+			{project.Policy.Retention.Enabled, maintenance.RetentionCron, "retention"},
+			{project.Policy.Retention.Enabled && project.Policy.Retention.Prune, maintenance.PruneCron, "prune"},
+			{project.Policy.Verification.Mode != "" && project.Policy.Verification.Mode != "off", maintenance.VerificationCron, "verification"},
+		}
+		for _, task := range tasks {
+			if !task.enabled {
+				continue
+			}
+			operationCron, err := m.operationCron(project, task.expression, maintenance.Timezone, task.operation)
+			if err != nil {
+				return err
+			}
+			prepared = append(prepared, operationCron)
+		}
 	}
 	if err := m.state.SetConfig(config); err != nil {
 		return err
@@ -65,19 +73,35 @@ func (m *Manager) Apply(config domain.AgentConfig) error {
 
 	m.mu.Lock()
 	old := m.crons
-	m.crons = make([]*cron.Cron, 0, len(prepared))
-	for _, item := range prepared {
-		m.crons = append(m.crons, item.cron)
-	}
+	m.crons = append([]*cron.Cron(nil), prepared...)
 	m.mu.Unlock()
 	for _, runner := range old {
 		runner.Stop()
 	}
-	for _, item := range prepared {
-		item.cron.Start()
+	for _, runner := range prepared {
+		runner.Start()
 	}
 	m.logger.Info("applied agent configuration", "revision", config.Revision, "projects", len(config.Projects))
 	return nil
+}
+
+func (m *Manager) operationCron(project domain.AgentProject, expression, timezone, operation string) (*cron.Cron, error) {
+	if err := schedule.Validate(expression, timezone); err != nil {
+		return nil, fmt.Errorf("project %s %s schedule: %w", project.ID, operation, err)
+	}
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		return nil, err
+	}
+	projectCopy := project
+	cronRunner := cron.New(cron.WithLocation(location), cron.WithParser(schedule.Parser))
+	if _, err := cronRunner.AddFunc(expression, func() {
+		scheduledAt := time.Now().UTC().Truncate(time.Minute)
+		go m.executeOperation(projectCopy, scheduledAt, operation)
+	}); err != nil {
+		return nil, fmt.Errorf("register project %s %s schedule: %w", project.ID, operation, err)
+	}
+	return cronRunner, nil
 }
 
 func (m *Manager) Stop() {
@@ -90,24 +114,27 @@ func (m *Manager) Stop() {
 	}
 }
 
-func (m *Manager) Manual(projectID, commandID string) error {
+func (m *Manager) Manual(projectID, commandID, commandType string) error {
 	config := m.state.Config()
 	for _, project := range config.Projects {
 		if project.ID != projectID {
 			continue
 		}
 		scheduledAt := time.Now().UTC()
-		go m.executeWithKey(project, scheduledAt, "manual:"+commandID)
+		if commandType != "backup" && commandType != "retention_preview" {
+			return fmt.Errorf("unsupported command type %q", commandType)
+		}
+		go m.executeWithKey(project, scheduledAt, "manual:"+commandID, commandType)
 		return nil
 	}
 	return fmt.Errorf("project %s is not present in applied configuration revision %d", projectID, config.Revision)
 }
 
-func (m *Manager) execute(project domain.AgentProject, scheduledAt time.Time) {
-	m.executeWithKey(project, scheduledAt, project.ID+":"+scheduledAt.UTC().Format(time.RFC3339))
+func (m *Manager) executeOperation(project domain.AgentProject, scheduledAt time.Time, operation string) {
+	m.executeWithKey(project, scheduledAt, project.ID+":"+operation+":"+scheduledAt.UTC().Format(time.RFC3339), operation)
 }
 
-func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.Time, idempotencyKey string) {
+func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.Time, idempotencyKey, operation string) {
 	runID := deterministicRunID(idempotencyKey)
 	now := time.Now().UTC()
 	report := domain.RunReport{
@@ -117,6 +144,7 @@ func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.T
 		ScheduledAt:    scheduledAt,
 		StartedAt:      now,
 		Status:         domain.RunRunning,
+		Stats:          map[string]any{"operation": operation},
 	}
 	claimed, err := m.state.BeginRun(report)
 	if err != nil {
@@ -152,7 +180,19 @@ func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.T
 		return
 	}
 	defer release()
-	result := m.runner.Execute(ctx, m.identity.AgentID, project)
+	var result RunResult
+	switch operation {
+	case "retention_preview":
+		result = m.runner.PreviewRetention(ctx, m.identity.AgentID, project)
+	case "retention":
+		result = m.runner.ApplyRetention(ctx, m.identity.AgentID, project)
+	case "prune":
+		result = m.runner.Prune(ctx, project)
+	case "verification":
+		result = m.runner.Verify(ctx, project)
+	default:
+		result = m.runner.Execute(ctx, m.identity.AgentID, project)
+	}
 	finished := time.Now().UTC()
 	report.FinishedAt = &finished
 	report.Status = result.Status
@@ -164,7 +204,7 @@ func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.T
 		m.logger.Error("persist run result", "run_id", report.ID, "error", err)
 		return
 	}
-	m.logger.Info("backup run finished", "run_id", report.ID, "project_id", project.ID, "status", report.Status, "snapshot_id", report.SnapshotID)
+	m.logger.Info("agent operation finished", "operation", operation, "run_id", report.ID, "project_id", project.ID, "status", report.Status, "snapshot_id", report.SnapshotID)
 }
 
 func (m *Manager) acquireRepository(ctx context.Context, repositoryID string) (func(), error) {

@@ -82,6 +82,18 @@ type ProjectPolicy struct {
 	Backup       BackupPolicy       `json:"backup"`
 	Retention    RetentionPolicy    `json:"retention"`
 	Verification VerificationPolicy `json:"verification"`
+	Maintenance  MaintenancePolicy  `json:"maintenance"`
+}
+
+type MaintenancePolicy struct {
+	// Separate keeps repository maintenance out of the backup critical path.
+	// It is explicit so projects created before this capability retain their
+	// original post-backup behavior until they are edited.
+	Separate         bool   `json:"separate"`
+	Timezone         string `json:"timezone,omitempty"`
+	RetentionCron    string `json:"retention_cron,omitempty"`
+	PruneCron        string `json:"prune_cron,omitempty"`
+	VerificationCron string `json:"verification_cron,omitempty"`
 }
 
 type BackupPolicy struct {
@@ -92,14 +104,18 @@ type BackupPolicy struct {
 }
 
 type RetentionPolicy struct {
-	Enabled     bool `json:"enabled"`
-	KeepLast    int  `json:"keep_last"`
-	KeepHourly  int  `json:"keep_hourly"`
-	KeepDaily   int  `json:"keep_daily"`
-	KeepWeekly  int  `json:"keep_weekly"`
-	KeepMonthly int  `json:"keep_monthly"`
-	KeepYearly  int  `json:"keep_yearly"`
-	Prune       bool `json:"prune"`
+	Enabled bool `json:"enabled"`
+	// Mode is one of count, smart, gfs, or age. Empty values from older
+	// configurations are normalized to gfs by the control plane.
+	Mode        string `json:"mode"`
+	KeepLast    int    `json:"keep_last"`
+	KeepHourly  int    `json:"keep_hourly"`
+	KeepDaily   int    `json:"keep_daily"`
+	KeepWeekly  int    `json:"keep_weekly"`
+	KeepMonthly int    `json:"keep_monthly"`
+	KeepYearly  int    `json:"keep_yearly"`
+	KeepWithin  string `json:"keep_within,omitempty"`
+	Prune       bool   `json:"prune"`
 }
 
 type VerificationPolicy struct {

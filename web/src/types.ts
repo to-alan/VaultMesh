@@ -65,17 +65,26 @@ export interface ProjectPolicy {
   }
   retention: {
     enabled: boolean
+    mode: 'count' | 'smart' | 'gfs' | 'age'
     keep_last: number
     keep_hourly: number
     keep_daily: number
     keep_weekly: number
     keep_monthly: number
     keep_yearly: number
+    keep_within?: string
     prune: boolean
   }
   verification: {
     mode: 'off' | 'metadata' | 'subset' | 'full'
     read_data_subset?: string
+  }
+  maintenance: {
+    separate: boolean
+    timezone?: string
+    retention_cron?: string
+    prune_cron?: string
+    verification_cron?: string
   }
 }
 

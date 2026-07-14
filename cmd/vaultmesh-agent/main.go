@@ -128,12 +128,12 @@ func fetchCommands(ctx context.Context, client *agent.Client, manager *agent.Man
 		return
 	}
 	for _, command := range commands {
-		if command.Type != "backup" {
+		if command.Type != "backup" && command.Type != "retention_preview" {
 			logger.Error("reject unsupported command", "command_id", command.ID, "type", command.Type)
 			continue
 		}
-		if err := manager.Manual(command.ProjectID, command.ID); err != nil {
-			logger.Warn("defer manual backup command", "command_id", command.ID, "error", err)
+		if err := manager.Manual(command.ProjectID, command.ID, command.Type); err != nil {
+			logger.Warn("defer manual command", "command_id", command.ID, "type", command.Type, "error", err)
 		}
 	}
 }

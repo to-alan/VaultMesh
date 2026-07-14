@@ -358,6 +358,9 @@ func (s *Store) Dashboard(_ context.Context, since time.Time) (domain.Dashboard,
 		if report.StartedAt.Before(since) {
 			continue
 		}
+		if operation, _ := report.Stats["operation"].(string); operation != "" && operation != "backup" {
+			continue
+		}
 		switch report.Status {
 		case domain.RunSucceeded:
 			dashboard.RunsSucceeded++
