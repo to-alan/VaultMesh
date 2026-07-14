@@ -23,7 +23,7 @@ export interface Server {
 
 export interface Repository {
   id: string
-  server_id: string
+  provider: 'cloudflare_r2' | 's3_compatible'
   name: string
   url: string
   created_at: string
@@ -31,7 +31,7 @@ export interface Repository {
 
 export interface Source {
   id?: string
-  type: 'files' | 'mysql' | 'postgresql'
+  type: 'files' | 'mysql' | 'postgresql' | 'docker'
   paths?: string[]
   excludes?: string[]
   database?: {
@@ -39,6 +39,10 @@ export interface Source {
     port: number
     username: string
     database: string
+  }
+  docker?: {
+    containers: string[]
+    include_volumes: boolean
   }
   required: boolean
 }

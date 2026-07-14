@@ -50,7 +50,7 @@ func TestPostgresVerticalSlice(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = dataStore.CreateRepository(ctx, domain.Repository{
-		ID: repositoryID, ServerID: serverID, Name: "Repository", URL: "s3:https://example.invalid/bucket",
+		ID: repositoryID, Provider: "s3_compatible", Name: "Repository " + suffix, URL: "s3:https://example.invalid/bucket",
 		SecretCiphertext: []byte("v1:test"), CreatedAt: now,
 	})
 	if err != nil {

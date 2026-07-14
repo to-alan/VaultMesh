@@ -138,9 +138,6 @@ func (s *Store) ListServers(context.Context) ([]domain.Server, error) {
 func (s *Store) CreateRepository(_ context.Context, repository domain.Repository) (domain.Repository, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.servers[repository.ServerID]; !ok {
-		return domain.Repository{}, store.ErrNotFound
-	}
 	if _, ok := s.repositories[repository.ID]; ok {
 		return domain.Repository{}, store.ErrConflict
 	}
@@ -176,8 +173,7 @@ func (s *Store) CreateProject(_ context.Context, project domain.Project) (domain
 	if !ok {
 		return domain.Project{}, store.ErrNotFound
 	}
-	repository, ok := s.repositories[project.RepositoryID]
-	if !ok || repository.ServerID != project.ServerID {
+	if _, ok := s.repositories[project.RepositoryID]; !ok {
 		return domain.Project{}, store.ErrNotFound
 	}
 	if _, ok := s.projects[project.ID]; ok {
@@ -358,6 +354,11 @@ func cloneProject(project domain.Project) domain.Project {
 		if project.Sources[i].Database != nil {
 			database := *project.Sources[i].Database
 			project.Sources[i].Database = &database
+		}
+		if project.Sources[i].Docker != nil {
+			docker := *project.Sources[i].Docker
+			docker.Containers = append([]string(nil), docker.Containers...)
+			project.Sources[i].Docker = &docker
 		}
 	}
 	return project

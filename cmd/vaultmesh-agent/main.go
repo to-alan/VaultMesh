@@ -30,6 +30,7 @@ func main() {
 	resticPath := flag.String("restic", envOr("VAULTMESH_RESTIC_PATH", "restic"), "path to the restic executable")
 	mysqlDumpPath := flag.String("mysqldump", envOr("VAULTMESH_MYSQLDUMP_PATH", "mysqldump"), "path to the mysqldump executable")
 	pgDumpPath := flag.String("pg-dump", envOr("VAULTMESH_PG_DUMP_PATH", "pg_dump"), "path to the pg_dump executable")
+	dockerPath := flag.String("docker", envOr("VAULTMESH_DOCKER_PATH", "docker"), "path to the Docker CLI executable")
 	stagingRoot := flag.String("staging-root", os.Getenv("VAULTMESH_STAGING_ROOT"), "parent directory for protected temporary database dumps")
 	flag.Parse()
 	if strings.TrimSpace(*serverURL) == "" {
@@ -77,7 +78,7 @@ func main() {
 		logger.Info("agent enrolled", "agent_id", identity.AgentID)
 	}
 
-	runner := agent.NewRunnerWithTools(*resticPath, *mysqlDumpPath, *pgDumpPath, *stagingRoot)
+	runner := agent.NewRunnerWithTools(*resticPath, *mysqlDumpPath, *pgDumpPath, *dockerPath, *stagingRoot)
 	manager := agent.NewManager(state, runner, identity, logger)
 	if cached := state.Config(); cached.Revision > 0 || len(cached.Projects) > 0 {
 		if err := manager.Apply(cached); err != nil {

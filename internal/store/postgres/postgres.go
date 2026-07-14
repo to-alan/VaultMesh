@@ -2,7 +2,7 @@ package postgres
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,8 +16,8 @@ import (
 	"github.com/to-alan/vaultmesh/internal/store"
 )
 
-//go:embed migrations/001_initial.sql
-var initialMigration string
+//go:embed migrations/*.sql
+var migrationFiles embed.FS
 
 type Store struct {
 	pool *pgxpool.Pool
@@ -49,8 +49,21 @@ func (s *Store) Migrate(ctx context.Context) error {
 		return fmt.Errorf("acquire migration connection: %w", err)
 	}
 	defer connection.Release()
-	if _, err := connection.Conn().PgConn().Exec(ctx, initialMigration).ReadAll(); err != nil {
-		return fmt.Errorf("run database migration: %w", err)
+	entries, err := migrationFiles.ReadDir("migrations")
+	if err != nil {
+		return fmt.Errorf("list database migrations: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		migration, err := migrationFiles.ReadFile("migrations/" + entry.Name())
+		if err != nil {
+			return fmt.Errorf("read database migration %s: %w", entry.Name(), err)
+		}
+		if _, err := connection.Conn().PgConn().Exec(ctx, string(migration)).ReadAll(); err != nil {
+			return fmt.Errorf("run database migration %s: %w", entry.Name(), err)
+		}
 	}
 	return nil
 }
@@ -190,8 +203,8 @@ func (s *Store) ListServers(ctx context.Context) ([]domain.Server, error) {
 
 func (s *Store) CreateRepository(ctx context.Context, repository domain.Repository) (domain.Repository, error) {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO repositories (id, server_id, name, url, secret_ciphertext, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)`, repository.ID, repository.ServerID,
+		INSERT INTO repositories (id, provider, name, url, secret_ciphertext, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)`, repository.ID, repository.Provider,
 		repository.Name, repository.URL, repository.SecretCiphertext, repository.CreatedAt)
 	if err != nil {
 		return domain.Repository{}, mapError(err)
@@ -201,7 +214,7 @@ func (s *Store) CreateRepository(ctx context.Context, repository domain.Reposito
 
 func (s *Store) ListRepositories(ctx context.Context) ([]domain.Repository, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, server_id, name, url, created_at
+		SELECT id, provider, name, url, created_at
 		FROM repositories ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -210,7 +223,7 @@ func (s *Store) ListRepositories(ctx context.Context) ([]domain.Repository, erro
 	var result []domain.Repository
 	for rows.Next() {
 		var repository domain.Repository
-		if err := rows.Scan(&repository.ID, &repository.ServerID, &repository.Name, &repository.URL, &repository.CreatedAt); err != nil {
+		if err := rows.Scan(&repository.ID, &repository.Provider, &repository.Name, &repository.URL, &repository.CreatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, repository)
@@ -221,8 +234,8 @@ func (s *Store) ListRepositories(ctx context.Context) ([]domain.Repository, erro
 func (s *Store) GetRepository(ctx context.Context, id string) (domain.Repository, error) {
 	var repository domain.Repository
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, server_id, name, url, secret_ciphertext, created_at
-		FROM repositories WHERE id = $1`, id).Scan(&repository.ID, &repository.ServerID,
+		SELECT id, provider, name, url, secret_ciphertext, created_at
+		FROM repositories WHERE id = $1`, id).Scan(&repository.ID, &repository.Provider,
 		&repository.Name, &repository.URL, &repository.SecretCiphertext, &repository.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Repository{}, store.ErrNotFound
@@ -244,9 +257,9 @@ func (s *Store) CreateProject(ctx context.Context, project domain.Project) (doma
 		return domain.Project{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	var repositoryServerID string
-	err = tx.QueryRow(ctx, `SELECT server_id FROM repositories WHERE id = $1`, project.RepositoryID).Scan(&repositoryServerID)
-	if errors.Is(err, pgx.ErrNoRows) || repositoryServerID != project.ServerID {
+	var repositoryID string
+	err = tx.QueryRow(ctx, `SELECT id FROM repositories WHERE id = $1`, project.RepositoryID).Scan(&repositoryID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Project{}, store.ErrNotFound
 	}
 	if err != nil {
@@ -306,7 +319,7 @@ func (s *Store) DesiredConfig(ctx context.Context, serverID string) (domain.Agen
 	rows, err := s.pool.Query(ctx, `
 		SELECT p.id, p.server_id, p.repository_id, p.name, p.enabled, p.sources,
 		       p.schedule, p.revision, p.created_at, p.updated_at,
-		       r.id, r.server_id, r.name, r.url, r.secret_ciphertext, r.created_at
+		       r.id, r.provider, r.name, r.url, r.secret_ciphertext, r.created_at
 		FROM projects p
 		JOIN repositories r ON r.id = p.repository_id
 		WHERE p.server_id = $1 AND p.enabled = TRUE
@@ -321,7 +334,7 @@ func (s *Store) DesiredConfig(ctx context.Context, serverID string) (domain.Agen
 		var sources, schedule []byte
 		if err := rows.Scan(&item.ID, &item.ServerID, &item.RepositoryID, &item.Project.Name,
 			&item.Enabled, &sources, &schedule, &item.Revision, &item.Project.CreatedAt,
-			&item.Project.UpdatedAt, &item.Repository.ID, &item.Repository.ServerID,
+			&item.Project.UpdatedAt, &item.Repository.ID, &item.Repository.Provider,
 			&item.Repository.Name, &item.Repository.URL, &item.Repository.SecretCiphertext,
 			&item.Repository.CreatedAt); err != nil {
 			return domain.AgentConfig{}, err

@@ -29,18 +29,20 @@ type Runner struct {
 	resticPath    string
 	mysqlDumpPath string
 	pgDumpPath    string
+	dockerPath    string
 	stagingRoot   string
 }
 
 func NewRunner(resticPath string) *Runner {
-	return &Runner{resticPath: resticPath, mysqlDumpPath: "mysqldump", pgDumpPath: "pg_dump"}
+	return &Runner{resticPath: resticPath, mysqlDumpPath: "mysqldump", pgDumpPath: "pg_dump", dockerPath: "docker"}
 }
 
-func NewRunnerWithTools(resticPath, mysqlDumpPath, pgDumpPath, stagingRoot string) *Runner {
+func NewRunnerWithTools(resticPath, mysqlDumpPath, pgDumpPath, dockerPath, stagingRoot string) *Runner {
 	return &Runner{
 		resticPath:    resticPath,
 		mysqlDumpPath: mysqlDumpPath,
 		pgDumpPath:    pgDumpPath,
+		dockerPath:    dockerPath,
 		stagingRoot:   stagingRoot,
 	}
 }
@@ -267,6 +269,28 @@ func (r *Runner) prepareSources(ctx context.Context, sources []domain.Source) ([
 				return nil, nil, func() {}, fmt.Errorf("prepare %s source %s: %w", source.Type, source.ID, err)
 			}
 			paths = append(paths, output)
+		case "docker":
+			if source.Docker == nil {
+				cleanup()
+				return nil, nil, func() {}, fmt.Errorf("Docker source %s has no container configuration", source.ID)
+			}
+			directory, err := ensureStaging()
+			if err != nil {
+				cleanup()
+				return nil, nil, func() {}, err
+			}
+			dockerPaths, manifest, err := r.prepareDockerSource(ctx, *source.Docker)
+			if err != nil {
+				cleanup()
+				return nil, nil, func() {}, fmt.Errorf("prepare Docker source %s: %w", source.ID, err)
+			}
+			manifestPath := filepath.Join(directory, safeFilename(source.ID)+".docker.json")
+			if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+				cleanup()
+				return nil, nil, func() {}, fmt.Errorf("write Docker source manifest: %w", err)
+			}
+			paths = append(paths, manifestPath)
+			paths = append(paths, dockerPaths...)
 		default:
 			cleanup()
 			return nil, nil, func() {}, fmt.Errorf("source type %q is not supported by this agent version", source.Type)
@@ -277,6 +301,101 @@ func (r *Runner) prepareSources(ctx context.Context, sources []domain.Source) ([
 		return nil, nil, func() {}, errors.New("project contains no backup paths or database artifacts")
 	}
 	return paths, excludes, cleanup, nil
+}
+
+type dockerInspection struct {
+	ID     string `json:"Id"`
+	Name   string `json:"Name"`
+	Config struct {
+		Image string `json:"Image"`
+	} `json:"Config"`
+	State struct {
+		Status string `json:"Status"`
+	} `json:"State"`
+	Mounts []struct {
+		Type        string `json:"Type"`
+		Name        string `json:"Name,omitempty"`
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
+	} `json:"Mounts"`
+}
+
+type dockerManifestEntry struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Image  string `json:"image"`
+	Status string `json:"status"`
+	Mounts any    `json:"mounts"`
+}
+
+func (r *Runner) prepareDockerSource(ctx context.Context, source domain.DockerSource) ([]string, []byte, error) {
+	seenPaths := make(map[string]struct{})
+	var paths []string
+	manifest := make([]dockerManifestEntry, 0, len(source.Containers))
+	for _, container := range source.Containers {
+		command := exec.CommandContext(ctx, r.dockerPath, "inspect", "--type", "container", container)
+		var stderr limitedBuffer
+		stderr.limit = 4 << 10
+		command.Stderr = &stderr
+		output, err := command.Output()
+		if err != nil {
+			message := strings.TrimSpace(stderr.String())
+			if message == "" {
+				message = err.Error()
+			}
+			return nil, nil, fmt.Errorf("docker inspect %q failed: %s", container, truncate(message, 4096))
+		}
+		if len(output) > 4<<20 {
+			return nil, nil, fmt.Errorf("docker inspect %q returned more than 4 MiB", container)
+		}
+		var inspected []dockerInspection
+		if err := json.Unmarshal(output, &inspected); err != nil || len(inspected) != 1 {
+			return nil, nil, fmt.Errorf("docker inspect %q returned invalid JSON", container)
+		}
+		item := inspected[0]
+		manifest = append(manifest, dockerManifestEntry{
+			ID: item.ID, Name: strings.TrimPrefix(item.Name, "/"), Image: item.Config.Image,
+			Status: item.State.Status, Mounts: item.Mounts,
+		})
+		if !source.IncludeVolumes {
+			continue
+		}
+		for _, mount := range item.Mounts {
+			if mount.Type != "bind" && mount.Type != "volume" {
+				continue
+			}
+			cleaned, err := safeBackupPath(mount.Source)
+			if err != nil {
+				return nil, nil, fmt.Errorf("container %q mount %q: %w", container, mount.Destination, err)
+			}
+			if _, exists := seenPaths[cleaned]; exists {
+				continue
+			}
+			seenPaths[cleaned] = struct{}{}
+			paths = append(paths, cleaned)
+		}
+	}
+	encoded, err := json.MarshalIndent(map[string]any{
+		"format": "vaultmesh.docker-manifest.v1", "containers": manifest,
+	}, "", "  ")
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode Docker source manifest: %w", err)
+	}
+	return paths, encoded, nil
+}
+
+func safeBackupPath(value string) (string, error) {
+	cleaned := filepath.Clean(value)
+	if !filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("source path %q is not absolute", value)
+	}
+	if cleaned == "/" || cleaned == "/proc" || strings.HasPrefix(cleaned, "/proc/") ||
+		cleaned == "/sys" || strings.HasPrefix(cleaned, "/sys/") ||
+		cleaned == "/dev" || strings.HasPrefix(cleaned, "/dev/") {
+		return "", fmt.Errorf("source path %q is blocked by the agent safety policy", cleaned)
+	}
+	return cleaned, nil
 }
 
 func (r *Runner) dumpMySQL(ctx context.Context, directory, output string, database domain.DatabaseSource) error {

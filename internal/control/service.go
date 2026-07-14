@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,6 +30,8 @@ var allowedRepositoryEnvironment = map[string]struct{}{
 	"AWS_REGION":            {},
 	"AWS_CA_BUNDLE":         {},
 }
+
+var dockerContainerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 
 type Service struct {
 	store  store.Store
@@ -100,11 +103,15 @@ func (s *Service) Heartbeat(ctx context.Context, serverID string, heartbeat doma
 func (s *Service) CreateRepository(ctx context.Context, input domain.Repository) (domain.Repository, error) {
 	input.Name = strings.TrimSpace(input.Name)
 	input.URL = strings.TrimSpace(input.URL)
+	input.Provider = strings.TrimSpace(input.Provider)
 	if input.Name == "" || len(input.Name) > 100 {
 		return domain.Repository{}, validationError("name", "must contain 1 to 100 characters")
 	}
-	if input.ServerID == "" {
-		return domain.Repository{}, validationError("server_id", "is required")
+	if input.Provider == "" {
+		input.Provider = "s3_compatible"
+	}
+	if input.Provider != "cloudflare_r2" && input.Provider != "s3_compatible" {
+		return domain.Repository{}, validationError("provider", "must be cloudflare_r2 or s3_compatible")
 	}
 	if err := validateRepositoryURL(input.URL); err != nil {
 		return domain.Repository{}, validationError("url", err.Error())
@@ -116,6 +123,19 @@ func (s *Service) CreateRepository(ctx context.Context, input domain.Repository)
 		if _, ok := allowedRepositoryEnvironment[key]; !ok {
 			return domain.Repository{}, validationError("environment", fmt.Sprintf("variable %q is not allowed", key))
 		}
+	}
+	if input.Provider == "cloudflare_r2" {
+		endpoint, _ := url.Parse(strings.TrimPrefix(input.URL, "s3:"))
+		if endpoint == nil || !strings.HasSuffix(strings.ToLower(endpoint.Hostname()), ".r2.cloudflarestorage.com") {
+			return domain.Repository{}, validationError("url", "Cloudflare R2 endpoint must end with .r2.cloudflarestorage.com")
+		}
+		if input.Environment["AWS_ACCESS_KEY_ID"] == "" || input.Environment["AWS_SECRET_ACCESS_KEY"] == "" {
+			return domain.Repository{}, validationError("environment", "Cloudflare R2 requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+		}
+		if region := input.Environment["AWS_DEFAULT_REGION"]; region != "" && region != "auto" {
+			return domain.Repository{}, validationError("environment", "Cloudflare R2 region must be auto")
+		}
+		input.Environment["AWS_DEFAULT_REGION"] = "auto"
 	}
 	secretPayload, err := json.Marshal(struct {
 		Password    string            `json:"password"`
@@ -134,7 +154,7 @@ func (s *Service) CreateRepository(ctx context.Context, input domain.Repository)
 	}
 	repository := domain.Repository{
 		ID:               id,
-		ServerID:         input.ServerID,
+		Provider:         input.Provider,
 		Name:             input.Name,
 		URL:              input.URL,
 		SecretCiphertext: sealed,
@@ -179,8 +199,12 @@ func (s *Service) CreateProject(ctx context.Context, input domain.Project) (doma
 			if err := s.prepareDatabaseSource(source); err != nil {
 				return domain.Project{}, err
 			}
+		case "docker":
+			if err := prepareDockerSource(source); err != nil {
+				return domain.Project{}, err
+			}
 		default:
-			return domain.Project{}, validationError("sources.type", "must be files, mysql, or postgresql")
+			return domain.Project{}, validationError("sources.type", "must be files, mysql, postgresql, or docker")
 		}
 	}
 	if input.Schedule.Timezone == "" {
@@ -247,6 +271,7 @@ func (s *Service) DesiredConfig(ctx context.Context, serverID string) (domain.Ag
 		repository.Password = payload.Password
 		repository.Environment = payload.Environment
 		repository.SecretCiphertext = nil
+		repository.URL = strings.TrimRight(repository.URL, "/") + "/" + serverID
 		for sourceIndex := range config.Projects[index].Sources {
 			source := &config.Projects[index].Sources[sourceIndex]
 			if source.SecretCiphertext == "" {
@@ -322,6 +347,34 @@ func (s *Service) prepareDatabaseSource(source *domain.Source) error {
 	database.Password = ""
 	source.Paths = nil
 	source.Excludes = nil
+	source.Docker = nil
+	return nil
+}
+
+func prepareDockerSource(source *domain.Source) error {
+	if source.Docker == nil {
+		return validationError("sources.docker", "Docker configuration is required")
+	}
+	if len(source.Docker.Containers) == 0 || len(source.Docker.Containers) > 50 {
+		return validationError("sources.docker.containers", "must contain between 1 and 50 container names or IDs")
+	}
+	seen := make(map[string]struct{}, len(source.Docker.Containers))
+	containers := make([]string, 0, len(source.Docker.Containers))
+	for _, value := range source.Docker.Containers {
+		value = strings.TrimSpace(value)
+		if !dockerContainerName.MatchString(value) {
+			return validationError("sources.docker.containers", fmt.Sprintf("container %q has an invalid name or ID", value))
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		containers = append(containers, value)
+	}
+	source.Docker.Containers = containers
+	source.Paths = nil
+	source.Excludes = nil
+	source.Database = nil
 	return nil
 }
 

@@ -19,16 +19,16 @@ Content-Type: application/json
 {"name":"Hong Kong VPS"}
 ```
 
-## Create an S3-compatible Restic repository
+## Create a global Cloudflare R2 storage channel
 
 ```http
 POST /api/v1/repositories
 Content-Type: application/json
 
 {
-  "server_id": "srv_example",
+  "provider": "cloudflare_r2",
   "name": "R2 Main",
-  "url": "s3:https://ACCOUNT.r2.cloudflarestorage.com/bucket/server-prefix",
+  "url": "s3:https://ACCOUNT_ID.r2.cloudflarestorage.com/bucket/vaultmesh",
   "password": "a-unique-restic-repository-password",
   "environment": {
     "AWS_ACCESS_KEY_ID": "...",
@@ -38,7 +38,7 @@ Content-Type: application/json
 }
 ```
 
-Repository secrets are AES-256-GCM encrypted before being written to the metadata store. The response never returns them.
+Storage channels are global and are not bound to a server. When a project is delivered to an Agent, the Control Plane appends `/<server-id>` to the base URL so each server gets an isolated Restic repository path. Secrets are AES-256-GCM encrypted before being written to the metadata store, and the response never returns them. Use `provider: "s3_compatible"` with the vendor endpoint for MinIO or another compatible service.
 
 ## Create a file project
 
@@ -106,7 +106,37 @@ The password is replaced by AES-GCM ciphertext before the project JSON is persis
 
 For PostgreSQL, use `"type": "postgresql"` with the same `database` object. The Agent uses `pg_dump --format=custom` and a protected temporary password file.
 
-`sources` accepts multiple entries. A project may therefore combine application files and one or more database dumps in the same Restic snapshot. Every project response also includes a server-calculated `next_run_at` value based on its five-field Cron expression and IANA timezone:
+## Add Docker containers and mounted volumes
+
+```json
+{
+  "server_id": "srv_example",
+  "repository_id": "repo_example",
+  "name": "Container data",
+  "sources": [
+    {
+      "type": "docker",
+      "required": true,
+      "docker": {
+        "containers": ["application", "redis"],
+        "include_volumes": true
+      }
+    }
+  ],
+  "schedule": {
+    "cron": "0 3 * * *",
+    "timezone": "Asia/Shanghai",
+    "jitter_seconds": 300,
+    "max_runtime_seconds": 21600,
+    "missed_run_policy": "skip",
+    "concurrency_policy": "forbid"
+  }
+}
+```
+
+The Agent runs `docker inspect` for the explicitly configured containers, stores a sanitized manifest without container environment variables, and adds bind-mount and named-volume host paths to Restic. It does not stop containers or back up their writable layers. Database containers should use the MySQL/PostgreSQL source adapters for application-consistent logical dumps.
+
+`sources` accepts multiple entries. A project may therefore combine application files, Docker mounts and database dumps in the same Restic snapshot. Every project response also includes a server-calculated `next_run_at` value based on its five-field Cron expression and IANA timezone:
 
 ```json
 {

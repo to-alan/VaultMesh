@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 
 	var repository domain.Repository
 	requestJSON(t, handler, http.MethodPost, "/api/v1/repositories", "a-very-long-administrator-token", domain.Repository{
-		ServerID:    identity.AgentID,
+		Provider:    "s3_compatible",
 		Name:        "MinIO",
 		URL:         "s3:http://localhost:9000/backups/server",
 		Password:    "repository-password",
@@ -82,7 +83,10 @@ func TestControlPlaneVerticalSlice(t *testing.T) {
 		t.Fatalf("unexpected agent config: %#v", config)
 	}
 	if config.Projects[0].Repository.Password != "repository-password" {
-		t.Fatalf("repository secret was not delivered to its bound agent")
+		t.Fatalf("repository secret was not delivered to the assigned agent")
+	}
+	if !strings.HasSuffix(config.Projects[0].Repository.URL, "/"+identity.AgentID) {
+		t.Fatalf("repository channel was not scoped to its assigned server: %s", config.Projects[0].Repository.URL)
 	}
 	var command domain.Command
 	requestJSON(t, handler, http.MethodPost, "/api/v1/projects/"+project.ID+"/run", "a-very-long-administrator-token",
@@ -202,7 +206,7 @@ func TestDatabaseSourcePasswordIsSealedAtRestAndDeliveredOnlyToAgent(t *testing.
 		t.Fatal(err)
 	}
 	repository, err := service.CreateRepository(ctx, domain.Repository{
-		ServerID: identity.AgentID,
+		Provider: "s3_compatible",
 		Name:     "Repository",
 		URL:      "s3:http://localhost:9000/backups/database",
 		Password: "restic-password",
@@ -241,6 +245,53 @@ func TestDatabaseSourcePasswordIsSealedAtRestAndDeliveredOnlyToAgent(t *testing.
 	got := config.Projects[0].Sources[0]
 	if got.SecretCiphertext != "" || got.Database == nil || got.Database.Password != "database-password" {
 		t.Fatalf("agent did not receive decrypted database password: %#v", got)
+	}
+}
+
+func TestGlobalRepositoryCanBeAssignedToDockerProject(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	repository, err := service.CreateRepository(ctx, domain.Repository{
+		Name: "Global R2", URL: "s3:https://example.r2.cloudflarestorage.com/backups", Password: "restic-password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repository.Provider != "s3_compatible" {
+		t.Fatalf("unexpected default provider %q", repository.Provider)
+	}
+	enrollment, err := service.CreateServer(ctx, "Docker host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "docker-host", OS: "linux", Arch: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Docker volumes",
+		Sources: []domain.Source{{Type: "docker", Required: true, Docker: &domain.DockerSource{
+			Containers: []string{"app", "app"}, IncludeVolumes: true,
+		}}},
+		Schedule: domain.Schedule{Cron: "0 4 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if project.Sources[0].Docker == nil || len(project.Sources[0].Docker.Containers) != 1 {
+		t.Fatalf("Docker source was not normalized: %#v", project.Sources[0])
+	}
+	config, err := service.DesiredConfig(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Projects) != 1 || config.Projects[0].Repository.ID != repository.ID {
+		t.Fatalf("global repository was not delivered to assigned Agent: %#v", config)
 	}
 }
 

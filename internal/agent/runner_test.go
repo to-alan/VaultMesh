@@ -105,7 +105,7 @@ func TestRunnerCreatesMySQLLogicalDumpBeforeBackup(t *testing.T) {
 		},
 		Repository: domain.Repository{ID: "repo", URL: "s3:https://example.invalid/bucket", Password: "repository-secret"},
 	}
-	result := NewRunnerWithTools(restic, mysqldump, pgDump, stagingRoot).Execute(context.Background(), "srv", project)
+	result := NewRunnerWithTools(restic, mysqldump, pgDump, "docker", stagingRoot).Execute(context.Background(), "srv", project)
 	if result.Status != domain.RunSucceeded || result.SnapshotID != "mysql123" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
@@ -115,6 +115,56 @@ func TestRunnerCreatesMySQLLogicalDumpBeforeBackup(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("staging artifacts were not removed: %#v", entries)
+	}
+}
+
+func TestRunnerBacksUpDockerMountsAndSanitizedManifest(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell scripts")
+	}
+	directory := t.TempDir()
+	volume := filepath.Join(directory, "docker-volume")
+	if err := os.Mkdir(volume, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_DOCKER_VOLUME", volume)
+	restic := filepath.Join(directory, "fake-restic")
+	resticScript := "#!/bin/sh\n" +
+		"if [ \"$1\" = snapshots ]; then printf '%s\\n' '[]'; exit 0; fi\n" +
+		"found_volume=0; found_manifest=0\n" +
+		"for arg in \"$@\"; do\n" +
+		"  [ \"$arg\" = \"$FAKE_DOCKER_VOLUME\" ] && found_volume=1\n" +
+		"  case \"$arg\" in *.docker.json) found_manifest=1; grep -q 'db-password' \"$arg\" && exit 8;; esac\n" +
+		"done\n" +
+		"[ \"$found_volume\" = 1 ] && [ \"$found_manifest\" = 1 ] || exit 9\n" +
+		"printf '%s\\n' '{\"message_type\":\"summary\",\"snapshot_id\":\"docker123\"}'\n"
+	if err := os.WriteFile(restic, []byte(resticScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	docker := filepath.Join(directory, "fake-docker")
+	dockerScript := "#!/bin/sh\n" +
+		"printf '[{\"Id\":\"container-id\",\"Name\":\"/app\",\"Config\":{\"Image\":\"example/app:1\",\"Env\":[\"PASSWORD=db-password\"]},\"State\":{\"Status\":\"running\"},\"Mounts\":[{\"Type\":\"volume\",\"Name\":\"app-data\",\"Source\":\"%s\",\"Destination\":\"/data\",\"RW\":true}]}]\n' \"$FAKE_DOCKER_VOLUME\"\n"
+	if err := os.WriteFile(docker, []byte(dockerScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stagingRoot := filepath.Join(directory, "staging")
+	project := domain.AgentProject{
+		Project: domain.Project{ID: "prj_docker", Sources: []domain.Source{{
+			ID: "src_docker", Type: "docker", Required: true,
+			Docker: &domain.DockerSource{Containers: []string{"app"}, IncludeVolumes: true},
+		}}},
+		Repository: domain.Repository{ID: "repo", URL: "s3:https://example.invalid/bucket", Password: "repository-secret"},
+	}
+	result := NewRunnerWithTools(restic, "mysqldump", "pg_dump", docker, stagingRoot).Execute(context.Background(), "srv", project)
+	if result.Status != domain.RunSucceeded || result.SnapshotID != "docker123" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	entries, err := os.ReadDir(stagingRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("Docker staging artifacts were not removed: %#v", entries)
 	}
 }
 

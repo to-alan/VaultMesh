@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { APIError, api, getAPIBaseURL, getToken, setToken } from './api'
 import type { Dashboard, EnrollmentResult, Project, Repository, Run, Server } from './types'
 
 type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'runs'
-type SourceType = 'files' | 'mysql' | 'postgresql'
+type SourceType = 'files' | 'mysql' | 'postgresql' | 'docker'
 type ScheduleMode = 'daily' | 'weekly' | 'custom'
 
 interface ProjectSourceDraft {
@@ -18,6 +18,8 @@ interface ProjectSourceDraft {
   username: string
   password: string
   database: string
+  containers: string
+  include_volumes: boolean
 }
 
 let sourceSequence = 0
@@ -32,6 +34,11 @@ const activeTab = ref<Tab>('overview')
 const loading = ref(false)
 const error = ref('')
 const success = ref('')
+const nowEpoch = ref(Date.now())
+const lastUpdatedAt = ref<number | null>(null)
+const queuedProjectIDs = ref<Set<string>>(new Set())
+let clockTimer: number | undefined
+let refreshTimer: number | undefined
 
 const dashboard = ref<Dashboard>({
   servers_total: 0,
@@ -49,9 +56,13 @@ const enrollment = ref<EnrollmentResult | null>(null)
 
 const serverForm = reactive({ name: '' })
 const repositoryForm = reactive({
-  server_id: '',
+  provider: 'cloudflare_r2' as 'cloudflare_r2' | 's3_compatible',
   name: '',
-  url: '',
+  account_id: '',
+  jurisdiction: 'default' as 'default' | 'eu' | 'fedramp',
+  endpoint: '',
+  bucket: '',
+  prefix: 'vaultmesh',
   password: '',
   access_key: '',
   secret_key: '',
@@ -71,9 +82,11 @@ const projectForm = reactive({
   max_runtime_hours: 6,
 })
 
-const repositoriesForProject = computed(() =>
-  repositories.value.filter((repository) => repository.server_id === projectForm.server_id),
-)
+const repositoryURL = computed(buildRepositoryURL)
+const repositoryReady = computed(() => Boolean(
+  repositoryForm.name.trim() && repositoryURL.value && repositoryForm.password &&
+  repositoryForm.access_key && repositoryForm.secret_key,
+))
 
 const projectNames = computed(() => new Map(projects.value.map((project) => [project.id, project.name])))
 const projectCron = computed(buildProjectCron)
@@ -89,6 +102,15 @@ const attentionCount = computed(() => dashboard.value.runs_failed + dashboard.va
 const onlineRate = computed(() => dashboard.value.servers_total
   ? Math.round(dashboard.value.servers_online / dashboard.value.servers_total * 100)
   : 0)
+const nextScheduledProject = computed(() => projects.value
+  .filter((project) => project.next_run_at)
+  .map((project) => ({ project, at: new Date(project.next_run_at!).getTime() }))
+  .filter((item) => Number.isFinite(item.at) && item.at >= nowEpoch.value - 1000)
+  .sort((left, right) => left.at - right.at)[0])
+const nextBackupCountdown = computed(() => {
+  if (!nextScheduledProject.value) return '--:--:--'
+  return formatCountdown(Math.max(0, nextScheduledProject.value.at - nowEpoch.value))
+})
 
 const runTrend = computed(() => {
   const points = Array.from({ length: 7 }, (_, index) => {
@@ -183,6 +205,7 @@ async function loadAll() {
     repositories.value = repositoryResult.items ?? []
     projects.value = projectResult.items ?? []
     runs.value = runResult.items ?? []
+    lastUpdatedAt.value = Date.now()
     selectDefaults()
   } finally {
     loading.value = false
@@ -190,10 +213,9 @@ async function loadAll() {
 }
 
 function selectDefaults() {
-  if (!repositoryForm.server_id && servers.value.length) repositoryForm.server_id = servers.value[0].id
   if (!projectForm.server_id && servers.value.length) projectForm.server_id = servers.value[0].id
-  if (!repositoriesForProject.value.some((repository) => repository.id === projectForm.repository_id)) {
-    projectForm.repository_id = repositoriesForProject.value[0]?.id ?? ''
+  if (!repositories.value.some((repository) => repository.id === projectForm.repository_id)) {
+    projectForm.repository_id = repositories.value[0]?.id ?? ''
   }
 }
 
@@ -212,6 +234,7 @@ async function createServer() {
 
 async function createRepository() {
   await perform(async () => {
+    if (!repositoryReady.value) throw new Error('请完整填写仓库、Bucket 和访问凭据')
     const environment: Record<string, string> = {}
     if (repositoryForm.access_key) environment.AWS_ACCESS_KEY_ID = repositoryForm.access_key
     if (repositoryForm.secret_key) environment.AWS_SECRET_ACCESS_KEY = repositoryForm.secret_key
@@ -219,20 +242,23 @@ async function createRepository() {
     await api<Repository>('/api/v1/repositories', {
       method: 'POST',
       body: JSON.stringify({
-        server_id: repositoryForm.server_id,
+        provider: repositoryForm.provider,
         name: repositoryForm.name,
-        url: repositoryForm.url,
+        url: repositoryURL.value,
         password: repositoryForm.password,
         environment,
       }),
     })
     repositoryForm.name = ''
-    repositoryForm.url = ''
+    repositoryForm.account_id = ''
+    repositoryForm.endpoint = ''
+    repositoryForm.bucket = ''
+    repositoryForm.prefix = 'vaultmesh'
     repositoryForm.password = ''
     repositoryForm.access_key = ''
     repositoryForm.secret_key = ''
     await loadAll()
-    success.value = '仓库配置已加密保存。'
+    success.value = '独立备份仓库已加密保存，可分配给任意服务器上的项目。'
   })
 }
 
@@ -244,6 +270,16 @@ async function createProject() {
           type: source.type,
           paths: lines(source.paths),
           excludes: lines(source.excludes),
+          required: source.required,
+        }
+      }
+      if (source.type === 'docker') {
+        return {
+          type: source.type,
+          docker: {
+            containers: lines(source.containers),
+            include_volumes: source.include_volumes,
+          },
           required: source.required,
         }
       }
@@ -292,10 +328,12 @@ function newProjectSource(type: SourceType): ProjectSourceDraft {
     paths: '/etc',
     excludes: '',
     host: '127.0.0.1',
-    port: type === 'mysql' ? 3306 : 5432,
+    port: type === 'mysql' ? 3306 : type === 'postgresql' ? 5432 : 0,
     username: '',
     password: '',
     database: '',
+    containers: '',
+    include_volumes: true,
   }
 }
 
@@ -311,6 +349,38 @@ function changeSourceType(source: ProjectSourceDraft) {
   source.port = source.type === 'mysql' ? 3306 : source.type === 'postgresql' ? 5432 : 0
 }
 
+function buildRepositoryURL(): string {
+  const bucket = repositoryForm.bucket.trim()
+  if (!bucket) return ''
+  let endpoint = repositoryForm.endpoint.trim().replace(/\/+$/, '')
+  if (repositoryForm.provider === 'cloudflare_r2') {
+    const accountID = repositoryForm.account_id.trim()
+    if (!accountID) return ''
+    const jurisdiction = repositoryForm.jurisdiction === 'default' ? '' : `.${repositoryForm.jurisdiction}`
+    endpoint = `https://${accountID}${jurisdiction}.r2.cloudflarestorage.com`
+  }
+  if (!/^https?:\/\//.test(endpoint)) return ''
+  const prefix = repositoryForm.prefix.trim().replace(/^\/+|\/+$/g, '')
+  return `s3:${endpoint}/${bucket}${prefix ? `/${prefix}` : ''}`
+}
+
+function generateRepositoryPassword() {
+  error.value = ''
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  repositoryForm.password = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  success.value = '已生成 256 位 Restic 仓库密码。请另行安全保存，恢复时必须使用。'
+}
+
+function checkRepositoryConfiguration() {
+  error.value = ''
+  success.value = ''
+  if (!repositoryReady.value) {
+    error.value = '配置尚不完整：请检查名称、Account ID/Endpoint、Bucket、仓库密码和访问密钥。'
+    return
+  }
+  success.value = `配置格式有效，Restic 目标为 ${repositoryURL.value}`
+}
+
 function buildProjectCron(): string {
   if (projectForm.schedule_mode === 'custom') return projectForm.custom_cron.trim()
   const match = /^(\d{2}):(\d{2})$/.exec(projectForm.schedule_time)
@@ -323,8 +393,23 @@ function buildProjectCron(): string {
 async function runNow(project: Project) {
   await perform(async () => {
     await api(`/api/v1/projects/${encodeURIComponent(project.id)}/run`, { method: 'POST' })
+    queuedProjectIDs.value = new Set([...queuedProjectIDs.value, project.id])
     success.value = `已向 ${project.name} 所在 Agent 排队发送手动备份。`
+    window.setTimeout(() => {
+      const next = new Set(queuedProjectIDs.value)
+      next.delete(project.id)
+      queuedProjectIDs.value = next
+    }, 5000)
   })
+}
+
+async function refreshData() {
+  try {
+    await loadAll()
+    success.value = '运行数据已刷新。'
+  } catch (cause) {
+    showError(cause)
+  }
 }
 
 async function perform(operation: () => Promise<void>) {
@@ -377,6 +462,16 @@ function formatDuration(run: Run): string {
   return `${minutes}m ${seconds % 60}s`
 }
 
+function formatCountdown(milliseconds: number): string {
+  const totalSeconds = Math.floor(milliseconds / 1000)
+  const days = Math.floor(totalSeconds / 86400)
+  const hours = Math.floor(totalSeconds % 86400 / 3600)
+  const minutes = Math.floor(totalSeconds % 3600 / 60)
+  const seconds = totalSeconds % 60
+  const clock = [hours, minutes, seconds].map((value) => String(value).padStart(2, '0')).join(':')
+  return days ? `${days}天 ${clock}` : clock
+}
+
 function pageDescription(tab: Tab): string {
   return {
     overview: '运行态势、成功率与风险信号',
@@ -405,8 +500,16 @@ function repositoryName(id: string): string {
   return repositories.value.find((repository) => repository.id === id)?.name ?? id
 }
 
+function repositoryUsageCount(id: string): number {
+  return projects.value.filter((project) => project.repository_id === id).length
+}
+
+function providerLabel(provider: Repository['provider']): string {
+  return provider === 'cloudflare_r2' ? 'Cloudflare R2' : 'S3 兼容存储'
+}
+
 function sourceTypeLabel(type: SourceType): string {
-  return { files: '文件与目录', mysql: 'MySQL', postgresql: 'PostgreSQL' }[type]
+  return { files: '文件与目录', mysql: 'MySQL', postgresql: 'PostgreSQL', docker: 'Docker' }[type]
 }
 
 function sourceSummary(source: Project['sources'][number]): string {
@@ -414,6 +517,10 @@ function sourceSummary(source: Project['sources'][number]): string {
     const paths = source.paths ?? []
     const visible = paths.slice(0, 2).join(', ')
     return `文件 · ${visible || '未配置路径'}${paths.length > 2 ? ` +${paths.length - 2}` : ''}`
+  }
+  if (source.type === 'docker') {
+    const containers = source.docker?.containers ?? []
+    return `Docker · ${containers.slice(0, 2).join(', ') || '未配置容器'}${containers.length > 2 ? ` +${containers.length - 2}` : ''}`
   }
   const database = source.database
   if (!database) return sourceTypeLabel(source.type)
@@ -463,6 +570,10 @@ function installCommand(result: EnrollmentResult): string {
 }
 
 onMounted(async () => {
+  clockTimer = window.setInterval(() => { nowEpoch.value = Date.now() }, 1000)
+  refreshTimer = window.setInterval(() => {
+    if (authenticated.value && !loading.value) void loadAll().catch(showError)
+  }, 30000)
   if (!authenticated.value) return
   try {
     await loadAll()
@@ -470,6 +581,11 @@ onMounted(async () => {
     if (cause instanceof APIError && cause.status === 401) logout()
     showError(cause)
   }
+})
+
+onBeforeUnmount(() => {
+  if (clockTimer) window.clearInterval(clockTimer)
+  if (refreshTimer) window.clearInterval(refreshTimer)
 })
 </script>
 
@@ -501,7 +617,7 @@ onMounted(async () => {
         <button v-for="item in ([
           ['overview', '运行总览', '01'], ['servers', '服务器', '02'], ['repositories', '备份仓库', '03'],
           ['projects', '备份项目', '04'], ['runs', '运行记录', '05'],
-        ] as [Tab, string, string][] )" :key="item[0]" :class="{ active: activeTab === item[0] }" @click="activeTab = item[0]">
+        ] as [Tab, string, string][] )" :key="item[0]" type="button" :class="{ active: activeTab === item[0] }" @click="activeTab = item[0]">
           <span class="nav-index">{{ item[2] }}</span><span class="nav-label">{{ item[1] }}</span><span v-if="navBadge(item[0])" class="nav-badge">{{ navBadge(item[0]) }}</span>
         </button>
       </nav>
@@ -511,8 +627,8 @@ onMounted(async () => {
         <small>Control Plane 与 Web 独立运行</small>
       </div>
       <div class="sidebar-footer">
-        <button class="ghost" @click="loadAll" :disabled="loading">{{ loading ? '同步中…' : '刷新' }}</button>
-        <button class="ghost" @click="logout">退出</button>
+        <button type="button" class="ghost" @click="refreshData" :disabled="loading">{{ loading ? '同步中…' : '刷新' }}</button>
+        <button type="button" class="ghost" @click="logout">退出</button>
       </div>
     </aside>
 
@@ -523,16 +639,16 @@ onMounted(async () => {
           <h1>{{ { overview: '备份总览', servers: '服务器', repositories: '备份仓库', projects: '备份项目', runs: '运行记录' }[activeTab] }}</h1>
           <p class="page-description">{{ pageDescription(activeTab) }}</p>
         </div>
-        <div class="topbar-status"><span class="scope-pill">LIVE DATA · 100 RUNS</span><span class="live-indicator"><i></i>{{ dashboard.servers_online }}/{{ dashboard.servers_total }} Agent 在线</span></div>
+        <div class="topbar-status"><button type="button" class="scope-pill interactive" :disabled="loading" @click="refreshData">{{ loading ? 'SYNCING…' : '刷新实时数据' }}</button><button type="button" class="live-indicator interactive" @click="activeTab = 'servers'"><i></i>{{ dashboard.servers_online }}/{{ dashboard.servers_total }} Agent 在线</button></div>
       </header>
 
-      <p v-if="error" class="message error">{{ error }}</p>
-      <p v-if="success" class="message success">{{ success }}</p>
+      <p v-if="error" class="message error" role="alert">{{ error }}</p>
+      <p v-if="success" class="message success" role="status" aria-live="polite">{{ success }}</p>
 
       <template v-if="activeTab === 'overview'">
         <div class="overview-strip">
           <div><span class="operational-dot"></span><strong>Backup operations</strong><small>基于最近 100 次运行和当前 Agent 心跳聚合</small></div>
-          <span>最近刷新 · {{ new Intl.DateTimeFormat('zh-CN', { timeStyle: 'medium' }).format(new Date()) }}</span>
+          <span>最近刷新 · {{ lastUpdatedAt ? new Intl.DateTimeFormat('zh-CN', { timeStyle: 'medium' }).format(new Date(lastUpdatedAt)) : '等待同步' }}</span>
         </div>
         <div class="metric-grid dense-metrics">
           <article class="metric"><header><span>AGENT HEALTH</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ dashboard.servers_online }}<small>/{{ dashboard.servers_total }}</small></strong><em>{{ onlineRate }}%</em></div><footer>在线节点 <span>{{ dashboard.servers_total - dashboard.servers_online }} 异常</span></footer></article>
@@ -540,6 +656,7 @@ onMounted(async () => {
           <article class="metric"><header><span>24H SNAPSHOTS</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ dashboard.runs_succeeded }}</strong><em>success</em></div><footer>有效快照 <span>{{ dashboard.runs_partial }} 次部分成功</span></footer></article>
           <article class="metric"><header><span>PROTECTED SOURCES</span><i class="metric-signal"></i></header><div class="metric-value"><strong>{{ protectedSourceCount }}</strong><em>{{ projects.length }} projects</em></div><footer>文件与数据库 <span>{{ repositories.length }} 个仓库</span></footer></article>
           <article class="metric" :class="{ alert: attentionCount > 0 }"><header><span>NEEDS ATTENTION</span><i class="metric-signal" :class="attentionCount ? 'bad' : 'good'"></i></header><div class="metric-value"><strong>{{ attentionCount }}</strong><em>24 hours</em></div><footer>失败或部分成功 <span>{{ attentionCount ? '需要处理' : '状态正常' }}</span></footer></article>
+          <article class="metric countdown-metric"><header><span>NEXT BACKUP</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ nextBackupCountdown }}</strong></div><footer><template v-if="nextScheduledProject"><span>{{ nextScheduledProject.project.name }}</span><span>{{ formatNextRun(nextScheduledProject.project) }}</span></template><template v-else><span>暂无已启用计划</span></template></footer></article>
         </div>
 
         <div class="dashboard-grid primary-dashboard">
@@ -618,22 +735,34 @@ onMounted(async () => {
       </template>
 
       <template v-else-if="activeTab === 'repositories'">
-        <div class="content-grid">
+        <section class="panel repository-guide">
+          <div class="panel-heading"><div><p class="eyebrow">CLOUDFLARE R2 ONBOARDING</p><h2>先在 Cloudflare 创建专用凭据</h2></div><a class="doc-link" href="https://dash.cloudflare.com/?to=/:account/r2/api-tokens" target="_blank" rel="noreferrer">打开 R2 API Tokens ↗</a></div>
+          <div class="guide-steps">
+            <article><span>1</span><div><strong>创建 Bucket</strong><small>Storage &amp; databases → R2 → Create bucket。建议每个环境使用独立 Bucket。</small></div></article>
+            <article><span>2</span><div><strong>创建 R2 API Token</strong><small>选择 Object Read &amp; Write，并限制到这个 Bucket；Restic 初始化、备份和清理都需要读写权限。</small></div></article>
+            <article><span>3</span><div><strong>只复制一次凭据</strong><small>保存 Access Key ID、Secret Access Key 和 Account ID。Secret 创建后无法再次查看。</small></div></article>
+          </div>
+          <p class="guide-note">R2 不是 AWS S3，但提供 S3 兼容 API。VaultMesh 使用标准 S3 凭据和 Restic S3 后端连接，R2 的 Region 固定使用 <code>auto</code>。</p>
+        </section>
+        <div class="content-grid repository-grid">
           <section class="panel">
-            <div class="panel-heading"><div><p class="eyebrow">RESTIC TARGETS</p><h2>仓库列表</h2></div></div>
+            <div class="panel-heading"><div><p class="eyebrow">STORAGE CHANNELS</p><h2>独立备份仓库</h2></div><span class="sample-size">{{ repositories.length }} CHANNELS</span></div>
             <div v-if="!repositories.length" class="empty-state">尚未配置仓库。</div>
-            <div v-else class="card-list"><article v-for="repository in repositories" :key="repository.id" class="data-card"><div><strong>{{ repository.name }}</strong><small>{{ serverName(repository.server_id) }}</small></div><code>{{ repository.url }}</code></article></div>
+            <div v-else class="card-list"><article v-for="repository in repositories" :key="repository.id" class="data-card repository-card"><div><strong>{{ repository.name }}</strong><small>{{ providerLabel(repository.provider) }} · 被 {{ repositoryUsageCount(repository.id) }} 个项目使用</small></div><span class="status-pill online">全局渠道</span><code>{{ repository.url }}</code></article></div>
           </section>
-          <aside class="panel form-panel wide-form"><p class="eyebrow">NEW REPOSITORY</p><h2>添加 S3 仓库</h2>
+          <aside class="panel form-panel wide-form"><p class="eyebrow">NEW STORAGE CHANNEL</p><h2>添加备份仓库</h2><p class="form-intro">仓库是全局存储渠道，不绑定服务器。创建项目时再选择由哪个 Agent 写入。</p>
             <form @submit.prevent="createRepository">
-              <label>服务器<select v-model="repositoryForm.server_id" required><option value="" disabled>选择服务器</option><option v-for="server in servers" :key="server.id" :value="server.id">{{ server.name }}</option></select></label>
-              <label>名称<input v-model="repositoryForm.name" required placeholder="R2 Main" /></label>
-              <label>Restic S3 URL<input v-model="repositoryForm.url" required placeholder="s3:https://ACCOUNT.r2.cloudflarestorage.com/bucket/prefix" /></label>
-              <label>Restic 仓库密码<input v-model="repositoryForm.password" type="password" required autocomplete="new-password" /></label>
-              <label>Access Key<input v-model="repositoryForm.access_key" autocomplete="off" /></label>
-              <label>Secret Key<input v-model="repositoryForm.secret_key" type="password" autocomplete="new-password" /></label>
-              <label>Region<input v-model="repositoryForm.region" placeholder="auto" /></label>
-              <button class="primary" :disabled="loading || !servers.length">加密并保存</button>
+              <div class="form-row"><label>存储类型<select v-model="repositoryForm.provider"><option value="cloudflare_r2">Cloudflare R2</option><option value="s3_compatible">其他 S3 兼容存储</option></select></label><label>渠道名称<input v-model="repositoryForm.name" required maxlength="100" placeholder="生产环境 R2" /></label></div>
+              <template v-if="repositoryForm.provider === 'cloudflare_r2'">
+                <div class="form-row"><label>Cloudflare Account ID<input v-model.trim="repositoryForm.account_id" required maxlength="64" autocomplete="off" placeholder="32 位 Account ID" /></label><label>数据管辖区<select v-model="repositoryForm.jurisdiction"><option value="default">默认 / Global</option><option value="eu">European Union (EU)</option><option value="fedramp">FedRAMP</option></select></label></div>
+              </template>
+              <label v-else>S3 Endpoint<input v-model.trim="repositoryForm.endpoint" required placeholder="https://s3.example.com" /></label>
+              <div class="form-row"><label>Bucket<input v-model.trim="repositoryForm.bucket" required placeholder="vaultmesh-backups" /></label><label>仓库目录前缀<input v-model.trim="repositoryForm.prefix" placeholder="vaultmesh" /><small class="field-help">可留空；用于在 Bucket 内隔离 Restic 数据。</small></label></div>
+              <div class="repository-preview"><span>RESTIC CHANNEL BASE</span><code>{{ repositoryURL || '填写 Account ID / Endpoint 与 Bucket 后自动生成' }}</code><small>下发给 Agent 时自动追加 <code>/&lt;server-id&gt;</code>，同一渠道中的不同服务器使用独立 Restic 仓库路径。</small></div>
+              <div class="form-row"><label>Access Key ID<input v-model.trim="repositoryForm.access_key" required autocomplete="off" /></label><label>Secret Access Key<input v-model="repositoryForm.secret_key" required type="password" autocomplete="new-password" /></label></div>
+              <label>Region<input v-model="repositoryForm.region" required :readonly="repositoryForm.provider === 'cloudflare_r2'" placeholder="auto" /><small class="field-help">Cloudflare R2 使用 <code>auto</code>；其他厂商按其 S3 文档填写。</small></label>
+              <label>Restic 仓库密码<div class="field-action"><input v-model="repositoryForm.password" type="password" required autocomplete="new-password" /><button type="button" class="ghost" @click="generateRepositoryPassword">安全生成</button></div><small class="field-help">它用于 Restic 端到端加密，和 R2 Secret Key 不是同一个密码；丢失后无法恢复快照。</small></label>
+              <div class="form-actions"><button type="button" class="ghost" @click="checkRepositoryConfiguration">检查配置</button><button class="primary" :disabled="loading || !repositoryReady">加密并保存渠道</button></div>
             </form>
           </aside>
         </div>
@@ -648,7 +777,7 @@ onMounted(async () => {
               <article v-for="project in projects" :key="project.id" class="project-card">
                 <div class="project-top">
                   <div><strong>{{ project.name }}</strong><small>{{ serverName(project.server_id) }} · {{ repositoryName(project.repository_id) }}</small></div>
-                  <div class="project-actions"><span class="status-pill online">Revision {{ project.revision }}</span><button class="ghost compact" :disabled="loading" @click="runNow(project)">立即备份</button></div>
+                  <div class="project-actions"><span class="status-pill online">Revision {{ project.revision }}</span><button type="button" class="ghost compact" :disabled="loading || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
                 </div>
                 <div class="project-source-list">
                   <span v-for="source in project.sources" :key="source.id" class="source-chip" :class="source.type">{{ sourceSummary(source) }}</span>
@@ -660,11 +789,11 @@ onMounted(async () => {
               </article>
             </div>
           </section>
-          <aside class="panel form-panel project-builder"><p class="eyebrow">NEW PROJECT</p><h2>创建备份项目</h2><p class="form-intro">一个项目可以组合文件、MySQL 和 PostgreSQL 数据源，并在同一个 Restic 快照中归档。</p>
+          <aside class="panel form-panel project-builder"><p class="eyebrow">NEW PROJECT</p><h2>创建备份项目</h2><p class="form-intro">一个项目可以组合文件、Docker、MySQL 和 PostgreSQL 数据源，并在同一个 Restic 快照中归档。</p>
             <form @submit.prevent="createProject">
               <section class="form-section">
                 <div class="section-title"><span>1</span><div><strong>基础信息</strong><small>选择 Agent 和快照写入位置</small></div></div>
-                <div class="form-row"><label>服务器<select v-model="projectForm.server_id" required @change="selectDefaults"><option value="" disabled>选择服务器</option><option v-for="server in servers" :key="server.id" :value="server.id">{{ server.name }}</option></select></label><label>备份仓库<select v-model="projectForm.repository_id" required><option value="" disabled>选择当前服务器的仓库</option><option v-for="repository in repositoriesForProject" :key="repository.id" :value="repository.id">{{ repository.name }}</option></select></label></div>
+                <div class="form-row"><label>执行服务器<select v-model="projectForm.server_id" required @change="selectDefaults"><option value="" disabled>选择运行备份的 Agent</option><option v-for="server in servers" :key="server.id" :value="server.id">{{ server.name }}</option></select></label><label>备份仓库<select v-model="projectForm.repository_id" required><option value="" disabled>选择独立存储渠道</option><option v-for="repository in repositories" :key="repository.id" :value="repository.id">{{ repository.name }} · {{ providerLabel(repository.provider) }}</option></select></label></div>
                 <label>项目名称<input v-model="projectForm.name" required maxlength="100" placeholder="例如：应用数据每日备份" /></label>
               </section>
 
@@ -672,10 +801,15 @@ onMounted(async () => {
                 <div class="section-title"><span>2</span><div><strong>备份内容</strong><small>可添加多个数据源；任一数据源失败会标记本次任务失败</small></div></div>
                 <article v-for="(source, index) in projectForm.sources" :key="source.key" class="source-editor">
                   <header><strong>数据源 {{ index + 1 }}</strong><button v-if="projectForm.sources.length > 1" type="button" class="text-button danger-text" @click="removeProjectSource(index)">移除</button></header>
-                  <label>类型<select v-model="source.type" @change="changeSourceType(source)"><option value="files">文件与目录</option><option value="mysql">MySQL 逻辑备份</option><option value="postgresql">PostgreSQL 逻辑备份</option></select></label>
+                  <label>类型<select v-model="source.type" @change="changeSourceType(source)"><option value="files">文件与目录</option><option value="docker">Docker 容器与挂载卷</option><option value="mysql">MySQL 逻辑备份</option><option value="postgresql">PostgreSQL 逻辑备份</option></select></label>
                   <template v-if="source.type === 'files'">
                     <label>绝对路径（每行一个）<textarea v-model="source.paths" rows="3" required placeholder="/etc&#10;/opt/app"></textarea></label>
                     <label>排除规则（每行一个）<textarea v-model="source.excludes" rows="2" placeholder="/opt/app/cache/**"></textarea></label>
+                  </template>
+                  <template v-else-if="source.type === 'docker'">
+                    <div class="database-note docker-note"><strong>Docker 挂载数据备份</strong><span>Agent 使用 <code>docker inspect</code> 解析 bind mounts 和 named volumes，并保存不含环境变量的容器清单。数据库容器仍建议同时添加数据库逻辑备份。</span></div>
+                    <label>容器名称或 ID（每行一个）<textarea v-model="source.containers" rows="3" required placeholder="nginx&#10;application&#10;redis"></textarea></label>
+                    <label class="check-row"><input v-model="source.include_volumes" type="checkbox" /><span><strong>包含挂载卷数据</strong><small>备份容器的 bind mounts 与 Docker named volumes；不会备份容器可写层，也不会自动停止容器。</small></span></label>
                   </template>
                   <template v-else>
                     <div class="database-note"><strong>{{ sourceTypeLabel(source.type) }} 逻辑备份</strong><span>Agent 将执行 {{ source.type === 'mysql' ? 'mysqldump' : 'pg_dump' }}，临时凭据和产物仅保存在目标服务器。</span></div>
@@ -684,7 +818,7 @@ onMounted(async () => {
                     <label>数据库密码<input v-model="source.password" required type="password" autocomplete="new-password" /><small class="field-help">提交后使用主密钥加密，管理 API 不会再次返回明文。</small></label>
                   </template>
                 </article>
-                <div class="source-add-row"><span>添加数据源</span><button type="button" class="ghost compact" @click="addProjectSource('files')">+ 文件</button><button type="button" class="ghost compact" @click="addProjectSource('mysql')">+ MySQL</button><button type="button" class="ghost compact" @click="addProjectSource('postgresql')">+ PostgreSQL</button></div>
+                <div class="source-add-row"><span>添加数据源</span><button type="button" class="ghost compact" @click="addProjectSource('files')">+ 文件</button><button type="button" class="ghost compact" @click="addProjectSource('docker')">+ Docker</button><button type="button" class="ghost compact" @click="addProjectSource('mysql')">+ MySQL</button><button type="button" class="ghost compact" @click="addProjectSource('postgresql')">+ PostgreSQL</button></div>
               </section>
 
               <section class="form-section">
@@ -695,7 +829,7 @@ onMounted(async () => {
                 <div class="form-row"><label>随机延迟<select v-model.number="projectForm.jitter_minutes"><option :value="0">不延迟</option><option :value="5">最多 5 分钟</option><option :value="10">最多 10 分钟</option><option :value="30">最多 30 分钟</option><option :value="60">最多 60 分钟</option></select></label><label>最长运行时间<select v-model.number="projectForm.max_runtime_hours"><option :value="1">1 小时</option><option :value="3">3 小时</option><option :value="6">6 小时</option><option :value="12">12 小时</option><option :value="24">24 小时</option></select></label></div>
                 <div class="schedule-preview"><span>计划预览</span><strong>{{ projectSchedulePreview }}</strong><code>{{ projectCron }}</code></div>
               </section>
-              <button class="primary" :disabled="loading || !repositoriesForProject.length">创建并下发</button>
+              <button class="primary" :disabled="loading || !servers.length || !repositories.length">创建并下发</button>
             </form>
           </aside>
         </div>

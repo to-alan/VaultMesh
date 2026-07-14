@@ -32,7 +32,7 @@ type Server struct {
 
 type Repository struct {
 	ID               string            `json:"id"`
-	ServerID         string            `json:"server_id"`
+	Provider         string            `json:"provider"`
 	Name             string            `json:"name"`
 	URL              string            `json:"url"`
 	Password         string            `json:"password,omitempty"`
@@ -47,8 +47,14 @@ type Source struct {
 	Paths            []string        `json:"paths,omitempty"`
 	Excludes         []string        `json:"excludes,omitempty"`
 	Database         *DatabaseSource `json:"database,omitempty"`
+	Docker           *DockerSource   `json:"docker,omitempty"`
 	SecretCiphertext string          `json:"secret_ciphertext,omitempty"`
 	Required         bool            `json:"required"`
+}
+
+type DockerSource struct {
+	Containers     []string `json:"containers"`
+	IncludeVolumes bool     `json:"include_volumes"`
 }
 
 type DatabaseSource struct {
