@@ -18,7 +18,7 @@ Please include the affected component, reproduction steps, expected impact, and 
 - Serve the Web console and API as same-site HTTPS origins, list only exact Web origins in `VAULTMESH_ALLOWED_ORIGINS`, never use a wildcard origin, and set `VAULTMESH_COOKIE_SECURE=true`.
 - Protect `.env` as a root-readable secret because it contains the administrator password, master key, and PostgreSQL password. Rotate those values if the file is exposed.
 - Administrator login uses a server-side session carried by an HttpOnly, SameSite cookie. The Web application does not store a bearer token. Agent enrollment and device credentials remain separate machine identities and must not be reused as administrator credentials.
-- Enable TOTP and store the one-time recovery codes outside the VaultMesh host. Adding or deleting a passkey requires the current password and, when enabled, a fresh second factor.
+- Enable TOTP and store the one-time recovery codes outside the VaultMesh host. Adding or deleting a passkey requires a session authenticated within the previous 10 minutes; stale sessions must reauthenticate with the current password and, when enabled, a fresh second factor.
 - Keep the WebAuthn RP ID stable and restrict RP origins to the exact HTTPS console origins. A reverse-proxy hostname change requires registering new passkeys before retiring the old hostname.
 - Keep `VAULTMESH_MASTER_KEY` separate from the PostgreSQL backup.
 - Treat a global storage channel as a trust boundary: scope its token to the minimum Bucket, do not share it across mutually untrusted servers, and use separate channels when credential isolation is required. VaultMesh automatically isolates Restic paths by server ID but cannot reduce the permissions of the underlying S3 token.

@@ -56,6 +56,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/auth/logout", s.logout)
 	mux.Handle("GET /api/v1/auth/session", s.admin(http.HandlerFunc(s.session)))
 	mux.Handle("GET /api/v1/profile", s.admin(http.HandlerFunc(s.profile)))
+	mux.Handle("POST /api/v1/profile/reauthenticate", s.admin(http.HandlerFunc(s.reauthenticate)))
 	mux.Handle("POST /api/v1/profile/password", s.admin(http.HandlerFunc(s.changePassword)))
 	mux.Handle("POST /api/v1/profile/totp/begin", s.admin(http.HandlerFunc(s.beginTOTP)))
 	mux.Handle("POST /api/v1/profile/totp/enable", s.admin(http.HandlerFunc(s.enableTOTP)))

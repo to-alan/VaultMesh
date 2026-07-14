@@ -104,4 +104,5 @@ export interface Profile {
   recovery_codes_remaining: number
   passkeys: Passkey[]
   webauthn_available: boolean
+  webauthn_rp_id: string
 }

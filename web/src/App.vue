@@ -6,6 +6,8 @@ import type { Dashboard, EnrollmentResult, Passkey, Profile, Project, Repository
 type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'runs' | 'profile'
 type SourceType = 'files' | 'mysql' | 'postgresql' | 'docker'
 type ScheduleMode = 'daily' | 'weekly' | 'custom'
+type SecurityModal = 'password' | 'totp-setup' | 'totp-manage' | 'passkey-add' | 'passkey-delete' | 'reauthenticate' | null
+type PendingPasskeyAction = 'add' | 'delete' | null
 
 interface ProjectSourceDraft {
   key: number
@@ -27,6 +29,7 @@ let sourceSequence = 0
 const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 const commonTimezones = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Tokyo', 'UTC', 'Europe/London', 'America/New_York']
 const apiBaseURL = getAPIBaseURL()
+const currentOrigin = window.location.origin
 
 const usernameInput = ref('admin')
 const passwordInput = ref('')
@@ -57,11 +60,16 @@ const repositories = ref<Repository[]>([])
 const projects = ref<Project[]>([])
 const runs = ref<Run[]>([])
 const enrollment = ref<EnrollmentResult | null>(null)
-const profile = ref<Profile>({ username: '', totp_enabled: false, recovery_codes_remaining: 0, passkeys: [], webauthn_available: false })
+const profile = ref<Profile>({ username: '', totp_enabled: false, recovery_codes_remaining: 0, passkeys: [], webauthn_available: false, webauthn_rp_id: '' })
 const totpSetup = ref<{ secret: string; qr_code: string } | null>(null)
 const recoveryCodes = ref<string[]>([])
 const totpActivationCode = ref('')
 const passkeyName = ref('')
+const securityModal = ref<SecurityModal>(null)
+const securityModalStep = ref<'start' | 'scan' | 'recovery'>('start')
+const selectedPasskey = ref<Passkey | null>(null)
+const pendingPasskeyAction = ref<PendingPasskeyAction>(null)
+const reauthenticationForm = reactive({ password: '', code: '' })
 
 const passwordForm = reactive({ current_password: '', new_password: '', confirm_password: '', verification_code: '' })
 const securityForm = reactive({ password: '', code: '' })
@@ -114,6 +122,9 @@ const attentionCount = computed(() => dashboard.value.runs_failed + dashboard.va
 const onlineRate = computed(() => dashboard.value.servers_total
   ? Math.round(dashboard.value.servers_online / dashboard.value.servers_total * 100)
   : 0)
+const passkeyEnvironmentReady = computed(() => Boolean(
+  profile.value.webauthn_available && window.isSecureContext && window.PublicKeyCredential && navigator.credentials,
+))
 const nextScheduledProject = computed(() => projects.value
   .filter((project) => project.next_run_at)
   .map((project) => ({ project, at: new Date(project.next_run_at!).getTime() }))
@@ -314,6 +325,7 @@ async function changePassword() {
     passwordForm.confirm_password = ''
     passwordForm.verification_code = ''
     success.value = '密码已修改，所有会话均已撤销，请使用新密码重新登录。'
+    securityModal.value = null
   })
 }
 
@@ -323,6 +335,7 @@ async function startTOTPSetup() {
       method: 'POST', body: JSON.stringify({ password: securityForm.password }),
     })
     recoveryCodes.value = []
+    securityModalStep.value = 'scan'
     success.value = '请用验证器扫描二维码，然后输入当前 6 位验证码完成启用。'
   })
 }
@@ -336,16 +349,19 @@ async function enableTOTP() {
     totpSetup.value = null
     totpActivationCode.value = ''
     await loadAll()
+    securityModalStep.value = 'recovery'
     success.value = '二步验证已启用。恢复码只展示这一次，请立即离线保存。'
   })
 }
 
 async function disableTOTP() {
   await perform(async () => {
+    if (!securityForm.password || !securityForm.code) throw new Error('请填写当前密码和验证器动态码')
     await api('/api/v1/profile/totp/disable', {
       method: 'POST', body: JSON.stringify(securityForm),
     })
     authenticated.value = false
+    securityModal.value = null
     success.value = '二步验证已停用，所有会话均已撤销，请重新登录。'
   })
 }
@@ -357,6 +373,7 @@ async function regenerateRecoveryCodes() {
     })
     recoveryCodes.value = result.recovery_codes
     await loadAll()
+    securityModalStep.value = 'recovery'
     success.value = '旧恢复码已失效。请立即保存这组新恢复码。'
   })
 }
@@ -364,28 +381,132 @@ async function regenerateRecoveryCodes() {
 async function registerPasskey() {
   await perform(async () => {
     if (!window.PublicKeyCredential || !navigator.credentials) throw new Error('当前浏览器不支持通行密钥')
-    const options = await api<any>('/api/v1/profile/passkeys/register/begin', {
-      method: 'POST', body: JSON.stringify({ name: passkeyName.value, password: securityForm.password, code: securityForm.code }),
-    })
-    const credential = await navigator.credentials.create({ publicKey: parseCreationOptions(options.publicKey) }) as PublicKeyCredential | null
+    let options: any
+    try {
+      options = await api<any>('/api/v1/profile/passkeys/register/begin', {
+        method: 'POST', body: JSON.stringify({ name: passkeyName.value || suggestedPasskeyName() }),
+      })
+    } catch (cause) {
+      if (cause instanceof APIError && cause.code === 'reauthentication_required') {
+        pendingPasskeyAction.value = 'add'
+        securityModal.value = 'reauthenticate'
+        return
+      }
+      throw cause
+    }
+    let credential: PublicKeyCredential | null
+    try {
+      credential = await navigator.credentials.create({ publicKey: parseCreationOptions(options.publicKey) }) as PublicKeyCredential | null
+    } catch (cause) {
+      throw friendlyPasskeyError(cause)
+    }
     if (!credential) throw new Error('通行密钥注册已取消')
     await api<Passkey>('/api/v1/profile/passkeys/register/finish', {
       method: 'POST', body: JSON.stringify(serializeRegistration(credential)),
     })
     passkeyName.value = ''
     await loadAll()
+    securityModal.value = null
     success.value = '通行密钥已注册，可在登录页直接使用。'
   })
 }
 
 async function deletePasskey(passkey: Passkey) {
   await perform(async () => {
-    await api(`/api/v1/profile/passkeys/${encodeURIComponent(passkey.id)}/delete`, {
-      method: 'POST', body: JSON.stringify(securityForm),
-    })
+    try {
+      await api(`/api/v1/profile/passkeys/${encodeURIComponent(passkey.id)}/delete`, { method: 'POST' })
+    } catch (cause) {
+      if (cause instanceof APIError && cause.code === 'reauthentication_required') {
+        selectedPasskey.value = passkey
+        pendingPasskeyAction.value = 'delete'
+        securityModal.value = 'reauthenticate'
+        return
+      }
+      throw cause
+    }
     await loadAll()
+    securityModal.value = null
     success.value = `已删除通行密钥“${passkey.name}”。`
   })
+}
+
+function openSecurityModal(modal: Exclude<SecurityModal, null>) {
+  error.value = ''
+  success.value = ''
+  securityModal.value = modal
+  securityModalStep.value = 'start'
+  if (modal === 'password') {
+    passwordForm.current_password = ''
+    passwordForm.new_password = ''
+    passwordForm.confirm_password = ''
+    passwordForm.verification_code = ''
+  }
+  if (modal === 'totp-setup') {
+    securityForm.password = ''
+    totpSetup.value = null
+    totpActivationCode.value = ''
+    recoveryCodes.value = []
+  }
+  if (modal === 'totp-manage') {
+    securityForm.password = ''
+    securityForm.code = ''
+    recoveryCodes.value = []
+  }
+  if (modal === 'passkey-add') passkeyName.value = suggestedPasskeyName()
+}
+
+function closeSecurityModal() {
+  if (loading.value) return
+  securityModal.value = null
+  selectedPasskey.value = null
+  pendingPasskeyAction.value = null
+  reauthenticationForm.password = ''
+  reauthenticationForm.code = ''
+  error.value = ''
+}
+
+function confirmPasskeyDeletion(passkey: Passkey) {
+  selectedPasskey.value = passkey
+  openSecurityModal('passkey-delete')
+}
+
+async function completeReauthentication() {
+  await perform(async () => {
+    await api('/api/v1/profile/reauthenticate', {
+      method: 'POST', body: JSON.stringify(reauthenticationForm),
+    })
+    const action = pendingPasskeyAction.value
+    const passkey = selectedPasskey.value
+    reauthenticationForm.password = ''
+    reauthenticationForm.code = ''
+    pendingPasskeyAction.value = null
+    if (action === 'add') {
+      securityModal.value = 'passkey-add'
+      await registerPasskey()
+    } else if (action === 'delete' && passkey) {
+      securityModal.value = 'passkey-delete'
+      await deletePasskey(passkey)
+    }
+  })
+}
+
+function suggestedPasskeyName(): string {
+  const nav = navigator as Navigator & { userAgentData?: { platform?: string } }
+  const platform = nav.userAgentData?.platform || navigator.platform || '当前设备'
+  return `${platform} · ${new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(new Date())}`
+}
+
+function friendlyPasskeyError(cause: unknown): Error {
+  if (!(cause instanceof DOMException)) return cause instanceof Error ? cause : new Error('通行密钥注册失败')
+  if (cause.name === 'InvalidStateError') return new Error('这台设备已经为 VaultMesh 注册过通行密钥，请使用现有密钥或换一台设备。')
+  if (cause.name === 'SecurityError') return new Error(`通行密钥域名校验失败：当前页面是 ${window.location.origin}，服务器 RP ID 是 ${profile.value.webauthn_rp_id || '未配置'}。`)
+  if (cause.name === 'NotAllowedError') return new Error('系统没有完成通行密钥创建：可能是你取消了操作、设备未设置锁屏，或浏览器等待超时。')
+  return new Error(`通行密钥注册失败：${cause.message || cause.name}`)
+}
+
+async function copyRecoveryCodes() {
+  await navigator.clipboard.writeText(recoveryCodes.value.join('\n'))
+  success.value = '恢复码已复制。请将它们保存到密码管理器或离线介质。'
 }
 
 function selectDefaults() {
@@ -888,7 +1009,7 @@ onBeforeUnmount(() => {
       <nav aria-label="主导航">
         <button v-for="item in ([
           ['overview', '运行总览', '01'], ['servers', '服务器', '02'], ['repositories', '备份仓库', '03'],
-          ['projects', '备份项目', '04'], ['runs', '运行记录', '05'], ['profile', '个人中心', '06'],
+          ['projects', '备份项目', '04'], ['runs', '运行记录', '05'],
         ] as [Tab, string, string][] )" :key="item[0]" type="button" :class="{ active: activeTab === item[0] }" @click="activeTab = item[0]">
           <span class="nav-index">{{ item[2] }}</span><span class="nav-label">{{ item[1] }}</span><span v-if="navBadge(item[0])" class="nav-badge">{{ navBadge(item[0]) }}</span>
         </button>
@@ -898,6 +1019,11 @@ onBeforeUnmount(() => {
         <code>{{ apiBaseURL.replace(/^https?:\/\//, '') }}</code>
         <small>Control Plane 与 Web 独立运行</small>
       </div>
+      <button type="button" class="sidebar-account" :class="{ active: activeTab === 'profile' }" @click="activeTab = 'profile'">
+        <span class="account-avatar">{{ (profile.username || 'A').slice(0, 1).toUpperCase() }}</span>
+        <span><strong>{{ profile.username || '管理员' }}</strong><small>个人中心与安全</small></span>
+        <span class="account-chevron">›</span>
+      </button>
       <div class="sidebar-footer">
         <button type="button" class="ghost" @click="refreshData" :disabled="loading">{{ loading ? '同步中…' : '刷新' }}</button>
         <button type="button" class="ghost" @click="logout">退出</button>
@@ -1127,44 +1253,71 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-else>
-        <div class="profile-summary-grid">
-          <article class="security-summary"><span>ACCOUNT</span><strong>{{ profile.username }}</strong><small>单管理员控制面账号</small></article>
-          <article class="security-summary" :class="{ enabled: profile.totp_enabled }"><span>TWO-STEP</span><strong>{{ profile.totp_enabled ? '已启用' : '未启用' }}</strong><small>{{ profile.totp_enabled ? `${profile.recovery_codes_remaining} 枚恢复码可用` : '建议立即启用验证器' }}</small></article>
-          <article class="security-summary" :class="{ enabled: profile.passkeys.length }"><span>PASSKEYS</span><strong>{{ profile.passkeys.length }}</strong><small>{{ profile.webauthn_available ? '可用于免密码登录' : '服务器尚未配置 WebAuthn' }}</small></article>
-        </div>
+        <section class="profile-identity panel">
+          <span class="profile-avatar">{{ (profile.username || 'A').slice(0, 1).toUpperCase() }}</span>
+          <div><p class="eyebrow">ADMINISTRATOR</p><h2>{{ profile.username }}</h2><small>VaultMesh 单管理员控制面账号</small></div>
+          <span class="account-state"><i></i>账号正常</span>
+        </section>
 
-        <div class="profile-grid">
-          <section class="panel security-panel">
-            <div class="panel-heading"><div><p class="eyebrow">PASSWORD</p><h2>修改登录密码</h2></div><span class="security-level">会撤销全部会话</span></div>
-            <form @submit.prevent="changePassword">
+        <section class="panel settings-panel">
+          <div class="settings-heading"><div><p class="eyebrow">SIGN-IN &amp; SECURITY</p><h2>登录与安全</h2><p>管理用于登录和确认敏感操作的方式。</p></div></div>
+          <div class="settings-list">
+            <article class="setting-row">
+              <span class="setting-icon">••</span>
+              <div><strong>登录密码</strong><small>建议使用密码管理器生成并保存独立密码。</small></div>
+              <span class="setting-status neutral">已设置</span>
+              <button type="button" class="ghost" @click="openSecurityModal('password')">修改</button>
+            </article>
+            <article class="setting-row">
+              <span class="setting-icon shield">◇</span>
+              <div><strong>验证器二步验证</strong><small>{{ profile.totp_enabled ? `登录时需要动态码，剩余 ${profile.recovery_codes_remaining} 枚恢复码。` : '使用验证器动态码保护密码登录。' }}</small></div>
+              <span class="setting-status" :class="profile.totp_enabled ? 'enabled' : 'warning'">{{ profile.totp_enabled ? '已启用' : '建议启用' }}</span>
+              <button type="button" class="ghost" @click="openSecurityModal(profile.totp_enabled ? 'totp-manage' : 'totp-setup')">{{ profile.totp_enabled ? '管理' : '设置' }}</button>
+            </article>
+            <article class="setting-row passkey-setting">
+              <span class="setting-icon passkey">◆</span>
+              <div><strong>通行密钥</strong><small>使用 Touch ID、Windows Hello、设备锁屏或 FIDO2 安全密钥登录。</small></div>
+              <span class="setting-status" :class="profile.passkeys.length ? 'enabled' : 'neutral'">{{ profile.passkeys.length ? `${profile.passkeys.length} 个` : '未设置' }}</span>
+              <button type="button" class="primary compact-action" :disabled="!passkeyEnvironmentReady" @click="openSecurityModal('passkey-add')">添加通行密钥</button>
+              <div v-if="profile.passkeys.length" class="credential-list">
+                <div v-for="passkey in profile.passkeys" :key="passkey.id">
+                  <span class="credential-device">◆</span><span><strong>{{ passkey.name }}</strong><small>{{ passkey.last_used_at ? `最近使用 ${formatDate(passkey.last_used_at)}` : `创建于 ${formatDate(passkey.created_at)}` }}</small></span><button type="button" class="text-button danger-text" @click="confirmPasskeyDeletion(passkey)">移除</button>
+                </div>
+              </div>
+              <p v-if="!passkeyEnvironmentReady" class="setting-warning">{{ profile.webauthn_available ? '当前页面不是安全上下文，通行密钥需要 HTTPS 或本机回环地址。' : '服务器尚未配置 WebAuthn RP ID 与可信 Origin。' }}</p>
+            </article>
+          </div>
+        </section>
+
+        <div v-if="securityModal" class="modal-backdrop" @click.self="closeSecurityModal">
+          <section class="security-dialog" role="dialog" aria-modal="true">
+            <header><div><p class="eyebrow">ACCOUNT SECURITY</p><h2>{{ securityModal === 'password' ? '修改密码' : securityModal === 'totp-setup' ? '设置二步验证' : securityModal === 'totp-manage' ? '管理二步验证' : securityModal === 'passkey-delete' ? '移除通行密钥' : securityModal === 'reauthenticate' ? '确认是你本人' : '添加通行密钥' }}</h2></div><button type="button" class="dialog-close" aria-label="关闭" @click="closeSecurityModal">×</button></header>
+            <p v-if="error" class="dialog-error">{{ error }}</p>
+
+            <form v-if="securityModal === 'password'" class="dialog-form" @submit.prevent="changePassword">
               <label>当前密码<input v-model="passwordForm.current_password" type="password" required autocomplete="current-password" /></label>
-              <div class="form-row"><label>新密码<input v-model="passwordForm.new_password" type="password" minlength="12" maxlength="72" required autocomplete="new-password" /></label><label>确认新密码<input v-model="passwordForm.confirm_password" type="password" minlength="12" maxlength="72" required autocomplete="new-password" /></label></div>
-              <label v-if="profile.totp_enabled">验证器或恢复码<input v-model.trim="passwordForm.verification_code" required autocomplete="one-time-code" placeholder="安全操作需要再次验证" /></label>
-              <button class="primary" :disabled="loading">修改密码并退出</button>
+              <label>新密码<input v-model="passwordForm.new_password" type="password" minlength="12" maxlength="72" required autocomplete="new-password" /></label>
+              <label>确认新密码<input v-model="passwordForm.confirm_password" type="password" minlength="12" maxlength="72" required autocomplete="new-password" /></label>
+              <label v-if="profile.totp_enabled">动态码或恢复码<input v-model.trim="passwordForm.verification_code" required autocomplete="one-time-code" /></label>
+              <div class="dialog-actions"><button type="button" class="ghost" @click="closeSecurityModal">取消</button><button class="primary" :disabled="loading">保存并退出所有会话</button></div>
             </form>
-          </section>
 
-          <section class="panel security-panel">
-            <div class="panel-heading"><div><p class="eyebrow">AUTHENTICATOR APP</p><h2>登录二步验证</h2></div><span class="status-pill" :class="profile.totp_enabled ? 'online' : 'offline'">{{ profile.totp_enabled ? '已启用' : '未启用' }}</span></div>
-            <template v-if="!profile.totp_enabled">
-              <p class="security-copy">支持 1Password、Bitwarden、Google Authenticator 等标准 TOTP 验证器。动态码只可使用一次。</p>
-              <form v-if="!totpSetup" @submit.prevent="startTOTPSetup"><label>当前密码<input v-model="securityForm.password" type="password" required autocomplete="current-password" /></label><button class="primary" :disabled="loading">开始设置</button></form>
-              <div v-else class="totp-setup"><img :src="totpSetup.qr_code" alt="TOTP 设置二维码" /><div><p>扫描二维码，或手动输入密钥：</p><code>{{ totpSetup.secret }}</code><form @submit.prevent="enableTOTP"><label>当前 6 位验证码<input v-model.trim="totpActivationCode" required inputmode="numeric" autocomplete="one-time-code" /></label><button class="primary" :disabled="loading">验证并启用</button></form></div></div>
+            <template v-else-if="securityModal === 'totp-setup'">
+              <form v-if="securityModalStep === 'start'" class="dialog-form" @submit.prevent="startTOTPSetup"><p class="dialog-copy">使用 1Password、Bitwarden、Google Authenticator 等验证器。先确认当前密码，然后扫描二维码。</p><label>当前密码<input v-model="securityForm.password" type="password" required autocomplete="current-password" /></label><div class="dialog-actions"><button type="button" class="ghost" @click="closeSecurityModal">取消</button><button class="primary" :disabled="loading">继续</button></div></form>
+              <div v-else-if="securityModalStep === 'scan' && totpSetup" class="totp-wizard"><img :src="totpSetup.qr_code" alt="TOTP 设置二维码" /><div><strong>用验证器扫描二维码</strong><p>无法扫描时，手动输入下面的密钥：</p><code>{{ totpSetup.secret }}</code><form class="dialog-form" @submit.prevent="enableTOTP"><label>验证器中的 6 位动态码<input v-model.trim="totpActivationCode" required inputmode="numeric" autocomplete="one-time-code" placeholder="000000" /></label><button class="primary" :disabled="loading">验证并启用</button></form></div></div>
+              <div v-else class="recovery-dialog"><span class="success-symbol">✓</span><h3>二步验证已启用</h3><p>恢复码只展示一次。每枚只能使用一次，请保存到密码管理器或离线介质。</p><div class="recovery-code-grid"><code v-for="code in recoveryCodes" :key="code">{{ code }}</code></div><div class="dialog-actions"><button type="button" class="ghost" @click="copyRecoveryCodes">复制全部</button><button type="button" class="primary" @click="closeSecurityModal">完成</button></div></div>
             </template>
-            <template v-else>
-              <p class="security-copy">登录密码通过后，还需要验证器动态码；恢复码可在无法访问验证器时单次使用。</p>
-              <form class="security-confirm" @submit.prevent="regenerateRecoveryCodes"><div class="form-row"><label>当前密码<input v-model="securityForm.password" type="password" required autocomplete="current-password" /></label><label>验证器动态码<input v-model.trim="securityForm.code" required autocomplete="one-time-code" /></label></div><div class="form-actions"><button type="button" class="ghost danger-ghost" :disabled="loading" @click="disableTOTP">停用二步验证</button><button class="ghost" :disabled="loading">生成新恢复码</button></div></form>
-            </template>
-            <div v-if="recoveryCodes.length" class="recovery-box"><div><strong>恢复码（仅展示一次）</strong><small>每枚只能使用一次，请保存在密码管理器或离线介质中。</small></div><code v-for="code in recoveryCodes" :key="code">{{ code }}</code></div>
-          </section>
 
-          <section class="panel security-panel passkey-panel">
-            <div class="panel-heading"><div><p class="eyebrow">WEBAUTHN</p><h2>通行密钥</h2></div><span class="sample-size">{{ profile.passkeys.length }}/12 KEYS</span></div>
-            <p class="security-copy">使用设备锁屏、Touch ID、Windows Hello 或硬件安全密钥登录。通行密钥是密码加二步验证之外的独立强认证路径。</p>
-            <div v-if="profile.passkeys.length" class="passkey-list"><article v-for="passkey in profile.passkeys" :key="passkey.id"><div class="passkey-icon">◆</div><div><strong>{{ passkey.name }}</strong><small>创建 {{ formatDate(passkey.created_at) }} · {{ passkey.last_used_at ? `最近使用 ${formatDate(passkey.last_used_at)}` : '尚未使用' }}</small></div><button type="button" class="ghost compact danger-ghost" :disabled="loading" @click="deletePasskey(passkey)">删除</button></article></div>
-            <div v-else class="empty-state compact-empty">尚未注册通行密钥。</div>
-            <form v-if="profile.webauthn_available" class="passkey-form" @submit.prevent="registerPasskey"><div class="form-row"><label>设备名称<input v-model="passkeyName" required maxlength="80" placeholder="例如：MacBook Touch ID" /></label><label>当前密码<input v-model="securityForm.password" type="password" required autocomplete="current-password" /></label></div><label v-if="profile.totp_enabled">敏感操作验证码<input v-model.trim="securityForm.code" required autocomplete="one-time-code" placeholder="注册或删除通行密钥时需要" /></label><button class="primary" :disabled="loading">注册这台设备</button></form>
-            <p v-else class="configuration-note">配置 <code>VAULTMESH_WEBAUTHN_RP_ID</code> 与可信 HTTPS Origin 后即可启用；localhost/127.0.0.1 可用于本地测试。</p>
+            <template v-else-if="securityModal === 'totp-manage'">
+              <div v-if="securityModalStep === 'recovery'" class="recovery-dialog"><h3>新的恢复码</h3><p>旧恢复码已失效，请立即保存新恢复码。</p><div class="recovery-code-grid"><code v-for="code in recoveryCodes" :key="code">{{ code }}</code></div><div class="dialog-actions"><button type="button" class="ghost" @click="copyRecoveryCodes">复制全部</button><button type="button" class="primary" @click="closeSecurityModal">完成</button></div></div>
+              <form v-else class="dialog-form" @submit.prevent="regenerateRecoveryCodes"><p class="dialog-copy">生成新恢复码或停用二步验证前，需要再次确认身份。</p><label>当前密码<input v-model="securityForm.password" type="password" required autocomplete="current-password" /></label><label>验证器动态码<input v-model.trim="securityForm.code" required autocomplete="one-time-code" placeholder="000000" /></label><div class="dialog-actions split"><button type="button" class="ghost danger-ghost" :disabled="loading" @click="disableTOTP">停用二步验证</button><button class="primary" :disabled="loading">更换恢复码</button></div></form>
+            </template>
+
+            <div v-else-if="securityModal === 'passkey-add'" class="passkey-dialog"><span class="large-passkey-icon">◆</span><h3>在这台设备上创建通行密钥</h3><p>继续后，浏览器会打开系统安全窗口。使用 Touch ID、Windows Hello、设备 PIN 或安全密钥完成确认。</p><dl><div><dt>名称</dt><dd>{{ passkeyName }}</dd></div><div><dt>当前 Origin</dt><dd>{{ currentOrigin }}</dd></div><div><dt>RP ID</dt><dd>{{ profile.webauthn_rp_id }}</dd></div></dl><div class="dialog-actions"><button type="button" class="ghost" @click="closeSecurityModal">取消</button><button type="button" class="primary" :disabled="loading" @click="registerPasskey">继续创建</button></div></div>
+
+            <div v-else-if="securityModal === 'passkey-delete' && selectedPasskey" class="confirm-dialog"><span class="warning-symbol">!</span><h3>移除“{{ selectedPasskey.name }}”？</h3><p>该设备将不能再使用这枚通行密钥登录，但设备密码管理器中的本地记录可能仍需单独删除。</p><div class="dialog-actions"><button type="button" class="ghost" @click="closeSecurityModal">取消</button><button type="button" class="primary danger-button" :disabled="loading" @click="deletePasskey(selectedPasskey)">确认移除</button></div></div>
+
+            <form v-else class="dialog-form" @submit.prevent="completeReauthentication"><p class="dialog-copy">上次身份确认已超过 10 分钟。继续修改通行密钥前，请重新验证。</p><label>当前密码<input v-model="reauthenticationForm.password" type="password" required autocomplete="current-password" /></label><label v-if="profile.totp_enabled">动态码或恢复码<input v-model.trim="reauthenticationForm.code" required autocomplete="one-time-code" placeholder="000000" /></label><div class="dialog-actions"><button type="button" class="ghost" @click="closeSecurityModal">取消</button><button class="primary" :disabled="loading">确认并继续</button></div></form>
           </section>
         </div>
       </template>

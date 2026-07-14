@@ -42,7 +42,38 @@ func (s *HTTPServer) profile(w http.ResponseWriter, _ *http.Request) {
 		"recovery_codes_remaining": len(s.adminAuth.security.RecoveryCodeHash),
 		"passkeys":                 passkeys,
 		"webauthn_available":       s.adminAuth.webAuthn != nil,
+		"webauthn_rp_id":           webAuthnRPID(s.adminAuth.webAuthn),
 	})
+}
+
+func (s *HTTPServer) reauthenticate(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Password string `json:"password"`
+		Code     string `json:"code"`
+	}
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	a := s.adminAuth
+	a.mu.Lock()
+	if bcrypt.CompareHashAndPassword(a.account.PasswordHash, []byte(input.Password)) != nil {
+		a.mu.Unlock()
+		s.writeError(w, http.StatusUnauthorized, "invalid_credentials", "current password is incorrect", nil)
+		return
+	}
+	if a.security.TOTPEnabled {
+		if err := a.verifySecondFactorLocked(r.Context(), input.Code, true, time.Now()); err != nil {
+			a.mu.Unlock()
+			s.writeError(w, http.StatusUnauthorized, "invalid_second_factor", "verification code is invalid", nil)
+			return
+		}
+	}
+	a.mu.Unlock()
+	if !a.markRecentlyAuthenticated(r, time.Now()) {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "administrator login required", nil)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *HTTPServer) changePassword(w http.ResponseWriter, r *http.Request) {
@@ -255,9 +286,7 @@ func (s *HTTPServer) beginPasskeyRegistration(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var input struct {
-		Name     string `json:"name"`
-		Password string `json:"password"`
-		Code     string `json:"code"`
+		Name string `json:"name"`
 	}
 	if !s.decodeJSON(w, r, &input) {
 		return
@@ -267,18 +296,11 @@ func (s *HTTPServer) beginPasskeyRegistration(w http.ResponseWriter, r *http.Req
 		s.writeError(w, http.StatusUnprocessableEntity, "invalid_passkey_name", "passkey name must contain 1 to 80 characters", nil)
 		return
 	}
-	if !s.adminAuth.authenticate(s.adminAuth.account.Username, input.Password) {
-		s.writeError(w, http.StatusUnauthorized, "invalid_credentials", "current password is incorrect", nil)
+	if !s.adminAuth.recentlyAuthenticated(r, time.Now()) {
+		s.writeError(w, http.StatusPreconditionRequired, "reauthentication_required", "confirm your identity before changing passkeys", nil)
 		return
 	}
 	s.adminAuth.mu.Lock()
-	if s.adminAuth.security.TOTPEnabled {
-		if err := s.adminAuth.verifySecondFactorLocked(r.Context(), input.Code, true, time.Now()); err != nil {
-			s.adminAuth.mu.Unlock()
-			s.writeError(w, http.StatusUnauthorized, "invalid_second_factor", "verification code is invalid", nil)
-			return
-		}
-	}
 	if len(s.adminAuth.security.Passkeys) >= maxPasskeys {
 		s.adminAuth.mu.Unlock()
 		s.writeError(w, http.StatusConflict, "passkey_limit", "the passkey limit has been reached", nil)
@@ -315,6 +337,7 @@ func (s *HTTPServer) finishPasskeyRegistration(w http.ResponseWriter, r *http.Re
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	credential, err := s.adminAuth.webAuthn.FinishRegistration(user, ceremony.Session, r)
 	if err != nil {
+		s.logger.Warn("passkey registration verification failed", "error", err)
 		s.writeError(w, http.StatusBadRequest, "webauthn_verification_failed", "passkey registration could not be verified", nil)
 		return
 	}
@@ -416,31 +439,18 @@ func (s *HTTPServer) finishPasskeyLogin(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *HTTPServer) deletePasskey(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		Password string `json:"password"`
-		Code     string `json:"code"`
-	}
-	if !s.decodeJSON(w, r, &input) {
-		return
-	}
 	credentialID, err := base64.RawURLEncoding.DecodeString(r.PathValue("passkeyID"))
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_passkey_id", "passkey ID is invalid", nil)
 		return
 	}
+	if !s.adminAuth.recentlyAuthenticated(r, time.Now()) {
+		s.writeError(w, http.StatusPreconditionRequired, "reauthentication_required", "confirm your identity before changing passkeys", nil)
+		return
+	}
 	a := s.adminAuth
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if bcrypt.CompareHashAndPassword(a.account.PasswordHash, []byte(input.Password)) != nil {
-		s.writeError(w, http.StatusUnauthorized, "invalid_credentials", "current password is incorrect", nil)
-		return
-	}
-	if a.security.TOTPEnabled {
-		if err := a.verifySecondFactorLocked(r.Context(), input.Code, true, time.Now()); err != nil {
-			s.writeError(w, http.StatusUnauthorized, "invalid_second_factor", "verification code is invalid", nil)
-			return
-		}
-	}
 	for index, passkey := range a.security.Passkeys {
 		if subtle.ConstantTimeCompare(credentialID, passkey.Credential.ID) == 1 {
 			a.security.Passkeys = append(a.security.Passkeys[:index], a.security.Passkeys[index+1:]...)
@@ -453,6 +463,13 @@ func (s *HTTPServer) deletePasskey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.writeError(w, http.StatusNotFound, "not_found", "passkey was not found", nil)
+}
+
+func webAuthnRPID(instance *webauthn.WebAuthn) string {
+	if instance == nil || instance.Config == nil {
+		return ""
+	}
+	return instance.Config.RPID
 }
 
 func (a *adminAuthenticator) saveCeremony(mode, name string, session webauthn.SessionData) (string, error) {

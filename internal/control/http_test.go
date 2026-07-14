@@ -275,6 +275,47 @@ func TestTOTPLoginAndOneTimeRecoveryCode(t *testing.T) {
 		map[string]string{"code": enabled.RecoveryCodes[0]}, http.StatusUnauthorized, nil)
 }
 
+func TestRecentAuthenticationRequiresSecondFactorWhenTOTPEnabled(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{8}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), AdminAuthConfig{
+		Username: testAdminUsername, Password: testAdminPassword,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := server.Handler()
+	adminCookie := loginAdmin(t, handler)
+	var setup struct {
+		Secret string `json:"secret"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/totp/begin", adminCookie,
+		map[string]string{"password": testAdminPassword}, http.StatusOK, &setup)
+	activationCode, err := totp.GenerateCode(setup.Secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/totp/enable", adminCookie,
+		map[string]string{"code": activationCode}, http.StatusOK, nil)
+
+	server.adminAuth.mu.Lock()
+	for token, session := range server.adminAuth.sessions {
+		session.AuthenticatedAt = time.Now().Add(-recentAuthTTL - time.Minute)
+		server.adminAuth.sessions[token] = session
+	}
+	server.adminAuth.mu.Unlock()
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/reauthenticate", adminCookie,
+		map[string]string{"password": testAdminPassword}, http.StatusUnauthorized, nil)
+	futureCode, err := totp.GenerateCode(setup.Secret, time.Now().Add(30*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/reauthenticate", adminCookie,
+		map[string]string{"password": testAdminPassword, "code": futureCode}, http.StatusNoContent, nil)
+}
+
 func TestPasskeyRegistrationBeginsWithDiscoverableCredentialPolicy(t *testing.T) {
 	sealer, err := secret.New(bytes.Repeat([]byte{9}, 32))
 	if err != nil {
@@ -299,11 +340,23 @@ func TestPasskeyRegistrationBeginsWithDiscoverableCredentialPolicy(t *testing.T)
 		} `json:"publicKey"`
 	}
 	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/passkeys/register/begin", adminCookie,
-		map[string]string{"name": "Test security key", "password": testAdminPassword}, http.StatusOK, &options)
+		map[string]string{"name": "Test security key"}, http.StatusOK, &options)
 	if options.PublicKey.Challenge == "" || options.PublicKey.AuthenticatorSelection.ResidentKey != "required" ||
 		options.PublicKey.AuthenticatorSelection.UserVerification != "required" {
 		t.Fatalf("unexpected passkey policy: %#v", options)
 	}
+	server.adminAuth.mu.Lock()
+	for token, session := range server.adminAuth.sessions {
+		session.AuthenticatedAt = time.Now().Add(-recentAuthTTL - time.Minute)
+		server.adminAuth.sessions[token] = session
+	}
+	server.adminAuth.mu.Unlock()
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/passkeys/register/begin", adminCookie,
+		map[string]string{"name": "Second key"}, http.StatusPreconditionRequired, nil)
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/reauthenticate", adminCookie,
+		map[string]string{"password": testAdminPassword}, http.StatusNoContent, nil)
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/passkeys/register/begin", adminCookie,
+		map[string]string{"name": "Second key"}, http.StatusOK, nil)
 }
 
 func beginMFALogin(t *testing.T, handler http.Handler) *http.Cookie {

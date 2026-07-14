@@ -31,6 +31,7 @@ const (
 	secureCeremonyCookie  = "__Host-vaultmesh_webauthn_ceremony"
 	defaultSessionTTL     = 12 * time.Hour
 	shortLivedAuthTTL     = 5 * time.Minute
+	recentAuthTTL         = 10 * time.Minute
 	maxAdminSessions      = 128
 	maxShortLivedSessions = 64
 	maxMFAAttempts        = 5
@@ -50,8 +51,9 @@ type AdminAuthConfig struct {
 }
 
 type adminSession struct {
-	Username  string
-	ExpiresAt time.Time
+	Username        string
+	ExpiresAt       time.Time
+	AuthenticatedAt time.Time
 }
 
 type pendingMFA struct {
@@ -217,7 +219,7 @@ func (a *adminAuthenticator) createSession(now time.Time) (string, adminSession,
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	session := adminSession{Username: a.account.Username, ExpiresAt: now.Add(a.sessionTTL)}
+	session := adminSession{Username: a.account.Username, ExpiresAt: now.Add(a.sessionTTL), AuthenticatedAt: now}
 	a.removeExpiredLocked(now)
 	if len(a.sessions) >= maxAdminSessions {
 		removeOldestSession(a.sessions)
@@ -280,6 +282,36 @@ func (a *adminAuthenticator) session(r *http.Request, now time.Time) (adminSessi
 		return adminSession{}, false
 	}
 	return session, true
+}
+
+func (a *adminAuthenticator) recentlyAuthenticated(r *http.Request, now time.Time) bool {
+	cookie, err := r.Cookie(a.cookieName())
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	tokenSum := sha256.Sum256([]byte(cookie.Value))
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	session, ok := a.sessions[tokenSum]
+	return ok && session.ExpiresAt.After(now) && !session.AuthenticatedAt.IsZero() &&
+		!session.AuthenticatedAt.After(now) && !now.After(session.AuthenticatedAt.Add(recentAuthTTL))
+}
+
+func (a *adminAuthenticator) markRecentlyAuthenticated(r *http.Request, now time.Time) bool {
+	cookie, err := r.Cookie(a.cookieName())
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	tokenSum := sha256.Sum256([]byte(cookie.Value))
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	session, ok := a.sessions[tokenSum]
+	if !ok || !session.ExpiresAt.After(now) {
+		return false
+	}
+	session.AuthenticatedAt = now
+	a.sessions[tokenSum] = session
+	return true
 }
 
 func (a *adminAuthenticator) deleteSession(r *http.Request) {
