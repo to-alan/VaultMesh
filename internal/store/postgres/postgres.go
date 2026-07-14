@@ -77,6 +77,36 @@ func (s *Store) Ping(ctx context.Context) error {
 
 func (s *Store) Close() { s.pool.Close() }
 
+func (s *Store) GetAdminAccount(ctx context.Context) (domain.AdminAccount, error) {
+	var account domain.AdminAccount
+	err := s.pool.QueryRow(ctx, `
+		SELECT username, password_hash, webauthn_user_id, security_data, created_at, updated_at
+		FROM admin_account WHERE id = 'admin'`).Scan(
+		&account.Username, &account.PasswordHash, &account.WebAuthnUserID,
+		&account.SecurityData, &account.CreatedAt, &account.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AdminAccount{}, store.ErrNotFound
+	}
+	return account, err
+}
+
+func (s *Store) SaveAdminAccount(ctx context.Context, account domain.AdminAccount) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO admin_account
+			(id, username, password_hash, webauthn_user_id, security_data, created_at, updated_at)
+		VALUES ('admin', $1, $2, $3, $4, $5, $6)
+		ON CONFLICT (id) DO UPDATE SET
+			username = EXCLUDED.username,
+			password_hash = EXCLUDED.password_hash,
+			webauthn_user_id = EXCLUDED.webauthn_user_id,
+			security_data = EXCLUDED.security_data,
+			updated_at = EXCLUDED.updated_at`,
+		account.Username, account.PasswordHash, account.WebAuthnUserID,
+		account.SecurityData, account.CreatedAt, account.UpdatedAt)
+	return mapError(err)
+}
+
 func (s *Store) CreateServer(ctx context.Context, server domain.Server, tokenHash []byte, expires time.Time) (domain.Server, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

@@ -28,7 +28,7 @@ type HTTPServer struct {
 type agentContextKey struct{}
 
 func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthConfig, allowedOrigins []string) (*HTTPServer, error) {
-	adminAuth, err := newAdminAuthenticator(adminConfig)
+	adminAuth, err := newAdminAuthenticator(context.Background(), service, adminConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -50,8 +50,20 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/meta", s.meta)
 	mux.HandleFunc("POST /api/v1/enroll", s.enrollAgent)
 	mux.HandleFunc("POST /api/v1/auth/login", s.login)
+	mux.HandleFunc("POST /api/v1/auth/totp", s.completeTOTPLogin)
+	mux.HandleFunc("POST /api/v1/auth/passkey/begin", s.beginPasskeyLogin)
+	mux.HandleFunc("POST /api/v1/auth/passkey/finish", s.finishPasskeyLogin)
 	mux.HandleFunc("POST /api/v1/auth/logout", s.logout)
 	mux.Handle("GET /api/v1/auth/session", s.admin(http.HandlerFunc(s.session)))
+	mux.Handle("GET /api/v1/profile", s.admin(http.HandlerFunc(s.profile)))
+	mux.Handle("POST /api/v1/profile/password", s.admin(http.HandlerFunc(s.changePassword)))
+	mux.Handle("POST /api/v1/profile/totp/begin", s.admin(http.HandlerFunc(s.beginTOTP)))
+	mux.Handle("POST /api/v1/profile/totp/enable", s.admin(http.HandlerFunc(s.enableTOTP)))
+	mux.Handle("POST /api/v1/profile/totp/disable", s.admin(http.HandlerFunc(s.disableTOTP)))
+	mux.Handle("POST /api/v1/profile/recovery-codes", s.admin(http.HandlerFunc(s.regenerateRecoveryCodes)))
+	mux.Handle("POST /api/v1/profile/passkeys/register/begin", s.admin(http.HandlerFunc(s.beginPasskeyRegistration)))
+	mux.Handle("POST /api/v1/profile/passkeys/register/finish", s.admin(http.HandlerFunc(s.finishPasskeyRegistration)))
+	mux.Handle("POST /api/v1/profile/passkeys/{passkeyID}/delete", s.admin(http.HandlerFunc(s.deletePasskey)))
 
 	mux.Handle("GET /api/v1/dashboard", s.admin(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /api/v1/servers", s.admin(http.HandlerFunc(s.listServers)))
@@ -102,6 +114,36 @@ func (s *HTTPServer) login(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusUnauthorized, "invalid_credentials", "username or password is incorrect", nil)
 		return
 	}
+	if s.adminAuth.totpEnabled() {
+		token, err := s.adminAuth.createPendingMFA(time.Now())
+		if err != nil {
+			s.logger.Error("create pending MFA session", "error", err)
+			s.writeError(w, http.StatusInternalServerError, "internal_error", "two-step login could not be started", nil)
+			return
+		}
+		s.adminAuth.setMFACookie(w, token)
+		s.writeJSON(w, http.StatusAccepted, map[string]any{"mfa_required": true})
+		return
+	}
+	s.issueAdminSession(w)
+}
+
+func (s *HTTPServer) completeTOTPLogin(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Code string `json:"code"`
+	}
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	if err := s.adminAuth.completePendingMFA(r.Context(), r, input.Code, time.Now()); err != nil {
+		s.writeError(w, http.StatusUnauthorized, "invalid_second_factor", "verification code is invalid or the login attempt expired", nil)
+		return
+	}
+	s.adminAuth.clearCookie(w, s.adminAuth.mfaCookieName(), s.adminAuth.cookieSecure)
+	s.issueAdminSession(w)
+}
+
+func (s *HTTPServer) issueAdminSession(w http.ResponseWriter) {
 	token, session, err := s.adminAuth.createSession(time.Now())
 	if err != nil {
 		s.logger.Error("create administrator session", "error", err)

@@ -61,9 +61,12 @@ func main() {
 
 	service := control.NewService(dataStore, sealer)
 	httpServer, err := control.NewHTTPServer(service, logger, control.AdminAuthConfig{
-		Username:     config.AdminUsername,
-		Password:     config.AdminPassword,
-		CookieSecure: config.CookieSecure,
+		Username:          config.AdminUsername,
+		Password:          config.AdminPassword,
+		CookieSecure:      config.CookieSecure,
+		WebAuthnRPID:      config.WebAuthnRPID,
+		WebAuthnRPName:    config.WebAuthnRPName,
+		WebAuthnRPOrigins: config.WebAuthnRPOrigins,
 	}, config.AllowedOrigins)
 	if err != nil {
 		logger.Error("initialize administrator authentication", "error", err)

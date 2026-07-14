@@ -20,6 +20,7 @@ type enrollment struct {
 
 type Store struct {
 	mu           sync.RWMutex
+	admin        *domain.AdminAccount
 	servers      map[string]domain.Server
 	enrollments  map[string]enrollment
 	credentials  map[string]string
@@ -49,6 +50,23 @@ func New() *Store {
 
 func (s *Store) Ping(context.Context) error { return nil }
 func (s *Store) Close()                     {}
+
+func (s *Store) GetAdminAccount(context.Context) (domain.AdminAccount, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.admin == nil {
+		return domain.AdminAccount{}, store.ErrNotFound
+	}
+	return cloneAdminAccount(*s.admin), nil
+}
+
+func (s *Store) SaveAdminAccount(_ context.Context, account domain.AdminAccount) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cloned := cloneAdminAccount(account)
+	s.admin = &cloned
+	return nil
+}
 
 func (s *Store) CreateServer(_ context.Context, server domain.Server, tokenHash []byte, expires time.Time) (domain.Server, error) {
 	s.mu.Lock()
@@ -330,6 +348,13 @@ func (s *Store) Dashboard(_ context.Context, since time.Time) (domain.Dashboard,
 }
 
 func key(value []byte) string { return hex.EncodeToString(value) }
+
+func cloneAdminAccount(account domain.AdminAccount) domain.AdminAccount {
+	account.PasswordHash = append([]byte(nil), account.PasswordHash...)
+	account.WebAuthnUserID = append([]byte(nil), account.WebAuthnUserID...)
+	account.SecurityData = append([]byte(nil), account.SecurityData...)
+	return account
+}
 
 func publicRepository(repository domain.Repository) domain.Repository {
 	repository.Password = ""

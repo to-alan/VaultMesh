@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pquerna/otp/totp"
 	"github.com/to-alan/vaultmesh/internal/domain"
 	"github.com/to-alan/vaultmesh/internal/secret"
 	"github.com/to-alan/vaultmesh/internal/store/memory"
@@ -196,6 +197,138 @@ func TestAdminLoginRejectsInvalidCredentials(t *testing.T) {
 		"username": testAdminUsername,
 		"password": "wrong-password",
 	}, http.StatusUnauthorized, nil)
+}
+
+func TestAdministratorPasswordChangePersistsAndRevokesSession(t *testing.T) {
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{5}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	handler := newTestHTTPHandler(t, service, slog.Default(), false, nil)
+	cookie := loginAdmin(t, handler)
+	newPassword := "a-new-correct-horse-battery-staple"
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/password", cookie, map[string]string{
+		"current_password": testAdminPassword,
+		"new_password":     newPassword,
+	}, http.StatusNoContent, nil)
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/auth/session", cookie, nil, http.StatusUnauthorized, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/v1/auth/login", "", map[string]string{
+		"username": testAdminUsername, "password": testAdminPassword,
+	}, http.StatusUnauthorized, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/v1/auth/login", "", map[string]string{
+		"username": testAdminUsername, "password": newPassword,
+	}, http.StatusOK, nil)
+
+	// A new control-plane process must load the persisted account rather than
+	// overwriting it with the bootstrap environment password.
+	restarted := newTestHTTPHandler(t, service, slog.Default(), false, nil)
+	requestJSON(t, restarted, http.MethodPost, "/api/v1/auth/login", "", map[string]string{
+		"username": testAdminUsername, "password": newPassword,
+	}, http.StatusOK, nil)
+}
+
+func TestTOTPLoginAndOneTimeRecoveryCode(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{6}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false, nil)
+	adminCookie := loginAdmin(t, handler)
+
+	var setup struct {
+		Secret string `json:"secret"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/totp/begin", adminCookie,
+		map[string]string{"password": testAdminPassword}, http.StatusOK, &setup)
+	if setup.Secret == "" {
+		t.Fatal("TOTP setup did not return a secret")
+	}
+	activationCode, err := totp.GenerateCode(setup.Secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var enabled struct {
+		RecoveryCodes []string `json:"recovery_codes"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/totp/enable", adminCookie,
+		map[string]string{"code": activationCode}, http.StatusOK, &enabled)
+	if len(enabled.RecoveryCodes) != 10 {
+		t.Fatalf("expected 10 recovery codes, got %d", len(enabled.RecoveryCodes))
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/auth/logout", adminCookie, nil, http.StatusNoContent, nil)
+
+	mfaCookie := beginMFALogin(t, handler)
+	futureCode, err := totp.GenerateCode(setup.Secret, time.Now().Add(30*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/auth/totp", mfaCookie,
+		map[string]string{"code": futureCode}, http.StatusOK, nil)
+
+	mfaCookie = beginMFALogin(t, handler)
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/auth/totp", mfaCookie,
+		map[string]string{"code": enabled.RecoveryCodes[0]}, http.StatusOK, nil)
+	mfaCookie = beginMFALogin(t, handler)
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/auth/totp", mfaCookie,
+		map[string]string{"code": enabled.RecoveryCodes[0]}, http.StatusUnauthorized, nil)
+}
+
+func TestPasskeyRegistrationBeginsWithDiscoverableCredentialPolicy(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), AdminAuthConfig{
+		Username: testAdminUsername, Password: testAdminPassword,
+		WebAuthnRPID: "localhost", WebAuthnRPOrigins: []string{"http://localhost:3000"},
+	}, []string{"http://localhost:3000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := server.Handler()
+	adminCookie := loginAdmin(t, handler)
+	var options struct {
+		PublicKey struct {
+			Challenge              string `json:"challenge"`
+			AuthenticatorSelection struct {
+				ResidentKey      string `json:"residentKey"`
+				UserVerification string `json:"userVerification"`
+			} `json:"authenticatorSelection"`
+		} `json:"publicKey"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/passkeys/register/begin", adminCookie,
+		map[string]string{"name": "Test security key", "password": testAdminPassword}, http.StatusOK, &options)
+	if options.PublicKey.Challenge == "" || options.PublicKey.AuthenticatorSelection.ResidentKey != "required" ||
+		options.PublicKey.AuthenticatorSelection.UserVerification != "required" {
+		t.Fatalf("unexpected passkey policy: %#v", options)
+	}
+}
+
+func beginMFALogin(t *testing.T, handler http.Handler) *http.Cookie {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{"username": testAdminUsername, "password": testAdminPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(data))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	response := recorder.Result()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("expected MFA login challenge, got %d: %s", response.StatusCode, body)
+	}
+	for _, cookie := range response.Cookies() {
+		if cookie.Name == localMFACookie || cookie.Name == secureMFACookie {
+			return cookie
+		}
+	}
+	t.Fatal("MFA login did not set its opaque challenge cookie")
+	return nil
 }
 
 func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {

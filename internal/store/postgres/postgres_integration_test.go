@@ -33,6 +33,18 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	repositoryID := "repo_pg_" + suffix
 	commandID := "cmd_pg_" + suffix
 	now := time.Now().UTC()
+	admin := domain.AdminAccount{
+		Username: "admin-" + suffix, PasswordHash: []byte("hash-" + suffix),
+		WebAuthnUserID: []byte("user-handle-" + suffix), SecurityData: []byte("v1:security-" + suffix),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := dataStore.SaveAdminAccount(ctx, admin); err != nil {
+		t.Fatal(err)
+	}
+	loadedAdmin, err := dataStore.GetAdminAccount(ctx)
+	if err != nil || loadedAdmin.Username != admin.Username || string(loadedAdmin.SecurityData) != string(admin.SecurityData) {
+		t.Fatalf("administrator security data was not persisted: %#v err=%v", loadedAdmin, err)
+	}
 	enrollmentHash := sha256.Sum256([]byte("enrollment-" + suffix))
 	credentialHash := sha256.Sum256([]byte("credential-" + suffix))
 	_, err = dataStore.CreateServer(ctx, domain.Server{ID: serverID, Name: "Postgres integration", CreatedAt: now}, enrollmentHash[:], now.Add(time.Minute))

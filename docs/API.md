@@ -22,7 +22,13 @@ curl --fail --silent \
 
 `POST /api/v1/auth/logout` revokes the current session. Session cookies are HttpOnly, SameSite=Lax, non-persistent, and marked Secure when `VAULTMESH_COOKIE_SECURE=true`. Agent endpoints still use the device credential returned by one-time enrollment; this is machine identity and is deliberately separate from administrator login. Secrets and login passwords are accepted only over HTTPS in production.
 
+When TOTP is enabled, password login returns HTTP `202` with `{"mfa_required":true}` and an opaque five-minute challenge cookie. Complete it with `POST /api/v1/auth/totp` and `{"code":"123456"}`; a one-time recovery code is accepted in the same field. A pending challenge is rejected after five failed attempts. Passkey login uses the two-step `POST /api/v1/auth/passkey/begin` and `/finish` WebAuthn ceremony.
+
+Authenticated personal-security endpoints are grouped under `/api/v1/profile`: `GET /profile`, `POST /profile/password`, `/profile/totp/begin`, `/profile/totp/enable`, `/profile/totp/disable`, `/profile/recovery-codes`, and the `/profile/passkeys/...` registration/deletion ceremonies. TOTP secrets, recovery-code hashes, and WebAuthn credential records are encrypted at rest with `VAULTMESH_MASTER_KEY`. Recovery codes are returned only when created or regenerated.
+
 The API service does not serve the Web application. Configure the independently deployed, same-site Web origin in `VAULTMESH_ALLOWED_ORIGINS` and set the Web container's `VAULTMESH_API_BASE_URL` to the browser-visible API URL. Origins are matched exactly, credentialed CORS is enabled only for those origins, and wildcard CORS is intentionally unsupported.
+
+Passkeys additionally use `VAULTMESH_WEBAUTHN_RP_ID`, `VAULTMESH_WEBAUTHN_RP_ORIGINS`, and `VAULTMESH_WEBAUTHN_RP_NAME`. If omitted, RP ID/origins are derived from the first allowed Web origin. The RP ID is a hostname without scheme or port, and changing it after passkeys are enrolled makes those credentials unusable.
 
 ## Create a server and enrollment token
 

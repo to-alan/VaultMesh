@@ -9,14 +9,17 @@ import (
 )
 
 type Server struct {
-	ListenAddress  string
-	DatabaseURL    string
-	AdminUsername  string
-	AdminPassword  string
-	MasterKey      string
-	AllowedOrigins []string
-	CookieSecure   bool
-	AutoMigrate    bool
+	ListenAddress     string
+	DatabaseURL       string
+	AdminUsername     string
+	AdminPassword     string
+	MasterKey         string
+	AllowedOrigins    []string
+	CookieSecure      bool
+	WebAuthnRPID      string
+	WebAuthnRPName    string
+	WebAuthnRPOrigins []string
+	AutoMigrate       bool
 }
 
 func LoadServer() (Server, error) {
@@ -29,14 +32,26 @@ func LoadServer() (Server, error) {
 		return Server{}, err
 	}
 	config := Server{
-		ListenAddress:  envOr("VAULTMESH_LISTEN", ":8080"),
-		DatabaseURL:    strings.TrimSpace(os.Getenv("VAULTMESH_DATABASE_URL")),
-		AdminUsername:  strings.TrimSpace(os.Getenv("VAULTMESH_ADMIN_USERNAME")),
-		AdminPassword:  os.Getenv("VAULTMESH_ADMIN_PASSWORD"),
-		MasterKey:      strings.TrimSpace(os.Getenv("VAULTMESH_MASTER_KEY")),
-		AllowedOrigins: splitList(os.Getenv("VAULTMESH_ALLOWED_ORIGINS")),
-		CookieSecure:   cookieSecure,
-		AutoMigrate:    autoMigrate,
+		ListenAddress:     envOr("VAULTMESH_LISTEN", ":8080"),
+		DatabaseURL:       strings.TrimSpace(os.Getenv("VAULTMESH_DATABASE_URL")),
+		AdminUsername:     strings.TrimSpace(os.Getenv("VAULTMESH_ADMIN_USERNAME")),
+		AdminPassword:     os.Getenv("VAULTMESH_ADMIN_PASSWORD"),
+		MasterKey:         strings.TrimSpace(os.Getenv("VAULTMESH_MASTER_KEY")),
+		AllowedOrigins:    splitList(os.Getenv("VAULTMESH_ALLOWED_ORIGINS")),
+		CookieSecure:      cookieSecure,
+		AutoMigrate:       autoMigrate,
+		WebAuthnRPID:      strings.TrimSpace(os.Getenv("VAULTMESH_WEBAUTHN_RP_ID")),
+		WebAuthnRPName:    envOr("VAULTMESH_WEBAUTHN_RP_NAME", "VaultMesh"),
+		WebAuthnRPOrigins: splitList(os.Getenv("VAULTMESH_WEBAUTHN_RP_ORIGINS")),
+	}
+	if len(config.WebAuthnRPOrigins) == 0 {
+		config.WebAuthnRPOrigins = append([]string(nil), config.AllowedOrigins...)
+	}
+	if config.WebAuthnRPID == "" && len(config.WebAuthnRPOrigins) > 0 {
+		parsed, _ := url.Parse(config.WebAuthnRPOrigins[0])
+		if parsed != nil {
+			config.WebAuthnRPID = parsed.Hostname()
+		}
 	}
 	if config.AdminUsername == "" {
 		return Server{}, fmt.Errorf("VAULTMESH_ADMIN_USERNAME is required")
@@ -54,6 +69,14 @@ func LoadServer() (Server, error) {
 		if err := validateOrigin(origin); err != nil {
 			return Server{}, fmt.Errorf("VAULTMESH_ALLOWED_ORIGINS contains %q: %w", origin, err)
 		}
+	}
+	for _, origin := range config.WebAuthnRPOrigins {
+		if err := validateOrigin(origin); err != nil {
+			return Server{}, fmt.Errorf("VAULTMESH_WEBAUTHN_RP_ORIGINS contains %q: %w", origin, err)
+		}
+	}
+	if strings.Contains(config.WebAuthnRPID, "://") || strings.ContainsAny(config.WebAuthnRPID, "/:") {
+		return Server{}, fmt.Errorf("VAULTMESH_WEBAUTHN_RP_ID must be a hostname without scheme, path, or port")
 	}
 	return config, nil
 }

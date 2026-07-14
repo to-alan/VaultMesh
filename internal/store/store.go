@@ -19,6 +19,9 @@ type Store interface {
 	Ping(context.Context) error
 	Close()
 
+	GetAdminAccount(context.Context) (domain.AdminAccount, error)
+	SaveAdminAccount(context.Context, domain.AdminAccount) error
+
 	CreateServer(context.Context, domain.Server, []byte, time.Time) (domain.Server, error)
 	EnrollAgent(context.Context, []byte, []byte, domain.AgentInfo) (domain.Server, error)
 	AuthenticateAgent(context.Context, []byte) (domain.Server, error)

@@ -154,3 +154,14 @@ type Command struct {
 	Attempts   int        `json:"attempts"`
 	CreatedAt  time.Time  `json:"created_at"`
 }
+
+// AdminAccount is the single control-plane administrator identity. SecurityData
+// contains an authenticated-encryption envelope managed by the control service.
+type AdminAccount struct {
+	Username       string    `json:"username"`
+	PasswordHash   []byte    `json:"-"`
+	WebAuthnUserID []byte    `json:"-"`
+	SecurityData   []byte    `json:"-"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}

@@ -8,6 +8,7 @@ func TestLoadServerUsesUsernamePasswordAndStrictBooleanConfiguration(t *testing.
 	t.Setenv("VAULTMESH_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	t.Setenv("VAULTMESH_COOKIE_SECURE", "true")
 	t.Setenv("VAULTMESH_AUTO_MIGRATE", "false")
+	t.Setenv("VAULTMESH_ALLOWED_ORIGINS", "https://vault.example.com")
 
 	config, err := LoadServer()
 	if err != nil {
@@ -18,6 +19,9 @@ func TestLoadServerUsesUsernamePasswordAndStrictBooleanConfiguration(t *testing.
 	}
 	if !config.CookieSecure || config.AutoMigrate {
 		t.Fatalf("unexpected boolean configuration: %#v", config)
+	}
+	if config.WebAuthnRPID != "vault.example.com" || len(config.WebAuthnRPOrigins) != 1 {
+		t.Fatalf("WebAuthn defaults were not derived from the trusted origin: %#v", config)
 	}
 
 	t.Setenv("VAULTMESH_COOKIE_SECURE", "sometimes")

@@ -90,3 +90,18 @@ export interface EnrollmentResult {
   enrollment_token: string
   expires_at: string
 }
+
+export interface Passkey {
+  id: string
+  name: string
+  created_at: string
+  last_used_at?: string
+}
+
+export interface Profile {
+  username: string
+  totp_enabled: boolean
+  recovery_codes_remaining: number
+  passkeys: Passkey[]
+  webauthn_available: boolean
+}

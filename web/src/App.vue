@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { APIError, api, getAPIBaseURL } from './api'
-import type { Dashboard, EnrollmentResult, Project, Repository, Run, Server } from './types'
+import type { Dashboard, EnrollmentResult, Passkey, Profile, Project, Repository, Run, Server } from './types'
 
-type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'runs'
+type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'runs' | 'profile'
 type SourceType = 'files' | 'mysql' | 'postgresql' | 'docker'
 type ScheduleMode = 'daily' | 'weekly' | 'custom'
 
@@ -30,6 +30,8 @@ const apiBaseURL = getAPIBaseURL()
 
 const usernameInput = ref('admin')
 const passwordInput = ref('')
+const mfaCode = ref('')
+const mfaLoginRequired = ref(false)
 const authenticated = ref(false)
 const authReady = ref(false)
 const activeTab = ref<Tab>('overview')
@@ -55,6 +57,14 @@ const repositories = ref<Repository[]>([])
 const projects = ref<Project[]>([])
 const runs = ref<Run[]>([])
 const enrollment = ref<EnrollmentResult | null>(null)
+const profile = ref<Profile>({ username: '', totp_enabled: false, recovery_codes_remaining: 0, passkeys: [], webauthn_available: false })
+const totpSetup = ref<{ secret: string; qr_code: string } | null>(null)
+const recoveryCodes = ref<string[]>([])
+const totpActivationCode = ref('')
+const passkeyName = ref('')
+
+const passwordForm = reactive({ current_password: '', new_password: '', confirm_password: '', verification_code: '' })
+const securityForm = reactive({ password: '', code: '' })
 
 const serverForm = reactive({ name: '' })
 const repositoryForm = reactive({
@@ -171,19 +181,78 @@ const projectHealth = computed(() => projects.value.map((project) => {
   return { project, latest, status: latest?.status ?? 'unknown' }
 }).sort((left, right) => healthOrder(left.status) - healthOrder(right.status)))
 
+const projectGroups = computed(() => {
+  const assigned = new Set<string>()
+  const groups: { id: string; name: string; server?: Server; projects: Project[] }[] = servers.value.map((server) => {
+    const items = projects.value.filter((project) => project.server_id === server.id)
+    items.forEach((project) => assigned.add(project.id))
+    return { id: server.id, name: server.name, server, projects: items }
+  })
+  const detached = projects.value.filter((project) => !assigned.has(project.id))
+  if (detached.length) groups.push({ id: 'unknown', name: '未知服务器', projects: detached })
+  return groups
+})
+
 async function login() {
   error.value = ''
   loading.value = true
   try {
-    await api('/api/v1/auth/login', {
+    const result = await api<{ mfa_required?: boolean }>('/api/v1/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username: usernameInput.value.trim(), password: passwordInput.value }),
     })
+    if (result.mfa_required) {
+      mfaLoginRequired.value = true
+      passwordInput.value = ''
+      return
+    }
     authenticated.value = true
+    mfaLoginRequired.value = false
     passwordInput.value = ''
     await loadAll()
   } catch (cause) {
     authenticated.value = false
+    showError(cause)
+  } finally {
+    loading.value = false
+  }
+}
+
+async function completeMFA() {
+  error.value = ''
+  loading.value = true
+  try {
+    await api('/api/v1/auth/totp', { method: 'POST', body: JSON.stringify({ code: mfaCode.value }) })
+    authenticated.value = true
+    mfaLoginRequired.value = false
+    mfaCode.value = ''
+    await loadAll()
+  } catch (cause) {
+    showError(cause)
+  } finally {
+    loading.value = false
+  }
+}
+
+function cancelMFA() {
+  mfaLoginRequired.value = false
+  mfaCode.value = ''
+  error.value = ''
+}
+
+async function loginWithPasskey() {
+  error.value = ''
+  loading.value = true
+  try {
+    if (!window.PublicKeyCredential || !navigator.credentials) throw new Error('当前浏览器不支持通行密钥')
+    const options = await api<any>('/api/v1/auth/passkey/begin', { method: 'POST' })
+    const credential = await navigator.credentials.get({ publicKey: parseRequestOptions(options.publicKey) }) as PublicKeyCredential | null
+    if (!credential) throw new Error('通行密钥验证已取消')
+    await api('/api/v1/auth/passkey/finish', { method: 'POST', body: JSON.stringify(serializeAssertion(credential)) })
+    authenticated.value = true
+    mfaLoginRequired.value = false
+    await loadAll()
+  } catch (cause) {
     showError(cause)
   } finally {
     loading.value = false
@@ -197,6 +266,7 @@ async function logout() {
     // Clear the local UI state even if the API is temporarily unreachable.
   } finally {
     authenticated.value = false
+    mfaLoginRequired.value = false
     passwordInput.value = ''
     error.value = ''
   }
@@ -206,23 +276,116 @@ async function loadAll() {
   loading.value = true
   error.value = ''
   try {
-    const [dashboardResult, serverResult, repositoryResult, projectResult, runResult] = await Promise.all([
+    const [dashboardResult, serverResult, repositoryResult, projectResult, runResult, profileResult] = await Promise.all([
       api<Dashboard>('/api/v1/dashboard'),
       api<{ items: Server[] }>('/api/v1/servers'),
       api<{ items: Repository[] }>('/api/v1/repositories'),
       api<{ items: Project[] }>('/api/v1/projects'),
       api<{ items: Run[] }>('/api/v1/runs?limit=100'),
+      api<Profile>('/api/v1/profile'),
     ])
     dashboard.value = dashboardResult
     servers.value = serverResult.items ?? []
     repositories.value = repositoryResult.items ?? []
     projects.value = projectResult.items ?? []
     runs.value = runResult.items ?? []
+    profile.value = profileResult
     lastUpdatedAt.value = Date.now()
     selectDefaults()
   } finally {
     loading.value = false
   }
+}
+
+async function changePassword() {
+  await perform(async () => {
+    if (passwordForm.new_password !== passwordForm.confirm_password) throw new Error('两次输入的新密码不一致')
+    await api('/api/v1/profile/password', {
+      method: 'POST',
+      body: JSON.stringify({
+        current_password: passwordForm.current_password,
+        new_password: passwordForm.new_password,
+        verification_code: passwordForm.verification_code,
+      }),
+    })
+    authenticated.value = false
+    passwordForm.current_password = ''
+    passwordForm.new_password = ''
+    passwordForm.confirm_password = ''
+    passwordForm.verification_code = ''
+    success.value = '密码已修改，所有会话均已撤销，请使用新密码重新登录。'
+  })
+}
+
+async function startTOTPSetup() {
+  await perform(async () => {
+    totpSetup.value = await api('/api/v1/profile/totp/begin', {
+      method: 'POST', body: JSON.stringify({ password: securityForm.password }),
+    })
+    recoveryCodes.value = []
+    success.value = '请用验证器扫描二维码，然后输入当前 6 位验证码完成启用。'
+  })
+}
+
+async function enableTOTP() {
+  await perform(async () => {
+    const result = await api<{ recovery_codes: string[] }>('/api/v1/profile/totp/enable', {
+      method: 'POST', body: JSON.stringify({ code: totpActivationCode.value }),
+    })
+    recoveryCodes.value = result.recovery_codes
+    totpSetup.value = null
+    totpActivationCode.value = ''
+    await loadAll()
+    success.value = '二步验证已启用。恢复码只展示这一次，请立即离线保存。'
+  })
+}
+
+async function disableTOTP() {
+  await perform(async () => {
+    await api('/api/v1/profile/totp/disable', {
+      method: 'POST', body: JSON.stringify(securityForm),
+    })
+    authenticated.value = false
+    success.value = '二步验证已停用，所有会话均已撤销，请重新登录。'
+  })
+}
+
+async function regenerateRecoveryCodes() {
+  await perform(async () => {
+    const result = await api<{ recovery_codes: string[] }>('/api/v1/profile/recovery-codes', {
+      method: 'POST', body: JSON.stringify(securityForm),
+    })
+    recoveryCodes.value = result.recovery_codes
+    await loadAll()
+    success.value = '旧恢复码已失效。请立即保存这组新恢复码。'
+  })
+}
+
+async function registerPasskey() {
+  await perform(async () => {
+    if (!window.PublicKeyCredential || !navigator.credentials) throw new Error('当前浏览器不支持通行密钥')
+    const options = await api<any>('/api/v1/profile/passkeys/register/begin', {
+      method: 'POST', body: JSON.stringify({ name: passkeyName.value, password: securityForm.password, code: securityForm.code }),
+    })
+    const credential = await navigator.credentials.create({ publicKey: parseCreationOptions(options.publicKey) }) as PublicKeyCredential | null
+    if (!credential) throw new Error('通行密钥注册已取消')
+    await api<Passkey>('/api/v1/profile/passkeys/register/finish', {
+      method: 'POST', body: JSON.stringify(serializeRegistration(credential)),
+    })
+    passkeyName.value = ''
+    await loadAll()
+    success.value = '通行密钥已注册，可在登录页直接使用。'
+  })
+}
+
+async function deletePasskey(passkey: Passkey) {
+  await perform(async () => {
+    await api(`/api/v1/profile/passkeys/${encodeURIComponent(passkey.id)}/delete`, {
+      method: 'POST', body: JSON.stringify(securityForm),
+    })
+    await loadAll()
+    success.value = `已删除通行密钥“${passkey.name}”。`
+  })
 }
 
 function selectDefaults() {
@@ -440,13 +603,13 @@ async function perform(operation: () => Promise<void>) {
 
 function showError(cause: unknown) {
   if (cause instanceof APIError) {
-    if (cause.status === 401 && cause.code !== 'invalid_credentials') {
+    if (cause.status === 401 && cause.code === 'unauthorized') {
       authenticated.value = false
       passwordInput.value = ''
       error.value = '登录已过期，请重新登录'
       return
     }
-    error.value = cause.code === 'invalid_credentials' ? '用户名或密码错误' : cause.message
+    error.value = cause.code === 'invalid_credentials' && !authenticated.value ? '用户名或密码错误' : cause.message
   } else if (cause instanceof Error) {
     error.value = cause.message
   } else {
@@ -498,6 +661,7 @@ function pageDescription(tab: Tab): string {
     repositories: 'Restic 目标与凭据边界',
     projects: '数据源、调度策略与下次执行',
     runs: '端到端备份执行证据',
+    profile: '密码、二步验证与通行密钥',
   }[tab]
 }
 
@@ -508,6 +672,7 @@ function navBadge(tab: Tab): number {
     repositories: repositories.value.length,
     projects: projects.value.length,
     runs: runs.value.length,
+    profile: profile.value.passkeys.length,
   }[tab]
 }
 
@@ -588,6 +753,72 @@ function installCommand(result: EnrollmentResult): string {
   return `sudo vaultmesh-agent --server ${apiBaseURL} --enrollment-token ${result.enrollment_token}`
 }
 
+function base64urlToBuffer(value: string): ArrayBuffer {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
+  const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4)
+  const binary = atob(padded)
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+  return bytes.buffer
+}
+
+function bufferToBase64url(value: ArrayBuffer | null): string | null {
+  if (!value) return null
+  const bytes = new Uint8Array(value)
+  let binary = ''
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte) })
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function parseCreationOptions(input: any): PublicKeyCredentialCreationOptions {
+  return {
+    ...input,
+    challenge: base64urlToBuffer(input.challenge),
+    user: { ...input.user, id: base64urlToBuffer(input.user.id) },
+    excludeCredentials: (input.excludeCredentials ?? []).map((item: any) => ({ ...item, id: base64urlToBuffer(item.id) })),
+  }
+}
+
+function parseRequestOptions(input: any): PublicKeyCredentialRequestOptions {
+  return {
+    ...input,
+    challenge: base64urlToBuffer(input.challenge),
+    allowCredentials: (input.allowCredentials ?? []).map((item: any) => ({ ...item, id: base64urlToBuffer(item.id) })),
+  }
+}
+
+function serializeRegistration(credential: PublicKeyCredential) {
+  const response = credential.response as AuthenticatorAttestationResponse
+  return {
+    id: credential.id,
+    rawId: bufferToBase64url(credential.rawId),
+    type: credential.type,
+    authenticatorAttachment: credential.authenticatorAttachment,
+    clientExtensionResults: credential.getClientExtensionResults(),
+    response: {
+      clientDataJSON: bufferToBase64url(response.clientDataJSON),
+      attestationObject: bufferToBase64url(response.attestationObject),
+      transports: typeof response.getTransports === 'function' ? response.getTransports() : [],
+    },
+  }
+}
+
+function serializeAssertion(credential: PublicKeyCredential) {
+  const response = credential.response as AuthenticatorAssertionResponse
+  return {
+    id: credential.id,
+    rawId: bufferToBase64url(credential.rawId),
+    type: credential.type,
+    authenticatorAttachment: credential.authenticatorAttachment,
+    clientExtensionResults: credential.getClientExtensionResults(),
+    response: {
+      clientDataJSON: bufferToBase64url(response.clientDataJSON),
+      authenticatorData: bufferToBase64url(response.authenticatorData),
+      signature: bufferToBase64url(response.signature),
+      userHandle: bufferToBase64url(response.userHandle),
+    },
+  }
+}
+
 onMounted(async () => {
   clockTimer = window.setInterval(() => { nowEpoch.value = Date.now() }, 1000)
   refreshTimer = window.setInterval(() => {
@@ -627,12 +858,20 @@ onBeforeUnmount(() => {
       <p class="eyebrow">SELF-HOSTED BACKUP CONTROL</p>
       <h1>VaultMesh</h1>
       <p class="muted">连接每一台服务器，看见每一次备份是否真正完成。</p>
-      <form class="login-form" @submit.prevent="login">
+      <form v-if="!mfaLoginRequired" class="login-form" @submit.prevent="login">
         <label for="admin-username">用户名</label>
         <input id="admin-username" v-model="usernameInput" type="text" autocomplete="username" required placeholder="admin" />
         <label for="admin-password">密码</label>
         <input id="admin-password" v-model="passwordInput" type="password" autocomplete="current-password" required placeholder="请输入管理员密码" />
         <button class="primary" :disabled="loading">{{ loading ? '正在验证…' : '进入控制台' }}</button>
+        <button type="button" class="ghost passkey-login" :disabled="loading" @click="loginWithPasskey">使用通行密钥登录</button>
+      </form>
+      <form v-else class="login-form" @submit.prevent="completeMFA">
+        <div class="login-stage"><span>02</span><div><strong>二步验证</strong><small>输入验证器中的 6 位动态码，或一枚恢复码。</small></div></div>
+        <label for="admin-mfa">验证码或恢复码</label>
+        <input id="admin-mfa" v-model.trim="mfaCode" type="text" inputmode="numeric" autocomplete="one-time-code" required autofocus placeholder="123456" />
+        <button class="primary" :disabled="loading">{{ loading ? '正在验证…' : '完成登录' }}</button>
+        <button type="button" class="ghost" @click="cancelMFA">返回密码登录</button>
       </form>
       <p v-if="error" class="message error">{{ error }}</p>
       <p class="security-note">登录成功后使用 HttpOnly 会话 Cookie，前端不会读取或保存密码与会话凭据。</p>
@@ -649,7 +888,7 @@ onBeforeUnmount(() => {
       <nav aria-label="主导航">
         <button v-for="item in ([
           ['overview', '运行总览', '01'], ['servers', '服务器', '02'], ['repositories', '备份仓库', '03'],
-          ['projects', '备份项目', '04'], ['runs', '运行记录', '05'],
+          ['projects', '备份项目', '04'], ['runs', '运行记录', '05'], ['profile', '个人中心', '06'],
         ] as [Tab, string, string][] )" :key="item[0]" type="button" :class="{ active: activeTab === item[0] }" @click="activeTab = item[0]">
           <span class="nav-index">{{ item[2] }}</span><span class="nav-label">{{ item[1] }}</span><span v-if="navBadge(item[0])" class="nav-badge">{{ navBadge(item[0]) }}</span>
         </button>
@@ -669,7 +908,7 @@ onBeforeUnmount(() => {
       <header class="topbar">
         <div>
           <p class="breadcrumb">VAULTMESH <span>/</span> {{ activeTab.toUpperCase() }}</p>
-          <h1>{{ { overview: '备份总览', servers: '服务器', repositories: '备份仓库', projects: '备份项目', runs: '运行记录' }[activeTab] }}</h1>
+          <h1>{{ { overview: '备份总览', servers: '服务器', repositories: '备份仓库', projects: '备份项目', runs: '运行记录', profile: '个人中心' }[activeTab] }}</h1>
           <p class="page-description">{{ pageDescription(activeTab) }}</p>
         </div>
         <div class="topbar-status"><button type="button" class="scope-pill interactive" :disabled="loading" @click="refreshData">{{ loading ? 'SYNCING…' : '刷新实时数据' }}</button><button type="button" class="live-indicator interactive" @click="activeTab = 'servers'"><i></i>{{ dashboard.servers_online }}/{{ dashboard.servers_total }} Agent 在线</button></div>
@@ -805,9 +1044,16 @@ onBeforeUnmount(() => {
         <div class="content-grid projects-grid">
           <section class="panel">
             <div class="panel-heading"><div><p class="eyebrow">DESIRED STATE</p><h2>项目列表</h2></div></div>
-            <div v-if="!projects.length" class="empty-state">尚未创建备份项目。</div>
-            <div v-else class="card-list">
-              <article v-for="project in projects" :key="project.id" class="project-card">
+            <div v-if="!servers.length" class="empty-state">请先添加服务器，再为对应 Agent 创建备份项目。</div>
+            <div v-else class="project-server-list">
+              <section v-for="group in projectGroups" :key="group.id" class="project-server-group">
+                <header class="project-server-heading">
+                  <div><span class="server-state" :class="group.server?.status"></span><div><strong>{{ group.name }}</strong><small>{{ group.server?.hostname || 'Agent 尚未注册' }} · {{ group.projects.length }} 个项目</small></div></div>
+                  <span v-if="group.server" class="status-pill" :class="group.server.status">{{ statusLabel(group.server.status) }}</span>
+                </header>
+                <div v-if="!group.projects.length" class="server-empty">这台服务器还没有备份项目。</div>
+                <div v-else class="card-list">
+              <article v-for="project in group.projects" :key="project.id" class="project-card">
                 <div class="project-top">
                   <div><strong>{{ project.name }}</strong><small>{{ serverName(project.server_id) }} · {{ repositoryName(project.repository_id) }}</small></div>
                   <div class="project-actions"><span class="status-pill online">Revision {{ project.revision }}</span><button type="button" class="ghost compact" :disabled="loading || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
@@ -820,6 +1066,8 @@ onBeforeUnmount(() => {
                   <div class="next-run"><small>下次计划</small><strong>{{ formatNextRun(project) }}</strong><span>最长运行 {{ Math.round(project.schedule.max_runtime_seconds / 3600) }} 小时</span></div>
                 </div>
               </article>
+                </div>
+              </section>
             </div>
           </section>
           <aside class="panel form-panel project-builder"><p class="eyebrow">NEW PROJECT</p><h2>创建备份项目</h2><p class="form-intro">一个项目可以组合文件、Docker、MySQL 和 PostgreSQL 数据源，并在同一个 Restic 快照中归档。</p>
@@ -868,7 +1116,7 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
-      <template v-else>
+      <template v-else-if="activeTab === 'runs'">
         <section class="panel">
           <div class="panel-heading"><div><p class="eyebrow">RUN HISTORY</p><h2>最近 100 次运行</h2></div></div>
           <div v-if="!runs.length" class="empty-state">尚无运行记录。</div>
@@ -876,6 +1124,49 @@ onBeforeUnmount(() => {
             <tr v-for="run in runs" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ run.id }}</small></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td>{{ formatDate(run.started_at) }}</td><td><code>{{ run.snapshot_id ? run.snapshot_id.slice(0, 16) : '—' }}</code></td><td class="error-cell">{{ run.error_message || '—' }}</td></tr>
           </tbody></table></div>
         </section>
+      </template>
+
+      <template v-else>
+        <div class="profile-summary-grid">
+          <article class="security-summary"><span>ACCOUNT</span><strong>{{ profile.username }}</strong><small>单管理员控制面账号</small></article>
+          <article class="security-summary" :class="{ enabled: profile.totp_enabled }"><span>TWO-STEP</span><strong>{{ profile.totp_enabled ? '已启用' : '未启用' }}</strong><small>{{ profile.totp_enabled ? `${profile.recovery_codes_remaining} 枚恢复码可用` : '建议立即启用验证器' }}</small></article>
+          <article class="security-summary" :class="{ enabled: profile.passkeys.length }"><span>PASSKEYS</span><strong>{{ profile.passkeys.length }}</strong><small>{{ profile.webauthn_available ? '可用于免密码登录' : '服务器尚未配置 WebAuthn' }}</small></article>
+        </div>
+
+        <div class="profile-grid">
+          <section class="panel security-panel">
+            <div class="panel-heading"><div><p class="eyebrow">PASSWORD</p><h2>修改登录密码</h2></div><span class="security-level">会撤销全部会话</span></div>
+            <form @submit.prevent="changePassword">
+              <label>当前密码<input v-model="passwordForm.current_password" type="password" required autocomplete="current-password" /></label>
+              <div class="form-row"><label>新密码<input v-model="passwordForm.new_password" type="password" minlength="12" maxlength="72" required autocomplete="new-password" /></label><label>确认新密码<input v-model="passwordForm.confirm_password" type="password" minlength="12" maxlength="72" required autocomplete="new-password" /></label></div>
+              <label v-if="profile.totp_enabled">验证器或恢复码<input v-model.trim="passwordForm.verification_code" required autocomplete="one-time-code" placeholder="安全操作需要再次验证" /></label>
+              <button class="primary" :disabled="loading">修改密码并退出</button>
+            </form>
+          </section>
+
+          <section class="panel security-panel">
+            <div class="panel-heading"><div><p class="eyebrow">AUTHENTICATOR APP</p><h2>登录二步验证</h2></div><span class="status-pill" :class="profile.totp_enabled ? 'online' : 'offline'">{{ profile.totp_enabled ? '已启用' : '未启用' }}</span></div>
+            <template v-if="!profile.totp_enabled">
+              <p class="security-copy">支持 1Password、Bitwarden、Google Authenticator 等标准 TOTP 验证器。动态码只可使用一次。</p>
+              <form v-if="!totpSetup" @submit.prevent="startTOTPSetup"><label>当前密码<input v-model="securityForm.password" type="password" required autocomplete="current-password" /></label><button class="primary" :disabled="loading">开始设置</button></form>
+              <div v-else class="totp-setup"><img :src="totpSetup.qr_code" alt="TOTP 设置二维码" /><div><p>扫描二维码，或手动输入密钥：</p><code>{{ totpSetup.secret }}</code><form @submit.prevent="enableTOTP"><label>当前 6 位验证码<input v-model.trim="totpActivationCode" required inputmode="numeric" autocomplete="one-time-code" /></label><button class="primary" :disabled="loading">验证并启用</button></form></div></div>
+            </template>
+            <template v-else>
+              <p class="security-copy">登录密码通过后，还需要验证器动态码；恢复码可在无法访问验证器时单次使用。</p>
+              <form class="security-confirm" @submit.prevent="regenerateRecoveryCodes"><div class="form-row"><label>当前密码<input v-model="securityForm.password" type="password" required autocomplete="current-password" /></label><label>验证器动态码<input v-model.trim="securityForm.code" required autocomplete="one-time-code" /></label></div><div class="form-actions"><button type="button" class="ghost danger-ghost" :disabled="loading" @click="disableTOTP">停用二步验证</button><button class="ghost" :disabled="loading">生成新恢复码</button></div></form>
+            </template>
+            <div v-if="recoveryCodes.length" class="recovery-box"><div><strong>恢复码（仅展示一次）</strong><small>每枚只能使用一次，请保存在密码管理器或离线介质中。</small></div><code v-for="code in recoveryCodes" :key="code">{{ code }}</code></div>
+          </section>
+
+          <section class="panel security-panel passkey-panel">
+            <div class="panel-heading"><div><p class="eyebrow">WEBAUTHN</p><h2>通行密钥</h2></div><span class="sample-size">{{ profile.passkeys.length }}/12 KEYS</span></div>
+            <p class="security-copy">使用设备锁屏、Touch ID、Windows Hello 或硬件安全密钥登录。通行密钥是密码加二步验证之外的独立强认证路径。</p>
+            <div v-if="profile.passkeys.length" class="passkey-list"><article v-for="passkey in profile.passkeys" :key="passkey.id"><div class="passkey-icon">◆</div><div><strong>{{ passkey.name }}</strong><small>创建 {{ formatDate(passkey.created_at) }} · {{ passkey.last_used_at ? `最近使用 ${formatDate(passkey.last_used_at)}` : '尚未使用' }}</small></div><button type="button" class="ghost compact danger-ghost" :disabled="loading" @click="deletePasskey(passkey)">删除</button></article></div>
+            <div v-else class="empty-state compact-empty">尚未注册通行密钥。</div>
+            <form v-if="profile.webauthn_available" class="passkey-form" @submit.prevent="registerPasskey"><div class="form-row"><label>设备名称<input v-model="passkeyName" required maxlength="80" placeholder="例如：MacBook Touch ID" /></label><label>当前密码<input v-model="securityForm.password" type="password" required autocomplete="current-password" /></label></div><label v-if="profile.totp_enabled">敏感操作验证码<input v-model.trim="securityForm.code" required autocomplete="one-time-code" placeholder="注册或删除通行密钥时需要" /></label><button class="primary" :disabled="loading">注册这台设备</button></form>
+            <p v-else class="configuration-note">配置 <code>VAULTMESH_WEBAUTHN_RP_ID</code> 与可信 HTTPS Origin 后即可启用；localhost/127.0.0.1 可用于本地测试。</p>
+          </section>
+        </div>
       </template>
     </section>
   </div>
