@@ -1,0 +1,1366 @@
+openapi: 3.1.0
+info:
+  title: VaultMesh Control Plane API
+  version: 1.0.0
+  summary: Versioned JSON API for VaultMesh frontends and Agents
+  description: |
+    The Control Plane is independent from the Web application and never serves frontend assets.
+    Browser endpoints use an HttpOnly administrator session cookie. Agent endpoints use a device
+    Bearer credential. Request objects reject unknown fields at runtime.
+servers:
+  - url: https://api.example.com
+    description: Production example
+  - url: http://localhost:8080
+    description: Local development
+tags:
+  - name: System
+  - name: Authentication
+  - name: Profile
+  - name: Dashboard
+  - name: Servers
+  - name: Repositories
+  - name: Projects
+  - name: Snapshots
+  - name: Runs
+  - name: Notifications
+  - name: Audit
+  - name: Agent
+security:
+  - cookieAuth: []
+paths:
+  /healthz:
+    get:
+      tags: [System]
+      operationId: health
+      security: []
+      responses:
+        '200':
+          description: Metadata store is available
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: ok }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/v1/meta:
+    get:
+      tags: [System]
+      operationId: getMeta
+      security: []
+      responses:
+        '200':
+          description: API build metadata
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Meta' }
+  /api/v1/auth/login:
+    post:
+      tags: [Authentication]
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Login succeeded and the session cookie was set
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '202':
+          description: Password accepted; TOTP or recovery code is required
+          headers:
+            Set-Cookie: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [mfa_required]
+                properties:
+                  mfa_required: { type: boolean, const: true }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/totp:
+    post:
+      tags: [Authentication]
+      operationId: completeTOTPLogin
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodeRequest' }
+      responses:
+        '200':
+          description: Second factor accepted and session cookie set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/passkey/begin:
+    post:
+      tags: [Authentication]
+      operationId: beginPasskeyLogin
+      security: []
+      responses:
+        '200': { $ref: '#/components/responses/WebAuthnOptions' }
+        '409': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/v1/auth/passkey/finish:
+    post:
+      tags: [Authentication]
+      operationId: finishPasskeyLogin
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebAuthnCredential' }
+      responses:
+        '200':
+          description: Passkey accepted and session cookie set
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/auth/session:
+    get:
+      tags: [Authentication]
+      operationId: getSession
+      responses:
+        '200':
+          description: Active administrator session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/auth/logout:
+    post:
+      tags: [Authentication]
+      operationId: logout
+      security: []
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+  /api/v1/profile:
+    get:
+      tags: [Profile]
+      operationId: getProfile
+      responses:
+        '200':
+          description: Public administrator security profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Profile' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/profile/reauthenticate:
+    post:
+      tags: [Profile]
+      operationId: reauthenticate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordCodeRequest' }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/profile/password:
+    post:
+      tags: [Profile]
+      operationId: changePassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string, format: password }
+                new_password: { type: string, format: password, minLength: 12, maxLength: 72 }
+                verification_code: { type: string }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '401': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/v1/profile/totp/begin:
+    post:
+      tags: [Profile]
+      operationId: beginTOTPSetup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [password]
+              properties:
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: TOTP setup secret and QR code; expires after ten minutes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TOTPSetup' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/v1/profile/totp/enable:
+    post:
+      tags: [Profile]
+      operationId: enableTOTP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodeRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/RecoveryCodes' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/v1/profile/totp/disable:
+    post:
+      tags: [Profile]
+      operationId: disableTOTP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordCodeRequest' }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/profile/recovery-codes:
+    post:
+      tags: [Profile]
+      operationId: regenerateRecoveryCodes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordCodeRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/RecoveryCodes' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/profile/passkeys/register/begin:
+    post:
+      tags: [Profile]
+      operationId: beginPasskeyRegistration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 80 }
+      responses:
+        '200': { $ref: '#/components/responses/WebAuthnOptions' }
+        '409': { $ref: '#/components/responses/Error' }
+        '428': { $ref: '#/components/responses/Error' }
+  /api/v1/profile/passkeys/register/finish:
+    post:
+      tags: [Profile]
+      operationId: finishPasskeyRegistration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebAuthnCredential' }
+      responses:
+        '201':
+          description: Registered passkey
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Passkey' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/profile/passkeys/{passkeyID}/delete:
+    parameters:
+      - $ref: '#/components/parameters/PasskeyID'
+    post:
+      tags: [Profile]
+      operationId: deletePasskey
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '404': { $ref: '#/components/responses/Error' }
+        '428': { $ref: '#/components/responses/Error' }
+  /api/v1/dashboard:
+    get:
+      tags: [Dashboard]
+      operationId: getDashboard
+      responses:
+        '200':
+          description: Last-24-hours dashboard summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/servers:
+    get:
+      tags: [Servers]
+      operationId: listServers
+      responses:
+        '200': { $ref: '#/components/responses/ServerList' }
+    post:
+      tags: [Servers]
+      operationId: createServer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100 }
+      responses:
+        '201':
+          description: Server placeholder and one-time enrollment token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnrollmentResult' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/v1/repositories:
+    get:
+      tags: [Repositories]
+      operationId: listRepositories
+      responses:
+        '200': { $ref: '#/components/responses/RepositoryList' }
+    post:
+      tags: [Repositories]
+      operationId: createRepository
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RepositoryWrite' }
+      responses:
+        '201':
+          description: Repository with credentials removed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Repository' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/v1/projects:
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      responses:
+        '200': { $ref: '#/components/responses/ProjectList' }
+    post:
+      tags: [Projects]
+      operationId: createProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectWrite' }
+      responses:
+        '201':
+          description: Created project
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/v1/projects/{projectID}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+    put:
+      tags: [Projects]
+      operationId: replaceProject
+      description: Database passwords may be empty only when preserving an existing source with the same ID and type.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectWrite' }
+      responses:
+        '200':
+          description: Replaced project desired state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [Projects]
+      operationId: setProjectEnabled
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: Updated project
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/project-health:
+    get:
+      tags: [Projects]
+      operationId: listProjectHealth
+      responses:
+        '200':
+          description: RPO health for all projects
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProjectHealth' }
+  /api/v1/projects/{projectID}/run:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+    post:
+      tags: [Projects]
+      operationId: runProject
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/v1/projects/{projectID}/retention-preview:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+    post:
+      tags: [Projects]
+      operationId: previewRetention
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/projects/{projectID}/snapshots/refresh:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+    post:
+      tags: [Snapshots]
+      operationId: refreshSnapshots
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/projects/{projectID}/snapshots/{snapshotID}/protect:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - $ref: '#/components/parameters/SnapshotID'
+    post:
+      tags: [Snapshots]
+      operationId: protectSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [protected]
+              properties:
+                protected: { type: boolean }
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/projects/{projectID}/snapshots/{snapshotID}/browse:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - $ref: '#/components/parameters/SnapshotID'
+    post:
+      tags: [Snapshots]
+      operationId: browseSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SnapshotPath' }
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/projects/{projectID}/snapshots/{snapshotID}/restore:
+    parameters:
+      - $ref: '#/components/parameters/ProjectID'
+      - $ref: '#/components/parameters/SnapshotID'
+    post:
+      tags: [Snapshots]
+      operationId: restoreSnapshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SnapshotPath' }
+      responses:
+        '202': { $ref: '#/components/responses/CommandAccepted' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/snapshots:
+    get:
+      tags: [Snapshots]
+      operationId: listSnapshots
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - name: project_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Cached Restic snapshot inventory
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Snapshot' }
+  /api/v1/runs:
+    get:
+      tags: [Runs]
+      operationId: listRuns
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Backup and command execution facts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Run' }
+  /api/v1/audit-events:
+    get:
+      tags: [Audit]
+      operationId: listAuditEvents
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Append-only administrator audit events
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEvent' }
+  /api/v1/notification-channels:
+    get:
+      tags: [Notifications]
+      operationId: listNotificationChannels
+      responses:
+        '200': { $ref: '#/components/responses/NotificationChannelList' }
+    post:
+      tags: [Notifications]
+      operationId: createNotificationChannel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationChannelWrite' }
+      responses:
+        '201':
+          description: Created channel with secrets removed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationChannel' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/v1/notification-channels/{channelID}:
+    parameters:
+      - $ref: '#/components/parameters/ChannelID'
+    put:
+      tags: [Notifications]
+      operationId: replaceNotificationChannel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationChannelWrite' }
+      responses:
+        '200':
+          description: Updated channel with secrets removed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationChannel' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+    patch:
+      tags: [Notifications]
+      operationId: setNotificationChannelEnabled
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        '200':
+          description: Updated channel
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationChannel' }
+        '404': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Notifications]
+      operationId: archiveNotificationChannel
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/notification-channels/{channelID}/test:
+    parameters:
+      - $ref: '#/components/parameters/ChannelID'
+    post:
+      tags: [Notifications]
+      operationId: testNotificationChannel
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '404': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+  /api/v1/alert-incidents:
+    get:
+      tags: [Notifications]
+      operationId: listAlertIncidents
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Alert incident history
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AlertIncident' }
+  /api/v1/notification-deliveries:
+    get:
+      tags: [Notifications]
+      operationId: listNotificationDeliveries
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Notification delivery history
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/NotificationDelivery' }
+  /api/v1/alerts/evaluate:
+    post:
+      tags: [Notifications]
+      operationId: evaluateAlerts
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '500': { $ref: '#/components/responses/Error' }
+  /api/v1/enroll:
+    post:
+      tags: [Agent]
+      operationId: enrollAgent
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AgentEnrollmentRequest' }
+      responses:
+        '201':
+          description: Persistent Agent device credential
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentIdentity' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/agent/heartbeat:
+    post:
+      tags: [Agent]
+      operationId: agentHeartbeat
+      security: [{ agentBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Heartbeat' }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/agent/config:
+    get:
+      tags: [Agent]
+      operationId: getAgentConfig
+      security: [{ agentBearer: [] }]
+      parameters:
+        - name: after
+          in: query
+          schema: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: Desired configuration newer than the supplied Revision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentConfig' }
+        '304': { description: No newer desired configuration }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/agent/commands:
+    get:
+      tags: [Agent]
+      operationId: listAgentCommands
+      security: [{ agentBearer: [] }]
+      responses:
+        '200':
+          description: Leased commands for this Agent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Command' }
+        '401': { $ref: '#/components/responses/Error' }
+  /api/v1/agent/runs:
+    post:
+      tags: [Agent]
+      operationId: reportAgentRun
+      security: [{ agentBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Run' }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: vaultmesh_admin_session
+      description: In HTTPS deployments the cookie name uses the __Host- prefix.
+    agentBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-device-credential
+  parameters:
+    ProjectID:
+      name: projectID
+      in: path
+      required: true
+      schema: { type: string }
+    SnapshotID:
+      name: snapshotID
+      in: path
+      required: true
+      description: Full 64-character Restic snapshot ID
+      schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+    ChannelID:
+      name: channelID
+      in: path
+      required: true
+      schema: { type: string }
+    PasskeyID:
+      name: passkeyID
+      in: path
+      required: true
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 1000 }
+  responses:
+    NoContent:
+      description: Operation completed; no response body
+    Error:
+      description: JSON error response
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RateLimited:
+      description: Authentication attempt limit reached
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    WebAuthnOptions:
+      description: WebAuthn options containing Base64URL encoded binary fields
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [publicKey]
+            properties:
+              publicKey:
+                type: object
+                additionalProperties: true
+    RecoveryCodes:
+      description: One-time recovery codes; this response is shown only once
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [recovery_codes]
+            properties:
+              recovery_codes:
+                type: array
+                items: { type: string }
+    ServerList:
+      description: Server list
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [items]
+            properties:
+              items:
+                type: array
+                items: { $ref: '#/components/schemas/Server' }
+    RepositoryList:
+      description: Repository list without credentials
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [items]
+            properties:
+              items:
+                type: array
+                items: { $ref: '#/components/schemas/Repository' }
+    ProjectList:
+      description: Project list without database passwords
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [items]
+            properties:
+              items:
+                type: array
+                items: { $ref: '#/components/schemas/Project' }
+    NotificationChannelList:
+      description: Notification channel list without secrets
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [items]
+            properties:
+              items:
+                type: array
+                items: { $ref: '#/components/schemas/NotificationChannel' }
+    CommandAccepted:
+      description: Asynchronous command accepted for Agent execution
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Command' }
+  schemas:
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, details]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
+    Meta:
+      type: object
+      required: [name, version, commit]
+      properties:
+        name: { type: string, const: VaultMesh }
+        version: { type: string }
+        commit: { type: string }
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+    CodeRequest:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        code: { type: string }
+    PasswordCodeRequest:
+      type: object
+      additionalProperties: false
+      required: [password, code]
+      properties:
+        password: { type: string, format: password }
+        code: { type: string }
+    Session:
+      type: object
+      required: [username, expires_at]
+      properties:
+        username: { type: string }
+        expires_at: { type: string, format: date-time }
+    TOTPSetup:
+      type: object
+      required: [secret, uri, qr_code]
+      properties:
+        secret: { type: string, x-sensitive: true }
+        uri: { type: string, x-sensitive: true }
+        qr_code: { type: string, description: Data URL containing a PNG QR code }
+    Passkey:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time }
+    Profile:
+      type: object
+      required: [username, totp_enabled, recovery_codes_remaining, passkeys, webauthn_available, webauthn_rp_id]
+      properties:
+        username: { type: string }
+        totp_enabled: { type: boolean }
+        recovery_codes_remaining: { type: integer, minimum: 0 }
+        passkeys:
+          type: array
+          items: { $ref: '#/components/schemas/Passkey' }
+        webauthn_available: { type: boolean }
+        webauthn_rp_id: { type: string }
+    WebAuthnCredential:
+      type: object
+      additionalProperties: true
+      description: Serialized PublicKeyCredential using Base64URL strings for binary values.
+    Dashboard:
+      type: object
+      required: [servers_total, servers_online, projects_total, runs_succeeded, runs_failed, runs_partial, projects_late, projects_overdue]
+      properties:
+        servers_total: { type: integer, minimum: 0 }
+        servers_online: { type: integer, minimum: 0 }
+        projects_total: { type: integer, minimum: 0 }
+        runs_succeeded: { type: integer, minimum: 0 }
+        runs_failed: { type: integer, minimum: 0 }
+        runs_partial: { type: integer, minimum: 0 }
+        projects_late: { type: integer, minimum: 0 }
+        projects_overdue: { type: integer, minimum: 0 }
+    Server:
+      type: object
+      required: [id, name, status, desired_revision, applied_revision, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        hostname: { type: string }
+        os: { type: string }
+        arch: { type: string }
+        agent_version: { type: string }
+        status: { type: string, enum: [pending, online, offline] }
+        last_seen_at: { type: string, format: date-time }
+        desired_revision: { type: integer, format: int64 }
+        applied_revision: { type: integer, format: int64 }
+        created_at: { type: string, format: date-time }
+    EnrollmentResult:
+      type: object
+      required: [server, enrollment_token, expires_at]
+      properties:
+        server: { $ref: '#/components/schemas/Server' }
+        enrollment_token: { type: string, x-sensitive: true, description: Returned only when the server is created }
+        expires_at: { type: string, format: date-time }
+    Repository:
+      type: object
+      required: [id, provider, name, url, created_at]
+      properties:
+        id: { type: string }
+        provider: { type: string }
+        name: { type: string }
+        url: { type: string }
+        created_at: { type: string, format: date-time }
+    RepositoryWrite:
+      type: object
+      additionalProperties: false
+      required: [provider, name, url, password]
+      properties:
+        provider: { type: string }
+        name: { type: string, minLength: 1, maxLength: 100 }
+        url: { type: string }
+        password: { type: string, format: password, writeOnly: true }
+        environment:
+          type: object
+          additionalProperties: { type: string }
+          writeOnly: true
+        options:
+          type: object
+          additionalProperties: { type: string }
+          writeOnly: true
+    DatabaseSource:
+      type: object
+      additionalProperties: false
+      required: [host, port, username, database]
+      properties:
+        host: { type: string }
+        port: { type: integer, minimum: 1, maximum: 65535 }
+        username: { type: string }
+        password: { type: string, format: password, writeOnly: true }
+        database: { type: string }
+    DockerSource:
+      type: object
+      additionalProperties: false
+      required: [containers, include_volumes]
+      properties:
+        containers:
+          type: array
+          minItems: 1
+          items: { type: string }
+        include_volumes: { type: boolean }
+    Source:
+      type: object
+      additionalProperties: false
+      required: [type, required]
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [files, mysql, postgresql, docker] }
+        paths:
+          type: array
+          items: { type: string }
+        excludes:
+          type: array
+          items: { type: string }
+        database: { $ref: '#/components/schemas/DatabaseSource' }
+        docker: { $ref: '#/components/schemas/DockerSource' }
+        required: { type: boolean }
+    Schedule:
+      type: object
+      additionalProperties: false
+      required: [cron, timezone, jitter_seconds, max_runtime_seconds, grace_seconds, missed_run_policy, concurrency_policy]
+      properties:
+        cron: { type: string, description: Five-field Cron expression }
+        timezone: { type: string, description: IANA timezone }
+        jitter_seconds: { type: integer, minimum: 0 }
+        max_runtime_seconds: { type: integer, minimum: 1 }
+        grace_seconds: { type: integer, minimum: 1 }
+        missed_run_policy: { type: string, const: skip }
+        concurrency_policy: { type: string, const: forbid }
+    BackupPolicy:
+      type: object
+      additionalProperties: false
+      required: [one_file_system, exclude_caches]
+      properties:
+        one_file_system: { type: boolean }
+        exclude_caches: { type: boolean }
+        exclude_if_present:
+          type: array
+          items: { type: string }
+        exclude_larger_than: { type: string }
+    RetentionPolicy:
+      type: object
+      additionalProperties: false
+      required: [enabled, mode, keep_last, keep_hourly, keep_daily, keep_weekly, keep_monthly, keep_yearly, prune]
+      properties:
+        enabled: { type: boolean }
+        mode: { type: string, enum: [count, smart, gfs, age] }
+        keep_last: { type: integer, minimum: 0 }
+        keep_hourly: { type: integer, minimum: 0 }
+        keep_daily: { type: integer, minimum: 0 }
+        keep_weekly: { type: integer, minimum: 0 }
+        keep_monthly: { type: integer, minimum: 0 }
+        keep_yearly: { type: integer, minimum: 0 }
+        keep_within: { type: string }
+        prune: { type: boolean }
+    VerificationPolicy:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode: { type: string, enum: [off, metadata, subset, full] }
+        read_data_subset: { type: string }
+    MaintenancePolicy:
+      type: object
+      additionalProperties: false
+      required: [separate]
+      properties:
+        separate: { type: boolean }
+        timezone: { type: string }
+        retention_cron: { type: string }
+        prune_cron: { type: string }
+        verification_cron: { type: string }
+    ProjectPolicy:
+      type: object
+      additionalProperties: false
+      required: [backup, retention, verification, maintenance]
+      properties:
+        backup: { $ref: '#/components/schemas/BackupPolicy' }
+        retention: { $ref: '#/components/schemas/RetentionPolicy' }
+        verification: { $ref: '#/components/schemas/VerificationPolicy' }
+        maintenance: { $ref: '#/components/schemas/MaintenancePolicy' }
+    ProjectWrite:
+      type: object
+      additionalProperties: false
+      required: [server_id, repository_id, name, sources, schedule, policy]
+      properties:
+        server_id: { type: string }
+        repository_id: { type: string }
+        name: { type: string, minLength: 1, maxLength: 100 }
+        sources:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/Source' }
+        schedule: { $ref: '#/components/schemas/Schedule' }
+        policy: { $ref: '#/components/schemas/ProjectPolicy' }
+    Project:
+      type: object
+      required: [id, server_id, repository_id, name, enabled, sources, schedule, policy, revision, created_at, updated_at]
+      properties:
+        id: { type: string }
+        server_id: { type: string }
+        repository_id: { type: string }
+        name: { type: string }
+        enabled: { type: boolean }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/Source' }
+        schedule: { $ref: '#/components/schemas/Schedule' }
+        policy: { $ref: '#/components/schemas/ProjectPolicy' }
+        revision: { type: integer, format: int64 }
+        next_run_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ProjectHealth:
+      type: object
+      required: [project_id, status]
+      properties:
+        project_id: { type: string }
+        status: { type: string, enum: [healthy, pending, late, overdue, paused, invalid] }
+        latest_run_status: { type: string }
+        latest_run_at: { type: string, format: date-time }
+        last_successful_at: { type: string, format: date-time }
+        expected_at: { type: string, format: date-time }
+        deadline_at: { type: string, format: date-time }
+    Command:
+      type: object
+      required: [id, server_id, project_id, type, attempts, created_at]
+      properties:
+        id: { type: string }
+        server_id: { type: string }
+        project_id: { type: string }
+        type: { type: string }
+        payload: { type: object, additionalProperties: true }
+        lease_until: { type: string, format: date-time }
+        attempts: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+    Run:
+      type: object
+      required: [id, idempotency_key, project_id, scheduled_at, started_at, status]
+      properties:
+        id: { type: string, maxLength: 128 }
+        idempotency_key: { type: string, maxLength: 512 }
+        project_id: { type: string }
+        server_id: { type: string }
+        scheduled_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        status: { type: string, enum: [running, succeeded, partial, failed, canceled, timed_out, unknown] }
+        snapshot_id: { type: string }
+        error_code: { type: string }
+        error_message: { type: string }
+        stats: { type: object, additionalProperties: true }
+    Snapshot:
+      type: object
+      required: [id, project_id, server_id, time, hostname, paths, tags, protected, last_synced_at]
+      properties:
+        id: { type: string, pattern: '^[a-f0-9]{64}$' }
+        project_id: { type: string }
+        server_id: { type: string }
+        time: { type: string, format: date-time }
+        hostname: { type: string }
+        username: { type: string }
+        paths:
+          type: array
+          items: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        total_files: { type: integer, format: int64, minimum: 0 }
+        total_bytes: { type: integer, format: int64, minimum: 0 }
+        protected: { type: boolean }
+        last_synced_at: { type: string, format: date-time }
+    SnapshotPath:
+      type: object
+      additionalProperties: false
+      required: [path]
+      properties:
+        path: { type: string }
+    NotificationChannelWrite:
+      type: object
+      additionalProperties: false
+      required: [name, type, enabled, send_resolved, repeat_interval_seconds, event_types, project_ids, config]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        type: { type: string, enum: [webhook, telegram, email, slack, discord, gotify, ntfy, wecom, dingtalk] }
+        enabled: { type: boolean }
+        send_resolved: { type: boolean }
+        repeat_interval_seconds: { type: integer, minimum: 300, maximum: 604800 }
+        event_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, enum: [backup_failure, rpo_overdue] }
+        project_ids:
+          type: array
+          uniqueItems: true
+          items: { type: string }
+        config:
+          type: object
+          additionalProperties: { type: string }
+          writeOnly: true
+    NotificationChannel:
+      type: object
+      required: [id, name, type, enabled, send_resolved, repeat_interval_seconds, event_types, configured, created_at, updated_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string }
+        enabled: { type: boolean }
+        send_resolved: { type: boolean }
+        repeat_interval_seconds: { type: integer }
+        event_types:
+          type: array
+          items: { type: string, enum: [backup_failure, rpo_overdue] }
+        project_ids:
+          type: array
+          items: { type: string }
+        config:
+          description: Only non-secret configuration fields are returned.
+          type: object
+          additionalProperties: { type: string }
+        destination: { type: string }
+        configured: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    AlertIncident:
+      type: object
+      required: [id, fingerprint, kind, project_id, project_name, status, severity, summary, description, source_event_id, occurrence_count, started_at, updated_at]
+      properties:
+        id: { type: string }
+        fingerprint: { type: string }
+        kind: { type: string, enum: [backup_failure, rpo_overdue] }
+        project_id: { type: string }
+        project_name: { type: string }
+        status: { type: string, enum: [firing, resolved] }
+        severity: { type: string }
+        summary: { type: string }
+        description: { type: string }
+        source_event_id: { type: string }
+        occurrence_count: { type: integer, minimum: 1 }
+        started_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time }
+    NotificationDelivery:
+      type: object
+      required: [id, alert_id, channel_id, transition, status, attempt_count, next_attempt_at, created_at]
+      properties:
+        id: { type: string }
+        alert_id: { type: string }
+        channel_id: { type: string }
+        channel_name: { type: string }
+        transition: { type: string, enum: [firing, repeat, resolved] }
+        status: { type: string, enum: [pending, delivering, sent, failed] }
+        attempt_count: { type: integer, minimum: 0, maximum: 5 }
+        next_attempt_at: { type: string, format: date-time }
+        last_error: { type: string }
+        created_at: { type: string, format: date-time }
+        sent_at: { type: string, format: date-time }
+    AuditEvent:
+      type: object
+      required: [id, actor, action, outcome, client_ip, status_code, created_at]
+      properties:
+        id: { type: string }
+        actor: { type: string }
+        action: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: string }
+        outcome: { type: string, enum: [succeeded, failed] }
+        client_ip: { type: string }
+        status_code: { type: integer, minimum: 100, maximum: 599 }
+        created_at: { type: string, format: date-time }
+    AgentEnrollmentRequest:
+      type: object
+      additionalProperties: false
+      required: [enrollment_token, hostname, os, arch, agent_version]
+      properties:
+        enrollment_token: { type: string, writeOnly: true }
+        hostname: { type: string }
+        os: { type: string }
+        arch: { type: string }
+        agent_version: { type: string }
+    AgentIdentity:
+      type: object
+      required: [agent_id, token]
+      properties:
+        agent_id: { type: string }
+        token: { type: string, x-sensitive: true, description: Returned only during enrollment }
+    Heartbeat:
+      type: object
+      additionalProperties: false
+      required: [hostname, os, arch, agent_version, applied_revision]
+      properties:
+        hostname: { type: string }
+        os: { type: string }
+        arch: { type: string }
+        agent_version: { type: string }
+        applied_revision: { type: integer, format: int64, minimum: 0 }
+    AgentProject:
+      allOf:
+        - $ref: '#/components/schemas/Project'
+        - type: object
+          required: [repository]
+          properties:
+            repository:
+              allOf:
+                - $ref: '#/components/schemas/Repository'
+                - type: object
+                  properties:
+                    password: { type: string, writeOnly: true }
+                    environment: { type: object, additionalProperties: { type: string }, writeOnly: true }
+                    options: { type: object, additionalProperties: { type: string } }
+    AgentConfig:
+      type: object
+      required: [revision, projects]
+      properties:
+        revision: { type: integer, format: int64 }
+        projects:
+          type: array
+          items: { $ref: '#/components/schemas/AgentProject' }

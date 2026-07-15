@@ -653,7 +653,12 @@ func (s *Store) UpsertRun(ctx context.Context, report domain.RunReport) error {
 	if err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO runs
 		(id, idempotency_key, project_id, server_id, scheduled_at, started_at,
 		 finished_at, status, snapshot_id, error_code, error_message, stats, updated_at)
@@ -679,7 +684,7 @@ func (s *Store) UpsertRun(ctx context.Context, report domain.RunReport) error {
 	}
 	if tag.RowsAffected() == 0 {
 		var idempotencyKey, projectID, serverID, status string
-		err := s.pool.QueryRow(ctx, `
+		err := tx.QueryRow(ctx, `
 			SELECT idempotency_key, project_id, server_id, status
 			FROM runs WHERE id = $1`, report.ID).Scan(&idempotencyKey, &projectID, &serverID, &status)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -692,12 +697,12 @@ func (s *Store) UpsertRun(ctx context.Context, report domain.RunReport) error {
 			return store.ErrConflict
 		}
 		// The identity matches and the WHERE clause can only reject an already
-		// terminal run. Treat delayed duplicates as acknowledged no-ops.
-		return nil
+		// terminal run. Keep processing the related command so a retry can repair
+		// a transaction that was interrupted before both facts committed.
 	}
 	if commandID, ok := strings.CutPrefix(report.IdempotencyKey, "manual:"); ok {
 		completed := report.Status != domain.RunRunning
-		_, err := s.pool.Exec(ctx, `
+		_, err := tx.Exec(ctx, `
 			UPDATE commands
 			SET accepted_at = COALESCE(accepted_at, NOW()),
 			    completed_at = CASE WHEN $2 THEN COALESCE(completed_at, NOW()) ELSE completed_at END
@@ -706,7 +711,7 @@ func (s *Store) UpsertRun(ctx context.Context, report domain.RunReport) error {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Store) ListRuns(ctx context.Context, limit int) ([]domain.RunReport, error) {

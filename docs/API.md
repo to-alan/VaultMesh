@@ -1,4 +1,6 @@
-# VaultMesh API quick reference
+# VaultMesh API reference
+
+机器可读的全部路径与 Schema 见 [OpenAPI 3.1 契约](./openapi.yaml)；替换前端主题或独立开发管理界面时，请先阅读 [前端 API 对接指南](./FRONTEND_INTEGRATION.md)。
 
 The API is versioned under `/api/v1`. Administrator access uses a username/password login and a server-side session. The Web application never receives an administrator bearer token.
 
@@ -20,13 +22,15 @@ curl --fail --silent \
   https://api.example.com/api/v1/servers
 ```
 
-`POST /api/v1/auth/logout` revokes the current session. Session cookies are HttpOnly, SameSite=Lax, non-persistent, and marked Secure when `VAULTMESH_COOKIE_SECURE=true`. Agent endpoints still use the device credential returned by one-time enrollment; this is machine identity and is deliberately separate from administrator login. Secrets and login passwords are accepted only over HTTPS in production.
+`POST /api/v1/auth/logout` revokes the current session. Session cookies are HttpOnly and non-persistent. `VAULTMESH_COOKIE_SAME_SITE` defaults to `lax`; a frontend on a completely different site may use `none` only together with `VAULTMESH_COOKIE_SECURE=true`. Agent endpoints still use the device credential returned by one-time enrollment; this is machine identity and is deliberately separate from administrator login. Secrets and login passwords are accepted only over HTTPS in production.
 
 When TOTP is enabled, password login returns HTTP `202` with `{"mfa_required":true}` and an opaque five-minute challenge cookie. Complete it with `POST /api/v1/auth/totp` and `{"code":"123456"}`; a one-time recovery code is accepted in the same field. A pending challenge is rejected after five failed attempts. Passkey login uses the two-step `POST /api/v1/auth/passkey/begin` and `/finish` WebAuthn ceremony.
 
-Password and TOTP failures are limited independently per client. The fifth failed attempt within 15 minutes returns HTTP `429` with code `rate_limited` and a `Retry-After` header; continued failures increase the lockout from 1 minute up to 15 minutes. A successful check clears that stage's failure history. This limiter is bounded and process-local, so it resets when the Control Plane restarts and is not shared by multiple replicas. Production deployments must keep an additional persistent or distributed limit at the reverse proxy/WAF. Forwarded client IP headers are accepted only from a loopback peer; otherwise the direct peer address is used.
+Password and TOTP failures are limited independently per client. The same controls protect authenticated password, TOTP and recovery-code confirmations; those operations use a client-address plus current-session key so one session cannot spend another session's attempt budget. The fifth failed attempt within 15 minutes returns HTTP `429` with code `rate_limited` and a `Retry-After` header; continued failures increase the lockout from 1 minute up to 15 minutes. A successful check clears that stage's failure history. This limiter is bounded and process-local, so it resets when the Control Plane restarts and is not shared by multiple replicas. Production deployments must keep an additional persistent or distributed limit at the reverse proxy/WAF. Forwarded client IP headers are accepted only from a loopback peer; otherwise the direct peer address is used.
 
-Authenticated personal-security endpoints are grouped under `/api/v1/profile`: `GET /profile`, `POST /profile/password`, `/profile/reauthenticate`, `/profile/totp/begin`, `/profile/totp/enable`, `/profile/totp/disable`, `/profile/recovery-codes`, and the `/profile/passkeys/...` registration/deletion ceremonies. TOTP secrets, recovery-code hashes, and WebAuthn credential records are encrypted at rest with `VAULTMESH_MASTER_KEY`. Recovery codes are returned only when created or regenerated.
+Authenticated personal-security endpoints are grouped under `/api/v1/profile`: `GET /profile`, `POST /profile/password`, `/profile/reauthenticate`, `/profile/totp/begin`, `/profile/totp/enable`, `/profile/totp/disable`, `/profile/recovery-codes`, and the `/profile/passkeys/...` registration/deletion ceremonies. TOTP secrets, recovery-code hashes, and WebAuthn credential records are encrypted at rest with `VAULTMESH_MASTER_KEY`. Recovery codes are returned only when created or regenerated. A pending TOTP setup belongs only to the administrator session that started it, expires after 10 minutes, and is discarded with that session.
+
+Endpoints that decode JSON require `Content-Type: application/json`, reject unknown fields and accept only one JSON value with a 1 MiB request limit. This deliberately excludes browser “simple request” content types from cookie-authenticated mutation endpoints.
 
 Adding or deleting a passkey requires an administrator session authenticated within the previous 10 minutes. A stale session receives HTTP `428` with code `reauthentication_required`; call `POST /api/v1/profile/reauthenticate` with `{"password":"...","code":"..."}` and retry. `code` is required only when TOTP is enabled and accepts either a current authenticator code or an unused recovery code. This keeps password and TOTP fields out of the normal passkey workflow while retaining explicit verification for older sessions.
 

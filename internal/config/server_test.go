@@ -60,3 +60,25 @@ func TestLoadServerRejectsIPAddressWebAuthnRPID(t *testing.T) {
 		t.Fatalf("expected an IP-address RP ID error, got %v", err)
 	}
 }
+
+func TestLoadServerAllowsCrossSiteCookiesOnlyOverHTTPS(t *testing.T) {
+	t.Setenv("VAULTMESH_ADMIN_USERNAME", "admin")
+	t.Setenv("VAULTMESH_ADMIN_PASSWORD", "correct-horse-battery-staple")
+	t.Setenv("VAULTMESH_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("VAULTMESH_ALLOWED_ORIGINS", "https://console.other-site.example")
+	t.Setenv("VAULTMESH_COOKIE_SAME_SITE", "none")
+	t.Setenv("VAULTMESH_COOKIE_SECURE", "true")
+
+	config, err := LoadServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.CookieSameSite != "none" || !config.CookieSecure {
+		t.Fatalf("unexpected cross-site cookie configuration: %#v", config)
+	}
+
+	t.Setenv("VAULTMESH_COOKIE_SECURE", "false")
+	if _, err := LoadServer(); err == nil || !strings.Contains(err.Error(), "requires VAULTMESH_COOKIE_SECURE=true") {
+		t.Fatalf("expected insecure SameSite=None configuration to fail, got %v", err)
+	}
+}

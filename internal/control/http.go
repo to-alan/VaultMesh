@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -181,6 +182,11 @@ func (s *HTTPServer) completeTOTPLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.adminAuth.completePendingMFA(r.Context(), r, input.Code, time.Now()); err != nil {
+		if !errors.Is(err, store.ErrUnauthorized) {
+			s.logger.Error("persist login second factor", "error", err)
+			s.writeError(w, http.StatusInternalServerError, "internal_error", "two-step login could not be completed", nil)
+			return
+		}
 		if s.recordAuthenticationFailure(w, s.secondFactors, clientKey, time.Now()) {
 			return
 		}
@@ -728,6 +734,7 @@ func (s *HTTPServer) cors(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+			w.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-VaultMesh-API-Version")
 			w.Header().Set("Access-Control-Max-Age", "600")
 			w.Header().Add("Vary", "Origin")
 			w.Header().Add("Vary", "Access-Control-Request-Method")
@@ -831,6 +838,7 @@ func (s *HTTPServer) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-VaultMesh-API-Version", "1")
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -901,6 +909,11 @@ func setAuditResourceID(w http.ResponseWriter, resourceID string) {
 }
 
 func (s *HTTPServer) decodeJSON(w http.ResponseWriter, r *http.Request, output any) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		s.writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "request content type must be application/json", nil)
+		return false
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()

@@ -3,9 +3,7 @@ package control
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"log/slog"
 	"net/mail"
 	"net/url"
 	"sort"
@@ -24,33 +22,61 @@ const (
 	maxNotificationAttempts    = 5
 )
 
-var notificationChannelTypes = map[string][]string{
-	"webhook":  {"url"},
-	"telegram": {"bot_token", "chat_id"},
-	"email":    {"smtp_host", "smtp_port", "from", "to"},
-	"slack":    {"webhook_url"},
-	"discord":  {"webhook_url"},
-	"gotify":   {"server_url", "token"},
-	"ntfy":     {"server_url", "topic"},
-	"wecom":    {"webhook_url"},
-	"dingtalk": {"webhook_url"},
+type notificationProviderDefinition struct {
+	RequiredFields []string
+	AllowedFields  map[string]struct{}
+	SecretFields   map[string]struct{}
+	Send           notificationProviderSend
+}
+
+var notificationProviderDefinitions = map[string]notificationProviderDefinition{
+	"webhook": notificationProvider(
+		[]string{"url"},
+		[]string{"url", "method", "authorization", "headers", "body_template", "allow_private_address"},
+		[]string{"url", "headers", "authorization", "body_template"},
+		sendWebhookProvider,
+	),
+	"telegram": notificationProvider(
+		[]string{"bot_token", "chat_id"},
+		[]string{"bot_token", "chat_id", "message_thread_id", "allow_private_address"},
+		[]string{"bot_token"},
+		sendTelegramProvider,
+	),
+	"email": notificationProvider(
+		[]string{"smtp_host", "smtp_port", "from", "to"},
+		[]string{"smtp_host", "smtp_port", "security", "username", "password", "from", "to", "allow_private_address"},
+		[]string{"password"},
+		sendEmailProvider,
+	),
+	"slack": notificationProvider(
+		[]string{"webhook_url"}, []string{"webhook_url", "allow_private_address"}, []string{"webhook_url"}, sendSlackProvider,
+	),
+	"discord": notificationProvider(
+		[]string{"webhook_url"}, []string{"webhook_url", "allow_private_address"}, []string{"webhook_url"}, sendDiscordProvider,
+	),
+	"gotify": notificationProvider(
+		[]string{"server_url", "token"},
+		[]string{"server_url", "token", "priority", "allow_private_address"},
+		[]string{"token"},
+		sendGotifyProvider,
+	),
+	"ntfy": notificationProvider(
+		[]string{"server_url", "topic"},
+		[]string{"server_url", "topic", "token", "allow_private_address"},
+		[]string{"token"},
+		sendNtfyProvider,
+	),
+	"wecom": notificationProvider(
+		[]string{"webhook_url"}, []string{"webhook_url", "allow_private_address"}, []string{"webhook_url"}, sendWeComProvider,
+	),
+	"dingtalk": notificationProvider(
+		[]string{"webhook_url"}, []string{"webhook_url", "allow_private_address"}, []string{"webhook_url"}, sendDingTalkProvider,
+	),
 }
 
 var notificationEventTypes = map[string]struct{}{
 	"backup_failure": {},
 	"rpo_overdue":    {},
-}
-
-var notificationSecretFields = map[string]map[string]struct{}{
-	"webhook":  {"url": {}, "headers": {}, "authorization": {}, "body_template": {}},
-	"telegram": {"bot_token": {}},
-	"email":    {"password": {}},
-	"slack":    {"webhook_url": {}},
-	"discord":  {"webhook_url": {}},
-	"gotify":   {"token": {}},
-	"ntfy":     {"token": {}},
-	"wecom":    {"webhook_url": {}},
-	"dingtalk": {"webhook_url": {}},
 }
 
 type notificationSender func(context.Context, domain.NotificationChannel, map[string]string, domain.AlertIncident, string) error
@@ -147,7 +173,7 @@ func (s *Service) prepareNotificationChannel(ctx context.Context, input *domain.
 	if input.Name == "" || len(input.Name) > 100 {
 		return validationError("name", "must contain 1 to 100 characters")
 	}
-	required, ok := notificationChannelTypes[input.Type]
+	provider, ok := notificationProviderDefinitions[input.Type]
 	if !ok {
 		return validationError("type", "is not a supported notification channel")
 	}
@@ -192,7 +218,7 @@ func (s *Service) prepareNotificationChannel(ctx context.Context, input *domain.
 			config[key] = trimmed
 		}
 	}
-	for _, key := range required {
+	for _, key := range provider.RequiredFields {
 		if config[key] == "" {
 			return validationError("config."+key, "is required")
 		}
@@ -215,6 +241,24 @@ func (s *Service) prepareNotificationChannel(ctx context.Context, input *domain.
 }
 
 func validateNotificationConfig(channelType string, config map[string]string) error {
+	provider, ok := notificationProviderDefinitions[channelType]
+	if !ok {
+		return validationError("type", "is not a supported notification channel")
+	}
+	for key := range config {
+		if _, allowed := provider.AllowedFields[key]; !allowed {
+			return validationError("config."+key, "is not supported for this notification channel")
+		}
+	}
+	if value := config["allow_private_address"]; value != "" {
+		allowed, err := strconv.ParseBool(value)
+		if err != nil {
+			return validationError("config.allow_private_address", "must be true or false")
+		}
+		config["allow_private_address"] = strconv.FormatBool(allowed)
+	} else {
+		config["allow_private_address"] = "false"
+	}
 	for _, key := range []string{"url", "webhook_url", "server_url"} {
 		if value := config[key]; value != "" {
 			parsed, err := url.Parse(value)
@@ -237,8 +281,12 @@ func validateNotificationConfig(channelType string, config map[string]string) er
 			if json.Unmarshal([]byte(headers), &values) != nil {
 				return validationError("config.headers", "must be a JSON object of string headers")
 			}
+			managedHeaders := map[string]struct{}{
+				"host": {}, "content-length": {}, "connection": {}, "proxy-authorization": {},
+				"te": {}, "trailer": {}, "transfer-encoding": {}, "upgrade": {},
+			}
 			for key := range values {
-				if strings.EqualFold(key, "Host") || strings.EqualFold(key, "Content-Length") {
+				if _, managed := managedHeaders[strings.ToLower(strings.TrimSpace(key))]; managed {
 					return validationError("config.headers", fmt.Sprintf("header %q is managed by VaultMesh", key))
 				}
 			}
@@ -275,9 +323,10 @@ func (s *Service) publicNotificationChannel(channel domain.NotificationChannel) 
 		channel.Configured = true
 		channel.Destination = notificationDestination(channel.Type, config)
 		channel.Config = make(map[string]string)
-		secrets := notificationSecretFields[channel.Type]
+		provider, knownProvider := notificationProviderDefinitions[channel.Type]
 		for key, value := range config {
-			if _, secret := secrets[key]; !secret {
+			_, allowed := provider.AllowedFields[key]
+			if _, secret := provider.SecretFields[key]; knownProvider && allowed && !secret {
 				channel.Config[key] = value
 			}
 		}
@@ -342,250 +391,19 @@ func uniqueStrings(values []string) []string {
 	return result
 }
 
-type alertCondition struct {
-	Kind, ProjectID, ProjectName, SourceEventID, Severity, Summary, Description string
-}
-
-func (s *Service) EvaluateAlerts(ctx context.Context) error {
-	projects, err := s.store.ListProjects(ctx)
-	if err != nil {
-		return err
-	}
-	healthItems, err := s.ProjectHealth(ctx)
-	if err != nil {
-		return err
-	}
-	activityItems, err := s.store.ListProjectBackupActivity(ctx)
-	if err != nil {
-		return err
-	}
-	projectNames := make(map[string]string, len(projects))
-	for _, project := range projects {
-		projectNames[project.ID] = project.Name
-	}
-	health := make(map[string]domain.ProjectHealth, len(healthItems))
-	for _, item := range healthItems {
-		health[item.ProjectID] = item
-	}
-	activity := make(map[string]domain.ProjectBackupActivity, len(activityItems))
-	for _, item := range activityItems {
-		activity[item.ProjectID] = item
-	}
-	for _, project := range projects {
-		healthItem := health[project.ID]
-		var rpo *alertCondition
-		if healthItem.Status == "overdue" {
-			description := "备份完成时限已过，且没有新的成功备份。"
-			sourceEventID := project.ID + ":overdue"
-			if healthItem.DeadlineAt != nil {
-				description = fmt.Sprintf("备份应在 %s 前完成，但控制面仍未看到新的成功记录。", healthItem.DeadlineAt.Format(time.RFC3339))
-				sourceEventID = strconv.FormatInt(healthItem.DeadlineAt.Unix(), 10)
-			}
-			rpo = &alertCondition{Kind: "rpo_overdue", ProjectID: project.ID, ProjectName: project.Name,
-				SourceEventID: sourceEventID, Severity: "critical",
-				Summary: "备份项目超过 RPO", Description: description}
-		}
-		if err := s.reconcileAlert(ctx, "rpo:"+project.ID, rpo); err != nil {
-			return err
-		}
-		activityItem := activity[project.ID]
-		var failure *alertCondition
-		if isBackupFailureStatus(activityItem.LatestRunStatus) {
-			failure = &alertCondition{Kind: "backup_failure", ProjectID: project.ID, ProjectName: projectNames[project.ID],
-				SourceEventID: activityItem.LatestRunID, Severity: backupFailureSeverity(activityItem.LatestRunStatus),
-				Summary: "备份运行未成功", Description: fmt.Sprintf("最近一次备份运行状态为 %s。", activityItem.LatestRunStatus)}
-		}
-		if err := s.reconcileAlert(ctx, "backup:"+project.ID, failure); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Service) reconcileAlert(ctx context.Context, fingerprint string, condition *alertCondition) error {
-	now := s.now()
-	current, err := s.store.GetFiringAlertIncident(ctx, fingerprint)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return err
-	}
-	if condition == nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil
-		}
-		current.Status = "resolved"
-		current.UpdatedAt = now
-		current.ResolvedAt = &now
-		updated, err := s.store.UpdateAlertIncident(ctx, current)
-		if err != nil {
-			return err
-		}
-		return s.enqueueAlertNotifications(ctx, updated, "resolved")
-	}
-	if errors.Is(err, store.ErrNotFound) {
-		id, err := randomValue("alt", 10)
-		if err != nil {
-			return err
-		}
-		created, err := s.store.CreateAlertIncident(ctx, domain.AlertIncident{
-			ID: id, Fingerprint: fingerprint, Kind: condition.Kind, ProjectID: condition.ProjectID,
-			ProjectName: condition.ProjectName, Status: "firing", Severity: condition.Severity,
-			Summary: condition.Summary, Description: condition.Description, SourceEventID: condition.SourceEventID,
-			OccurrenceCount: 1, StartedAt: now, UpdatedAt: now,
-		})
-		if err != nil {
-			return err
-		}
-		return s.enqueueAlertNotifications(ctx, created, "firing")
-	}
-	if current.SourceEventID != condition.SourceEventID {
-		current.SourceEventID = condition.SourceEventID
-		current.OccurrenceCount++
-		current.UpdatedAt = now
-		current.Severity = condition.Severity
-		current.Description = condition.Description
-		current, err = s.store.UpdateAlertIncident(ctx, current)
-		if err != nil {
-			return err
-		}
-	}
-	return s.enqueueAlertNotifications(ctx, current, "repeat")
-}
-
-func (s *Service) enqueueAlertNotifications(ctx context.Context, alert domain.AlertIncident, transition string) error {
-	channels, err := s.store.ListNotificationChannels(ctx)
-	if err != nil {
-		return err
-	}
-	now := s.now()
-	for _, channel := range channels {
-		if !channel.Enabled || !containsString(channel.EventTypes, alert.Kind) || !matchesProject(channel.ProjectIDs, alert.ProjectID) {
-			continue
-		}
-		if transition == "resolved" && !channel.SendResolved {
-			continue
-		}
-		if transition == "repeat" {
-			interval := time.Duration(channel.RepeatIntervalSeconds) * time.Second
-			if now.Sub(alert.StartedAt) < interval {
-				continue
-			}
-		}
-		dedupeKey := alert.ID + ":" + channel.ID + ":" + transition
-		if transition == "repeat" {
-			dedupeKey += ":" + strconv.FormatInt(now.Unix()/int64(channel.RepeatIntervalSeconds), 10)
-		}
-		id, err := randomValue("ntf", 10)
-		if err != nil {
-			return err
-		}
-		err = s.store.CreateNotificationDelivery(ctx, domain.NotificationDelivery{
-			ID: id, AlertID: alert.ID, ChannelID: channel.ID, Transition: transition,
-			DedupeKey: dedupeKey, Status: "pending", NextAttemptAt: now, CreatedAt: now,
-		})
-		if err != nil && !errors.Is(err, store.ErrConflict) {
-			return err
-		}
-	}
-	return nil
-}
-
-func containsString(values []string, target string) bool {
+func fieldSet(values ...string) map[string]struct{} {
+	result := make(map[string]struct{}, len(values))
 	for _, value := range values {
-		if value == target {
-			return true
-		}
+		result[value] = struct{}{}
 	}
-	return false
+	return result
 }
 
-func matchesProject(projectIDs []string, projectID string) bool {
-	return len(projectIDs) == 0 || containsString(projectIDs, projectID)
-}
-
-func isBackupFailureStatus(status string) bool {
-	return status == domain.RunPartial || status == domain.RunFailed || status == domain.RunTimedOut ||
-		status == domain.RunUnknown || status == domain.RunCanceled
-}
-
-func backupFailureSeverity(status string) string {
-	if status == domain.RunPartial {
-		return "warning"
-	}
-	return "critical"
-}
-
-func (s *Service) DeliverNotifications(ctx context.Context) error {
-	now := s.now()
-	deliveries, err := s.store.ClaimNotificationDeliveries(ctx, now, now.Add(notificationLease), 20)
-	if err != nil {
-		return err
-	}
-	for _, delivery := range deliveries {
-		channel, channelErr := s.store.GetNotificationChannel(ctx, delivery.ChannelID)
-		alert, alertErr := s.store.GetAlertIncident(ctx, delivery.AlertID)
-		var sendErr error
-		if channelErr != nil {
-			sendErr = channelErr
-		} else if alertErr != nil {
-			sendErr = alertErr
-		} else if channel.DeletedAt != nil || !channel.Enabled {
-			sendErr = errors.New("notification channel is disabled or archived")
-		} else {
-			config, err := s.openNotificationConfig(channel)
-			if err != nil {
-				sendErr = err
-			} else {
-				sendErr = s.notificationSender(ctx, channel, config, alert, delivery.Transition)
-			}
-		}
-		if sendErr == nil {
-			if err := s.store.CompleteNotificationDelivery(ctx, delivery.ID, true, "", now, time.Time{}); err != nil {
-				return err
-			}
-			continue
-		}
-		lastError := boundedNotificationError(sendErr)
-		var next time.Time
-		if delivery.AttemptCount < maxNotificationAttempts && channelErr == nil && alertErr == nil && channel.DeletedAt == nil && channel.Enabled {
-			backoff := []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, time.Hour}[min(delivery.AttemptCount-1, 3)]
-			next = now.Add(backoff)
-		}
-		if err := s.store.CompleteNotificationDelivery(ctx, delivery.ID, false, lastError, now, next); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func boundedNotificationError(err error) string {
-	value := strings.TrimSpace(err.Error())
-	if len(value) > 500 {
-		value = value[:500]
-	}
-	return value
-}
-
-func (s *Service) RunNotificationWorker(ctx context.Context, logger *slog.Logger) {
-	run := func() {
-		cycleCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-		defer cancel()
-		if err := s.EvaluateAlerts(cycleCtx); err != nil {
-			logger.Error("evaluate notification alerts", "error", err)
-			return
-		}
-		if err := s.DeliverNotifications(cycleCtx); err != nil {
-			logger.Error("deliver notifications", "error", err)
-		}
-	}
-	run()
-	ticker := time.NewTicker(notificationWorkerInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			run()
-		}
+func notificationProvider(required, allowed, secret []string, sender notificationProviderSend) notificationProviderDefinition {
+	return notificationProviderDefinition{
+		RequiredFields: required,
+		AllowedFields:  fieldSet(allowed...),
+		SecretFields:   fieldSet(secret...),
+		Send:           sender,
 	}
 }

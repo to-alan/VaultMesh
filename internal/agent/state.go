@@ -166,9 +166,14 @@ func (s *StateStore) PendingReports() []domain.RunReport {
 func (s *StateStore) AckReport(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous := clonePersistedState(s.state)
 	delete(s.state.Outbox, id)
 	s.pruneHistoryLocked(2000)
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.state = previous
+		return err
+	}
+	return nil
 }
 
 func (s *StateStore) initializeMaps() {
@@ -286,5 +291,28 @@ func cloneReport(report domain.RunReport) domain.RunReport {
 	data, _ := json.Marshal(report)
 	var result domain.RunReport
 	_ = json.Unmarshal(data, &result)
+	return result
+}
+
+func clonePersistedState(state persistedState) persistedState {
+	result := persistedState{
+		Config:  cloneAgentConfig(state.Config),
+		RunKeys: make(map[string]string, len(state.RunKeys)),
+		Runs:    make(map[string]domain.RunReport, len(state.Runs)),
+		Outbox:  make(map[string]domain.RunReport, len(state.Outbox)),
+	}
+	if state.Identity != nil {
+		identity := *state.Identity
+		result.Identity = &identity
+	}
+	for key, id := range state.RunKeys {
+		result.RunKeys[key] = id
+	}
+	for id, report := range state.Runs {
+		result.Runs[id] = cloneReport(report)
+	}
+	for id, report := range state.Outbox {
+		result.Outbox[id] = cloneReport(report)
+	}
 	return result
 }

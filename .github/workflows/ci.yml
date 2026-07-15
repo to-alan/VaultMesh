@@ -88,7 +88,7 @@ jobs:
             --data '{"username":"admin","password":"vaultmesh-ci-administrator-password"}' \
             http://127.0.0.1:18081/api/v1/auth/login
           curl --fail --silent --cookie /tmp/vaultmesh-ci-cookie http://127.0.0.1:18081/api/v1/dashboard
-          web_config=$(curl --fail --silent --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:18080/config.js) || {
+          web_config=$(curl --fail --silent --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:18080/config.txt) || {
             docker logs vaultmesh-web-ci
             exit 1
           }

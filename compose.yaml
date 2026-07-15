@@ -33,9 +33,18 @@ services:
       VAULTMESH_WEBAUTHN_RP_NAME: ${VAULTMESH_WEBAUTHN_RP_NAME:-VaultMesh}
       VAULTMESH_WEBAUTHN_RP_ORIGINS: ${VAULTMESH_WEBAUTHN_RP_ORIGINS:-}
       VAULTMESH_COOKIE_SECURE: ${VAULTMESH_COOKIE_SECURE:-false}
+      VAULTMESH_COOKIE_SAME_SITE: ${VAULTMESH_COOKIE_SAME_SITE:-lax}
       VAULTMESH_AUTO_MIGRATE: "true"
     ports:
       - "127.0.0.1:${VAULTMESH_API_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       interval: 10s

@@ -174,6 +174,108 @@ func TestNotificationLifecycleDeduplicatesRepeatsAndSendsRecovery(t *testing.T) 
 	}
 }
 
+func TestPausingProjectResolvesActiveBackupAlerts(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{20}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	enrollment, err := service.CreateServer(ctx, "Paused alert host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "paused-alert-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{
+		Provider: "local", Name: "Paused alert repository", URL: "/tmp/paused-alert-repository", Password: "password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Paused project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 1 * * *", Timezone: "UTC", MaxRuntimeSeconds: 3600, GraceSeconds: 1800},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	finished := now.Add(time.Minute)
+	if err := dataStore.UpsertRun(ctx, domain.RunReport{
+		ID: "run_paused_failure", IdempotencyKey: "paused-failure", ProjectID: project.ID, ServerID: identity.AgentID,
+		ScheduledAt: now, StartedAt: now, FinishedAt: &finished, Status: domain.RunFailed,
+		Stats: map[string]any{"operation": "backup"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.EvaluateAlerts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	incidents, err := dataStore.ListAlertIncidents(ctx, 10)
+	if err != nil || len(incidents) != 1 || incidents[0].Status != "firing" {
+		t.Fatalf("failed run did not open an incident: %#v err=%v", incidents, err)
+	}
+	if _, err := service.SetProjectEnabled(ctx, project.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.EvaluateAlerts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	incidents, err = dataStore.ListAlertIncidents(ctx, 10)
+	if err != nil || len(incidents) != 1 || incidents[0].Status != "resolved" {
+		t.Fatalf("pausing project left its incident firing: %#v err=%v", incidents, err)
+	}
+}
+
+func TestNotificationChannelRejectsUnknownConfigFields(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{22}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(memory.New(), sealer)
+	_, err = service.CreateNotificationChannel(context.Background(), domain.NotificationChannel{
+		Name: "Unknown secret field", Type: "webhook", Enabled: true,
+		Config: map[string]string{
+			"url": "https://alerts.example.com/hook", "api_key": "must-not-be-echoed",
+		},
+	})
+	var validation *ValidationError
+	if !errors.As(err, &validation) || validation.Field != "config.api_key" {
+		t.Fatalf("unknown notification field was not rejected safely: %v", err)
+	}
+}
+
+func TestNotificationProviderDefinitionsAreSelfContained(t *testing.T) {
+	if len(notificationProviderDefinitions) == 0 {
+		t.Fatal("no notification providers are registered")
+	}
+	for providerType, definition := range notificationProviderDefinitions {
+		t.Run(providerType, func(t *testing.T) {
+			if definition.Send == nil {
+				t.Fatal("provider has no delivery adapter")
+			}
+			if len(definition.RequiredFields) == 0 {
+				t.Fatal("provider has no required fields")
+			}
+			for _, field := range definition.RequiredFields {
+				if _, ok := definition.AllowedFields[field]; !ok {
+					t.Fatalf("required field %q is not allowed", field)
+				}
+			}
+			for field := range definition.SecretFields {
+				if _, ok := definition.AllowedFields[field]; !ok {
+					t.Fatalf("secret field %q is not allowed", field)
+				}
+			}
+		})
+	}
+}
+
 func TestNotificationDeliveryRetriesAreBoundedAndPersistent(t *testing.T) {
 	ctx := context.Background()
 	dataStore := memory.New()

@@ -161,6 +161,12 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	if err := dataStore.UpsertRun(ctx, report); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := dataStore.pool.Exec(ctx, `UPDATE commands SET accepted_at = NULL, completed_at = NULL WHERE id = $1`, commandID); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.UpsertRun(ctx, report); err != nil {
+		t.Fatalf("terminal duplicate did not repair its manual command: %v", err)
+	}
 	staleRunningReport := report
 	staleRunningReport.Status = domain.RunRunning
 	staleRunningReport.FinishedAt = nil

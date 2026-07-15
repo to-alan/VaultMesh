@@ -82,3 +82,29 @@ func TestStateMutationsRollBackWhenPersistenceFails(t *testing.T) {
 		t.Fatalf("failed configuration persistence changed revision to %d", got)
 	}
 }
+
+func TestAckReportRollsBackWhenPersistenceFails(t *testing.T) {
+	directory := t.TempDir()
+	state, err := OpenState(filepath.Join(directory, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	report := domain.RunReport{
+		ID: "run_pending", IdempotencyKey: "project:pending", ProjectID: "project",
+		ScheduledAt: now, StartedAt: now, Status: domain.RunSucceeded,
+	}
+	if claimed, err := state.BeginRun(report); err != nil || !claimed {
+		t.Fatalf("begin run: claimed=%v err=%v", claimed, err)
+	}
+	if err := os.RemoveAll(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.AckReport(report.ID); err == nil {
+		t.Fatal("report acknowledgement unexpectedly persisted")
+	}
+	pending := state.PendingReports()
+	if len(pending) != 1 || pending[0].ID != report.ID {
+		t.Fatalf("failed acknowledgement removed the pending report: %#v", pending)
+	}
+}

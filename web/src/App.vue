@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { APIError, api, getAPIBaseURL } from './api'
+import { APIError, getAPIBaseURL } from './api'
 import {
   buildRepositoryEnvironment,
   buildRepositoryOptions,
@@ -14,35 +14,54 @@ import {
   repositoryProviders,
 } from './repositories'
 import { notificationDefaults, notificationProvider, notificationProviderGroups, notificationProviders } from './notifications'
+import {
+  alertKindLabel,
+  auditActionCategory,
+  auditActionLabel,
+  auditCategoryLabel,
+  auditResourceLabel,
+  cronDescription,
+  describeProjectHealth,
+  formatBytes,
+  formatCountdown,
+  formatDate,
+  formatDuration,
+  formatNextRun,
+  healthOrder,
+  localDateKey,
+  maintenanceSummary,
+  notificationTransitionLabel,
+  pageDescription,
+  projectHealthLabel,
+  repeatIntervalLabel,
+  retentionSummary,
+  runOperationGroup,
+  runOperationLabel,
+  scanSummary,
+  snapshotEntryIcon,
+  snapshotEntryName,
+  sourceSummary,
+  sourceTypeLabel,
+  statusLabel,
+  verificationSummary,
+} from './display'
+import type { AuditCategory, RunOperationFilter, SourceType, Tab } from './display'
+import {
+  buildProjectCron,
+  changeProjectSourceType as changeSourceType,
+  createProjectFormDraft,
+  createProjectSourceDraft,
+  projectFormDraftFromProject,
+  projectWriteInput,
+} from './forms/project'
+import { controlPlane } from './services'
+import type { NotificationChannelWriteInput } from './services'
 import type { AlertIncident, AuditEvent, Dashboard, EnrollmentResult, NotificationChannel, NotificationDelivery, Passkey, Profile, Project, ProjectHealth, Repository, Run, Server, Snapshot, SnapshotEntry } from './types'
+import { friendlyPasskeyError, parseCreationOptions, parseRequestOptions, serializeAssertion, serializeRegistration, suggestedPasskeyName } from './webauthn'
 
-type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'snapshots' | 'runs' | 'notifications' | 'audit' | 'profile'
-type SourceType = 'files' | 'mysql' | 'postgresql' | 'docker'
-type ScheduleMode = 'daily' | 'weekly' | 'custom'
-type AuditCategory = 'all' | 'authentication' | 'security' | 'configuration' | 'backup'
 type RunStatusFilter = 'all' | 'active' | 'succeeded' | 'attention'
-type RunOperationFilter = 'all' | 'backup' | 'maintenance' | 'recovery'
 type SecurityModal = 'password' | 'totp-setup' | 'totp-manage' | 'passkey-add' | 'passkey-delete' | 'reauthenticate' | null
 type PendingPasskeyAction = 'add' | 'delete' | null
-
-interface ProjectSourceDraft {
-  key: number
-  id?: string
-  type: SourceType
-  required: boolean
-  paths: string
-  excludes: string
-  host: string
-  port: number
-  username: string
-  password: string
-  database: string
-  password_configured: boolean
-  containers: string
-  include_volumes: boolean
-}
-
-let sourceSequence = 0
 
 const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 const commonTimezones = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Tokyo', 'UTC', 'Europe/London', 'America/New_York']
@@ -133,6 +152,7 @@ const notificationForm = reactive({
   repeat_minutes: 240,
   backup_failure: true,
   rpo_overdue: true,
+  allow_private_address: false,
   project_ids: [] as string[],
   config: notificationDefaults('webhook') as Record<string, string>,
 })
@@ -145,39 +165,7 @@ const repositoryForm = reactive({
   password: '',
   values: repositoryDefaults('cloudflare_r2') as Record<string, string>,
 })
-const projectForm = reactive({
-  server_id: '',
-  repository_id: '',
-  name: '',
-  sources: [newProjectSource('files')] as ProjectSourceDraft[],
-  schedule_mode: 'daily' as ScheduleMode,
-  schedule_time: '02:00',
-  weekday: '1',
-  custom_cron: '0 2 * * *',
-  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-  jitter_minutes: 5,
-  max_runtime_hours: 6,
-  grace_minutes: 60,
-  one_file_system: true,
-  exclude_caches: true,
-  exclude_if_present: '.nobackup',
-  exclude_larger_than: '',
-  retention_enabled: true,
-  retention_mode: 'count' as 'count' | 'smart' | 'gfs' | 'age',
-  keep_last: 14,
-  keep_hourly: 0,
-  keep_daily: 7,
-  keep_weekly: 4,
-  keep_monthly: 12,
-  keep_yearly: 3,
-  keep_within: '90d',
-  prune: false,
-  verification_mode: 'off' as 'off' | 'metadata' | 'subset' | 'full',
-  read_data_subset: '1%',
-  retention_cron: '30 3 * * *',
-  prune_cron: '0 4 * * 0',
-  verification_cron: '0 5 * * 0',
-})
+const projectForm = reactive(createProjectFormDraft())
 
 const activeRepositoryProvider = computed(() => repositoryProvider(repositoryForm.provider))
 const activeNotificationProvider = computed(() => notificationProvider(notificationForm.type))
@@ -217,7 +205,7 @@ const backupRuns = computed(() => runs.value.filter((run) => {
   const operation = String(run.stats?.operation || 'backup')
   return operation === 'backup'
 }))
-const projectCron = computed(buildProjectCron)
+const projectCron = computed(() => buildProjectCron(projectForm))
 const projectSchedulePreview = computed(() => {
   const jitter = projectForm.jitter_minutes > 0 ? `，最多随机延后 ${projectForm.jitter_minutes} 分钟` : ''
   return `${cronDescription(projectCron.value)} · ${projectForm.timezone}${jitter}`
@@ -422,10 +410,7 @@ async function login() {
   error.value = ''
   loading.value = true
   try {
-    const result = await api<{ mfa_required?: boolean }>('/api/v1/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ username: usernameInput.value.trim(), password: passwordInput.value }),
-    })
+    const result = await controlPlane.auth.login(usernameInput.value.trim(), passwordInput.value)
     if (result.mfa_required) {
       mfaLoginRequired.value = true
       passwordInput.value = ''
@@ -447,7 +432,7 @@ async function completeMFA() {
   error.value = ''
   loading.value = true
   try {
-    await api('/api/v1/auth/totp', { method: 'POST', body: JSON.stringify({ code: mfaCode.value }) })
+    await controlPlane.auth.completeTOTP(mfaCode.value)
     authenticated.value = true
     mfaLoginRequired.value = false
     mfaCode.value = ''
@@ -470,10 +455,10 @@ async function loginWithPasskey() {
   loading.value = true
   try {
     if (!window.PublicKeyCredential || !navigator.credentials) throw new Error('当前浏览器不支持通行密钥')
-    const options = await api<any>('/api/v1/auth/passkey/begin', { method: 'POST' })
+    const options = await controlPlane.auth.beginPasskey()
     const credential = await navigator.credentials.get({ publicKey: parseRequestOptions(options.publicKey) }) as PublicKeyCredential | null
     if (!credential) throw new Error('通行密钥验证已取消')
-    await api('/api/v1/auth/passkey/finish', { method: 'POST', body: JSON.stringify(serializeAssertion(credential)) })
+    await controlPlane.auth.finishPasskey(serializeAssertion(credential))
     authenticated.value = true
     mfaLoginRequired.value = false
     await loadInitialData()
@@ -486,7 +471,7 @@ async function loginWithPasskey() {
 
 async function logout() {
   try {
-    await api('/api/v1/auth/logout', { method: 'POST' })
+    await controlPlane.auth.logout()
   } catch {
     // Clear the local UI state even if the API is temporarily unreachable.
   } finally {
@@ -514,28 +499,28 @@ async function loadInitialData() {
 
 async function loadCoreData() {
   const [dashboardResult, serverResult, repositoryResult, projectResult, projectHealthResult, runResult, profileResult] = await Promise.all([
-    api<Dashboard>('/api/v1/dashboard'),
-    api<{ items: Server[] }>('/api/v1/servers'),
-    api<{ items: Repository[] }>('/api/v1/repositories'),
-    api<{ items: Project[] }>('/api/v1/projects'),
-    api<{ items: ProjectHealth[] }>('/api/v1/project-health'),
-    api<{ items: Run[] }>('/api/v1/runs?limit=100'),
-    api<Profile>('/api/v1/profile'),
+    controlPlane.dashboard.get(),
+    controlPlane.servers.list(),
+    controlPlane.repositories.list(),
+    controlPlane.projects.list(),
+    controlPlane.projects.health(),
+    controlPlane.runs.list(100),
+    controlPlane.profile.get(),
   ])
   dashboard.value = dashboardResult
-  servers.value = serverResult.items ?? []
-  repositories.value = repositoryResult.items ?? []
-  projects.value = projectResult.items ?? []
-  projectHealthItems.value = projectHealthResult.items ?? []
-  runs.value = runResult.items ?? []
+  servers.value = serverResult
+  repositories.value = repositoryResult
+  projects.value = projectResult
+  projectHealthItems.value = projectHealthResult
+  runs.value = runResult
   profile.value = profileResult
   lastUpdatedAt.value = Date.now()
   selectDefaults()
 }
 
 async function loadSnapshotsData() {
-  const result = await api<{ items: Snapshot[] }>('/api/v1/snapshots?limit=1000')
-  snapshots.value = (result.items ?? []).map((snapshot) => ({
+  const result = await controlPlane.snapshots.list(1000)
+  snapshots.value = result.map((snapshot) => ({
     ...snapshot,
     paths: snapshot.paths ?? [],
     tags: snapshot.tags ?? [],
@@ -545,26 +530,24 @@ async function loadSnapshotsData() {
 }
 
 async function loadAuditData() {
-  const result = await api<{ items: AuditEvent[] }>('/api/v1/audit-events?limit=200')
-  auditEvents.value = result.items ?? []
+  auditEvents.value = await controlPlane.audit.list(200)
   loadedTabs.add('audit')
 }
 
 async function loadNotificationData() {
   const [channelResult, incidentResult, deliveryResult] = await Promise.all([
-    api<{ items: NotificationChannel[] }>('/api/v1/notification-channels'),
-    api<{ items: AlertIncident[] }>('/api/v1/alert-incidents?limit=200'),
-    api<{ items: NotificationDelivery[] }>('/api/v1/notification-deliveries?limit=200'),
+    controlPlane.notifications.listChannels(),
+    controlPlane.notifications.listIncidents(200),
+    controlPlane.notifications.listDeliveries(200),
   ])
-  notificationChannels.value = channelResult.items ?? []
-  alertIncidents.value = incidentResult.items ?? []
-  notificationDeliveries.value = deliveryResult.items ?? []
+  notificationChannels.value = channelResult
+  alertIncidents.value = incidentResult
+  notificationDeliveries.value = deliveryResult
   loadedTabs.add('notifications')
 }
 
 async function loadRunsData() {
-  const result = await api<{ items: Run[] }>('/api/v1/runs?limit=100')
-  runs.value = result.items ?? []
+  runs.value = await controlPlane.runs.list(100)
 }
 
 async function loadTabData(tab: Tab, force = false) {
@@ -591,13 +574,10 @@ async function refreshSnapshotContext() {
 async function changePassword() {
   await perform(async () => {
     if (passwordForm.new_password !== passwordForm.confirm_password) throw new Error('两次输入的新密码不一致')
-    await api('/api/v1/profile/password', {
-      method: 'POST',
-      body: JSON.stringify({
-        current_password: passwordForm.current_password,
-        new_password: passwordForm.new_password,
-        verification_code: passwordForm.verification_code,
-      }),
+    await controlPlane.profile.changePassword({
+      current_password: passwordForm.current_password,
+      new_password: passwordForm.new_password,
+      verification_code: passwordForm.verification_code,
     })
     authenticated.value = false
     passwordForm.current_password = ''
@@ -611,9 +591,7 @@ async function changePassword() {
 
 async function startTOTPSetup() {
   await perform(async () => {
-    totpSetup.value = await api('/api/v1/profile/totp/begin', {
-      method: 'POST', body: JSON.stringify({ password: securityForm.password }),
-    })
+    totpSetup.value = await controlPlane.profile.beginTOTP(securityForm.password)
     recoveryCodes.value = []
     securityModalStep.value = 'scan'
     success.value = '请用验证器扫描二维码，然后输入当前 6 位验证码完成启用。'
@@ -622,9 +600,7 @@ async function startTOTPSetup() {
 
 async function enableTOTP() {
   await perform(async () => {
-    const result = await api<{ recovery_codes: string[] }>('/api/v1/profile/totp/enable', {
-      method: 'POST', body: JSON.stringify({ code: totpActivationCode.value }),
-    })
+    const result = await controlPlane.profile.enableTOTP(totpActivationCode.value)
     recoveryCodes.value = result.recovery_codes
     totpSetup.value = null
     totpActivationCode.value = ''
@@ -637,9 +613,7 @@ async function enableTOTP() {
 async function disableTOTP() {
   await perform(async () => {
     if (!securityForm.password || !securityForm.code) throw new Error('请填写当前密码和验证器动态码')
-    await api('/api/v1/profile/totp/disable', {
-      method: 'POST', body: JSON.stringify(securityForm),
-    })
+    await controlPlane.profile.disableTOTP(securityForm)
     authenticated.value = false
     securityModal.value = null
     success.value = '二步验证已停用，所有会话均已撤销，请重新登录。'
@@ -648,9 +622,7 @@ async function disableTOTP() {
 
 async function regenerateRecoveryCodes() {
   await perform(async () => {
-    const result = await api<{ recovery_codes: string[] }>('/api/v1/profile/recovery-codes', {
-      method: 'POST', body: JSON.stringify(securityForm),
-    })
+    const result = await controlPlane.profile.regenerateRecoveryCodes(securityForm)
     recoveryCodes.value = result.recovery_codes
     await loadCoreData()
     securityModalStep.value = 'recovery'
@@ -663,9 +635,7 @@ async function registerPasskey() {
     if (!window.PublicKeyCredential || !navigator.credentials) throw new Error('当前浏览器不支持通行密钥')
     let options: any
     try {
-      options = await api<any>('/api/v1/profile/passkeys/register/begin', {
-        method: 'POST', body: JSON.stringify({ name: passkeyName.value || suggestedPasskeyName() }),
-      })
+      options = await controlPlane.profile.beginPasskeyRegistration(passkeyName.value || suggestedPasskeyName())
     } catch (cause) {
       if (cause instanceof APIError && cause.code === 'reauthentication_required') {
         pendingPasskeyAction.value = 'add'
@@ -678,12 +648,10 @@ async function registerPasskey() {
     try {
       credential = await navigator.credentials.create({ publicKey: parseCreationOptions(options.publicKey) }) as PublicKeyCredential | null
     } catch (cause) {
-      throw friendlyPasskeyError(cause)
+      throw friendlyPasskeyError(cause, profile.value.webauthn_rp_id)
     }
     if (!credential) throw new Error('通行密钥注册已取消')
-    await api<Passkey>('/api/v1/profile/passkeys/register/finish', {
-      method: 'POST', body: JSON.stringify(serializeRegistration(credential)),
-    })
+    await controlPlane.profile.finishPasskeyRegistration(serializeRegistration(credential))
     passkeyName.value = ''
     await loadCoreData()
     securityModal.value = null
@@ -694,7 +662,7 @@ async function registerPasskey() {
 async function deletePasskey(passkey: Passkey) {
   await perform(async () => {
     try {
-      await api(`/api/v1/profile/passkeys/${encodeURIComponent(passkey.id)}/delete`, { method: 'POST' })
+      await controlPlane.profile.deletePasskey(passkey.id)
     } catch (cause) {
       if (cause instanceof APIError && cause.code === 'reauthentication_required') {
         selectedPasskey.value = passkey
@@ -752,9 +720,7 @@ function confirmPasskeyDeletion(passkey: Passkey) {
 
 async function completeReauthentication() {
   await perform(async () => {
-    await api('/api/v1/profile/reauthenticate', {
-      method: 'POST', body: JSON.stringify(reauthenticationForm),
-    })
+    await controlPlane.profile.reauthenticate(reauthenticationForm)
     const action = pendingPasskeyAction.value
     const passkey = selectedPasskey.value
     reauthenticationForm.password = ''
@@ -768,20 +734,6 @@ async function completeReauthentication() {
       await deletePasskey(passkey)
     }
   })
-}
-
-function suggestedPasskeyName(): string {
-  const nav = navigator as Navigator & { userAgentData?: { platform?: string } }
-  const platform = nav.userAgentData?.platform || navigator.platform || '当前设备'
-  return `${platform} · ${new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(new Date())}`
-}
-
-function friendlyPasskeyError(cause: unknown): Error {
-  if (!(cause instanceof DOMException)) return cause instanceof Error ? cause : new Error('通行密钥注册失败')
-  if (cause.name === 'InvalidStateError') return new Error('这台设备已经为 VaultMesh 注册过通行密钥，请使用现有密钥或换一台设备。')
-  if (cause.name === 'SecurityError') return new Error(`通行密钥域名校验失败：当前页面是 ${window.location.origin}，服务器 RP ID 是 ${profile.value.webauthn_rp_id || '未配置'}。`)
-  if (cause.name === 'NotAllowedError') return new Error('系统没有完成通行密钥创建：可能是你取消了操作、设备未设置锁屏，或浏览器等待超时。')
-  return new Error(`通行密钥注册失败：${cause.message || cause.name}`)
 }
 
 async function copyRecoveryCodes() {
@@ -811,10 +763,7 @@ function selectDefaults() {
 
 async function createServer() {
   await perform(async () => {
-    enrollment.value = await api<EnrollmentResult>('/api/v1/servers', {
-      method: 'POST',
-      body: JSON.stringify({ name: serverForm.name }),
-    })
+    enrollment.value = await controlPlane.servers.create(serverForm.name)
     serverForm.name = ''
     await loadCoreData()
     navigateTo('servers')
@@ -825,16 +774,13 @@ async function createServer() {
 async function createRepository() {
   await perform(async () => {
     if (!repositoryReady.value) throw new Error(`请完成仓库配置${repositoryMissing.value.length ? `：${repositoryMissing.value.join('、')}` : ''}`)
-    await api<Repository>('/api/v1/repositories', {
-      method: 'POST',
-      body: JSON.stringify({
-        provider: repositoryForm.provider,
-        name: repositoryForm.name,
-        url: repositoryURL.value,
-        password: repositoryForm.password,
-        environment: buildRepositoryEnvironment(repositoryForm.provider, repositoryForm.values),
-        options: buildRepositoryOptions(repositoryForm.provider, repositoryForm.values),
-      }),
+    await controlPlane.repositories.create({
+      provider: repositoryForm.provider,
+      name: repositoryForm.name,
+      url: repositoryURL.value,
+      password: repositoryForm.password,
+      environment: buildRepositoryEnvironment(repositoryForm.provider, repositoryForm.values),
+      options: buildRepositoryOptions(repositoryForm.provider, repositoryForm.values),
     })
     repositoryForm.name = ''
     repositoryForm.prefix = 'vaultmesh'
@@ -853,7 +799,7 @@ function resetNotificationForm() {
   editingNotificationID.value = ''
   Object.assign(notificationForm, {
     type: 'webhook', name: '', enabled: true, send_resolved: true, repeat_minutes: 240,
-    backup_failure: true, rpo_overdue: true, project_ids: [], config: notificationDefaults('webhook'),
+    backup_failure: true, rpo_overdue: true, allow_private_address: false, project_ids: [], config: notificationDefaults('webhook'),
   })
 }
 
@@ -867,6 +813,7 @@ function editNotificationChannel(channel: NotificationChannel) {
     repeat_minutes: Math.round(channel.repeat_interval_seconds / 60),
     backup_failure: channel.event_types.includes('backup_failure'),
     rpo_overdue: channel.event_types.includes('rpo_overdue'),
+    allow_private_address: channel.config?.allow_private_address === 'true',
     project_ids: [...(channel.project_ids ?? [])],
     config: { ...notificationDefaults(channel.type), ...(channel.config ?? {}) },
   })
@@ -878,22 +825,21 @@ async function saveNotificationChannel() {
     const eventTypes = [
       notificationForm.backup_failure ? 'backup_failure' : '',
       notificationForm.rpo_overdue ? 'rpo_overdue' : '',
-    ].filter(Boolean)
+    ].filter(Boolean) as NotificationChannelWriteInput['event_types']
     if (!eventTypes.length) throw new Error('至少选择一种告警事件。')
     const id = editingNotificationID.value
-    await api<NotificationChannel>(id ? `/api/v1/notification-channels/${encodeURIComponent(id)}` : '/api/v1/notification-channels', {
-      method: id ? 'PUT' : 'POST',
-      body: JSON.stringify({
-        name: notificationForm.name,
-        type: notificationForm.type,
-        enabled: notificationForm.enabled,
-        send_resolved: notificationForm.send_resolved,
-        repeat_interval_seconds: Number(notificationForm.repeat_minutes) * 60,
-        event_types: eventTypes,
-        project_ids: notificationForm.project_ids,
-        config: notificationForm.config,
-      }),
-    })
+    const input: NotificationChannelWriteInput = {
+      name: notificationForm.name,
+      type: notificationForm.type,
+      enabled: notificationForm.enabled,
+      send_resolved: notificationForm.send_resolved,
+      repeat_interval_seconds: Number(notificationForm.repeat_minutes) * 60,
+      event_types: eventTypes,
+      project_ids: notificationForm.project_ids,
+      config: { ...notificationForm.config, allow_private_address: String(notificationForm.allow_private_address) },
+    }
+    if (id) await controlPlane.notifications.replaceChannel(id, input)
+    else await controlPlane.notifications.createChannel(input)
     resetNotificationForm()
     await loadNotificationData()
     success.value = id ? '通知渠道已更新；留空的 Secret 字段保持原配置。' : '通知渠道已加密保存。建议立即发送测试消息。'
@@ -902,9 +848,7 @@ async function saveNotificationChannel() {
 
 async function toggleNotificationChannel(channel: NotificationChannel) {
   await perform(async () => {
-    await api(`/api/v1/notification-channels/${encodeURIComponent(channel.id)}`, {
-      method: 'PATCH', body: JSON.stringify({ enabled: !channel.enabled }),
-    })
+    await controlPlane.notifications.setChannelEnabled(channel.id, !channel.enabled)
     await loadNotificationData()
     success.value = channel.enabled ? `${channel.name} 已停用，不再创建新投递。` : `${channel.name} 已启用。`
   })
@@ -913,7 +857,7 @@ async function toggleNotificationChannel(channel: NotificationChannel) {
 async function testNotificationChannel(channel: NotificationChannel) {
   testingChannelIDs.value = new Set([...testingChannelIDs.value, channel.id])
   await perform(async () => {
-    await api(`/api/v1/notification-channels/${encodeURIComponent(channel.id)}/test`, { method: 'POST' })
+    await controlPlane.notifications.testChannel(channel.id)
     success.value = `测试消息已通过 ${channel.name} 发出。`
   })
   const next = new Set(testingChannelIDs.value)
@@ -924,7 +868,7 @@ async function testNotificationChannel(channel: NotificationChannel) {
 async function archiveNotificationChannel(channel: NotificationChannel) {
   if (!window.confirm(`归档通知渠道“${channel.name}”？历史投递记录会保留。`)) return
   await perform(async () => {
-    await api(`/api/v1/notification-channels/${encodeURIComponent(channel.id)}`, { method: 'DELETE' })
+    await controlPlane.notifications.archiveChannel(channel.id)
     if (editingNotificationID.value === channel.id) resetNotificationForm()
     await loadNotificationData()
     success.value = `${channel.name} 已归档。`
@@ -933,7 +877,7 @@ async function archiveNotificationChannel(channel: NotificationChannel) {
 
 async function evaluateAlertsNow() {
   await perform(async () => {
-    await api('/api/v1/alerts/evaluate', { method: 'POST' })
+    await controlPlane.notifications.evaluate()
     await Promise.all([loadNotificationData(), loadCoreData()])
     success.value = '已重新评估运行事实和 RPO，并处理当前可投递消息。'
   })
@@ -943,108 +887,12 @@ function notificationTypeLabel(type: string): string {
   return notificationProvider(type).label
 }
 
-function alertKindLabel(kind: string): string {
-  return kind === 'rpo_overdue' ? 'RPO 超时' : kind === 'backup_failure' ? '备份失败' : kind
-}
-
-function notificationTransitionLabel(transition: string): string {
-  return transition === 'resolved' ? '恢复' : transition === 'repeat' ? '重复提醒' : '首次告警'
-}
-
-function repeatIntervalLabel(seconds: number): string {
-  const minutes = Math.round(seconds / 60)
-  if (minutes % 1440 === 0) return `${minutes / 1440} 天`
-  if (minutes % 60 === 0) return `${minutes / 60} 小时`
-  return `${minutes} 分钟`
-}
-
 async function saveProject() {
   await perform(async () => {
-    const sources = projectForm.sources.map((source) => {
-      if (source.type === 'files') {
-        return {
-          id: source.id,
-          type: source.type,
-          paths: lines(source.paths),
-          excludes: lines(source.excludes),
-          required: source.required,
-        }
-      }
-      if (source.type === 'docker') {
-        return {
-          id: source.id,
-          type: source.type,
-          docker: {
-            containers: lines(source.containers),
-            include_volumes: source.include_volumes,
-          },
-          required: source.required,
-        }
-      }
-      return {
-        id: source.id,
-        type: source.type,
-        database: {
-          host: source.host,
-          port: Number(source.port),
-          username: source.username,
-          password: source.password,
-          database: source.database,
-        },
-        required: source.required,
-      }
-    })
-    const payload = {
-      server_id: projectForm.server_id,
-      repository_id: projectForm.repository_id,
-      name: projectForm.name,
-      sources,
-      schedule: {
-        cron: projectCron.value,
-        timezone: projectForm.timezone,
-        jitter_seconds: Number(projectForm.jitter_minutes) * 60,
-        max_runtime_seconds: Number(projectForm.max_runtime_hours) * 3600,
-        grace_seconds: Number(projectForm.grace_minutes) * 60,
-        missed_run_policy: 'skip',
-        concurrency_policy: 'forbid',
-      },
-      policy: {
-        backup: {
-          one_file_system: projectForm.one_file_system,
-          exclude_caches: projectForm.exclude_caches,
-          exclude_if_present: lines(projectForm.exclude_if_present),
-          exclude_larger_than: projectForm.exclude_larger_than.trim(),
-        },
-        retention: {
-          enabled: projectForm.retention_enabled,
-          mode: projectForm.retention_mode,
-          keep_last: Number(projectForm.keep_last),
-          keep_hourly: Number(projectForm.keep_hourly),
-          keep_daily: Number(projectForm.keep_daily),
-          keep_weekly: Number(projectForm.keep_weekly),
-          keep_monthly: Number(projectForm.keep_monthly),
-          keep_yearly: Number(projectForm.keep_yearly),
-          keep_within: projectForm.keep_within.trim(),
-          prune: projectForm.prune,
-        },
-        verification: {
-          mode: projectForm.verification_mode,
-          read_data_subset: projectForm.verification_mode === 'subset' ? projectForm.read_data_subset : '',
-        },
-        maintenance: {
-          separate: true,
-          timezone: projectForm.timezone,
-          retention_cron: projectForm.retention_enabled ? projectForm.retention_cron.trim() : '',
-          prune_cron: projectForm.retention_enabled && projectForm.prune ? projectForm.prune_cron.trim() : '',
-          verification_cron: projectForm.verification_mode !== 'off' ? projectForm.verification_cron.trim() : '',
-        },
-      },
-    }
+    const payload = projectWriteInput(projectForm)
     const projectID = editingProjectID.value
-    await api<Project>(projectID ? `/api/v1/projects/${encodeURIComponent(projectID)}` : '/api/v1/projects', {
-      method: projectID ? 'PUT' : 'POST',
-      body: JSON.stringify(payload),
-    })
+    if (projectID) await controlPlane.projects.replace(projectID, payload)
+    else await controlPlane.projects.create(payload)
     resetProjectForm()
     await loadCoreData()
     success.value = projectID
@@ -1053,135 +901,28 @@ async function saveProject() {
   })
 }
 
-function newProjectSource(type: SourceType): ProjectSourceDraft {
-  sourceSequence += 1
-  return {
-    key: sourceSequence,
-    type,
-    required: true,
-    paths: '/etc',
-    excludes: '',
-    host: '127.0.0.1',
-    port: type === 'mysql' ? 3306 : type === 'postgresql' ? 5432 : 0,
-    username: '',
-    password: '',
-    database: '',
-    password_configured: false,
-    containers: '',
-    include_volumes: true,
-  }
-}
-
 function resetProjectForm() {
   editingProjectID.value = ''
-  Object.assign(projectForm, {
-    server_id: servers.value[0]?.id ?? '',
-    repository_id: repositories.value[0]?.id ?? '',
-    name: '',
-    sources: [newProjectSource('files')],
-    schedule_mode: 'daily' as ScheduleMode,
-    schedule_time: '02:00',
-    weekday: '1',
-    custom_cron: '0 2 * * *',
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-    jitter_minutes: 5,
-    max_runtime_hours: 6,
-    grace_minutes: 60,
-    one_file_system: true,
-    exclude_caches: true,
-    exclude_if_present: '.nobackup',
-    exclude_larger_than: '',
-    retention_enabled: true,
-    retention_mode: 'count' as const,
-    keep_last: 14,
-    keep_hourly: 0,
-    keep_daily: 7,
-    keep_weekly: 4,
-    keep_monthly: 12,
-    keep_yearly: 3,
-    keep_within: '90d',
-    prune: false,
-    verification_mode: 'off' as const,
-    read_data_subset: '1%',
-    retention_cron: '30 3 * * *',
-    prune_cron: '0 4 * * 0',
-    verification_cron: '0 5 * * 0',
-  })
+  Object.assign(projectForm, createProjectFormDraft(
+    servers.value[0]?.id ?? '',
+    repositories.value[0]?.id ?? '',
+  ))
 }
 
 function openProjectEditor(project: Project) {
-  const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(project.schedule.cron)
-  const weekly = /^(\d{1,2}) (\d{1,2}) \* \* ([0-6])$/.exec(project.schedule.cron)
-  const retention = project.policy?.retention
-  const verification = project.policy?.verification
-  const maintenance = project.policy?.maintenance
-  const backup = project.policy?.backup
   editingProjectID.value = project.id
-  Object.assign(projectForm, {
-    server_id: project.server_id,
-    repository_id: project.repository_id,
-    name: project.name,
-    sources: project.sources.map((source) => ({
-      key: ++sourceSequence,
-      id: source.id,
-      type: source.type,
-      required: source.required,
-      paths: source.paths?.join('\n') || '',
-      excludes: source.excludes?.join('\n') || '',
-      host: source.database?.host || '127.0.0.1',
-      port: source.database?.port || (source.type === 'mysql' ? 3306 : source.type === 'postgresql' ? 5432 : 0),
-      username: source.database?.username || '',
-      password: '',
-      database: source.database?.database || '',
-      password_configured: Boolean(source.database),
-      containers: source.docker?.containers.join('\n') || '',
-      include_volumes: source.docker?.include_volumes ?? true,
-    })),
-    schedule_mode: daily ? 'daily' : weekly ? 'weekly' : 'custom',
-    schedule_time: daily ? clock(daily[2], daily[1]) : weekly ? clock(weekly[2], weekly[1]) : '02:00',
-    weekday: weekly?.[3] || '1',
-    custom_cron: project.schedule.cron,
-    timezone: project.schedule.timezone,
-    jitter_minutes: Math.round(project.schedule.jitter_seconds / 60),
-    max_runtime_hours: Math.max(1, Math.round(project.schedule.max_runtime_seconds / 3600)),
-    grace_minutes: Math.max(1, Math.round((project.schedule.grace_seconds || 3600) / 60)),
-    one_file_system: backup?.one_file_system ?? true,
-    exclude_caches: backup?.exclude_caches ?? true,
-    exclude_if_present: backup?.exclude_if_present?.join('\n') || '',
-    exclude_larger_than: backup?.exclude_larger_than || '',
-    retention_enabled: retention?.enabled ?? false,
-    retention_mode: retention?.mode || 'gfs',
-    keep_last: retention?.keep_last ?? 0,
-    keep_hourly: retention?.keep_hourly ?? 0,
-    keep_daily: retention?.keep_daily ?? 0,
-    keep_weekly: retention?.keep_weekly ?? 0,
-    keep_monthly: retention?.keep_monthly ?? 0,
-    keep_yearly: retention?.keep_yearly ?? 0,
-    keep_within: retention?.keep_within || '90d',
-    prune: retention?.prune ?? false,
-    verification_mode: verification?.mode || 'off',
-    read_data_subset: verification?.read_data_subset || '1%',
-    retention_cron: maintenance?.retention_cron || '30 3 * * *',
-    prune_cron: maintenance?.prune_cron || '0 4 * * 0',
-    verification_cron: maintenance?.verification_cron || '0 5 * * 0',
-  })
+  Object.assign(projectForm, projectFormDraftFromProject(project))
   window.requestAnimationFrame(() => {
     document.getElementById('project-builder')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   })
 }
 
 function addProjectSource(type: SourceType) {
-  projectForm.sources.push(newProjectSource(type))
+  projectForm.sources.push(createProjectSourceDraft(type))
 }
 
 function removeProjectSource(index: number) {
   if (projectForm.sources.length > 1) projectForm.sources.splice(index, 1)
-}
-
-function changeSourceType(source: ProjectSourceDraft) {
-  source.port = source.type === 'mysql' ? 3306 : source.type === 'postgresql' ? 5432 : 0
-  source.password = ''
-  source.password_configured = false
 }
 
 function generateRepositoryPassword() {
@@ -1202,18 +943,9 @@ function checkRepositoryConfiguration() {
   success.value = `配置格式有效，Restic 目标为 ${repositoryURL.value}`
 }
 
-function buildProjectCron(): string {
-  if (projectForm.schedule_mode === 'custom') return projectForm.custom_cron.trim()
-  const match = /^(\d{2}):(\d{2})$/.exec(projectForm.schedule_time)
-  const hour = Number(match?.[1] ?? 2)
-  const minute = Number(match?.[2] ?? 0)
-  if (projectForm.schedule_mode === 'weekly') return `${minute} ${hour} * * ${projectForm.weekday}`
-  return `${minute} ${hour} * * *`
-}
-
 async function runNow(project: Project) {
   await perform(async () => {
-    await api(`/api/v1/projects/${encodeURIComponent(project.id)}/run`, { method: 'POST' })
+    await controlPlane.projects.run(project.id)
     queuedProjectIDs.value = new Set([...queuedProjectIDs.value, project.id])
     success.value = `已向 ${project.name} 所在 Agent 排队发送手动备份。`
     window.setTimeout(() => {
@@ -1226,7 +958,7 @@ async function runNow(project: Project) {
 
 async function previewRetention(project: Project) {
   await perform(async () => {
-    await api(`/api/v1/projects/${encodeURIComponent(project.id)}/retention-preview`, { method: 'POST' })
+    await controlPlane.projects.previewRetention(project.id)
     queuedPreviewProjectIDs.value = new Set([...queuedPreviewProjectIDs.value, project.id])
     success.value = `已向 ${project.name} 所在 Agent 排队发送只读清理预览；结果会在运行记录和项目卡片中显示。`
     window.setTimeout(() => {
@@ -1242,9 +974,7 @@ async function refreshSnapshotInventory() {
     const targets = projects.value.filter((project) => project.enabled
       && (!snapshotProjectFilter.value || project.id === snapshotProjectFilter.value))
     if (!targets.length) throw new Error('当前筛选下没有可同步的已启用项目')
-    await Promise.all(targets.map((project) => api(`/api/v1/projects/${encodeURIComponent(project.id)}/snapshots/refresh`, {
-      method: 'POST',
-    })))
+    await Promise.all(targets.map((project) => controlPlane.projects.refreshSnapshots(project.id)))
     success.value = `已向 ${targets.length} 个项目的 Agent 排队同步快照索引，页面会自动获取结果。`
     queueSnapshotPolls()
   })
@@ -1263,10 +993,7 @@ async function browseSnapshotPath(path: string) {
   const snapshot = selectedSnapshot.value
   if (!snapshot) return
   await perform(async () => {
-    const command = await api<{ id: string }>(`/api/v1/projects/${encodeURIComponent(snapshot.project_id)}/snapshots/${encodeURIComponent(snapshot.id)}/browse`, {
-      method: 'POST',
-      body: JSON.stringify({ path }),
-    })
+    const command = await controlPlane.projects.browseSnapshot(snapshot.project_id, snapshot.id, path)
     snapshotBrowsePath.value = path
     snapshotBrowseCommandID.value = command.id
     pendingRestorePath.value = null
@@ -1277,10 +1004,7 @@ async function browseSnapshotPath(path: string) {
 
 async function toggleSnapshotProtection(snapshot: Snapshot) {
   await perform(async () => {
-    await api(`/api/v1/projects/${encodeURIComponent(snapshot.project_id)}/snapshots/${encodeURIComponent(snapshot.id)}/protect`, {
-      method: 'POST',
-      body: JSON.stringify({ protected: !snapshot.protected }),
-    })
+    await controlPlane.projects.protectSnapshot(snapshot.project_id, snapshot.id, !snapshot.protected)
     success.value = snapshot.protected
       ? '已排队取消保护；新的快照索引返回后生效。'
       : '已排队永久保护；保留策略将跳过这份快照。'
@@ -1298,10 +1022,7 @@ async function confirmSnapshotRestore() {
   const path = pendingRestorePath.value
   if (!snapshot || !path) return
   await perform(async () => {
-    const command = await api<{ id: string }>(`/api/v1/projects/${encodeURIComponent(snapshot.project_id)}/snapshots/${encodeURIComponent(snapshot.id)}/restore`, {
-      method: 'POST',
-      body: JSON.stringify({ path }),
-    })
+    const command = await controlPlane.projects.restoreSnapshot(snapshot.project_id, snapshot.id, path)
     snapshotRestoreCommandID.value = command.id
     pendingRestorePath.value = null
     success.value = '安全恢复已排队：Agent 只会写入新的隔离目录，并强制禁止覆盖已有文件。'
@@ -1322,10 +1043,7 @@ function queueSnapshotPolls() {
 async function toggleProject(project: Project) {
   await perform(async () => {
     const enabled = !project.enabled
-    await api<Project>(`/api/v1/projects/${encodeURIComponent(project.id)}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ enabled }),
-    })
+    await controlPlane.projects.setEnabled(project.id, enabled)
     await loadCoreData()
     success.value = enabled ? `${project.name} 已恢复，Agent 将重新加载执行计划。` : `${project.name} 已暂停，不再接受计划或手动备份。`
   })
@@ -1418,102 +1136,9 @@ function retryActiveTabData() {
   void loadTabData(activeTab.value, true)
 }
 
-function lines(value: string): string[] {
-  return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
-}
-
-function formatDate(value?: string): string {
-  if (!value) return '—'
-  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'medium' }).format(new Date(value))
-}
-
-function formatBytes(value?: number): string {
-  const bytes = Number(value || 0)
-  if (!bytes) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)))
-  const size = bytes / 1024 ** index
-  return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`
-}
-
-function snapshotEntryName(entry: SnapshotEntry): string {
-  return entry.name || entry.path.split('/').filter(Boolean).at(-1) || '/'
-}
-
-function snapshotEntryIcon(entry: SnapshotEntry): string {
-  if (entry.type === 'dir') return '▰'
-  if (entry.type === 'symlink') return '↗'
-  return '▪'
-}
-
-function localDateKey(date: Date): string {
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
-}
-
-function healthOrder(status: string): number {
-  if (['failed', 'timed_out', 'unknown'].includes(status)) return 0
-  if (['partial', 'running'].includes(status)) return 1
-  return 2
-}
-
-function formatDuration(run: Run): string {
-  if (!run.finished_at) return run.status === 'running' ? '执行中' : '—'
-  const seconds = Math.max(0, Math.round((new Date(run.finished_at).getTime() - new Date(run.started_at).getTime()) / 1000))
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  return `${minutes}m ${seconds % 60}s`
-}
-
-function formatCountdown(milliseconds: number): string {
-  const totalSeconds = Math.floor(milliseconds / 1000)
-  const days = Math.floor(totalSeconds / 86400)
-  const hours = Math.floor(totalSeconds % 86400 / 3600)
-  const minutes = Math.floor(totalSeconds % 3600 / 60)
-  const seconds = totalSeconds % 60
-  const clock = [hours, minutes, seconds].map((value) => String(value).padStart(2, '0')).join(':')
-  return days ? `${days}天 ${clock}` : clock
-}
-
-function projectHealthLabel(health?: ProjectHealth): string {
-  const labels: Record<string, string> = {
-    healthy: 'RPO 正常',
-    pending: '等待首次备份',
-    late: '备份迟到',
-    overdue: 'RPO 已超时',
-    paused: '监控已暂停',
-    invalid: '计划无效',
-  }
-  return labels[health?.status || ''] || '状态计算中'
-}
-
 function projectHealthSummary(health?: ProjectHealth): string {
-  if (!health) return '正在计算计划健康状态'
-  if (health.status === 'paused') return '项目暂停后不计算 RPO'
-  if (health.status === 'invalid') return 'Cron 或时区无法解析，请编辑项目修复'
-  if (health.status === 'overdue' && health.deadline_at) {
-    return `超过完成时限 ${formatCountdown(Math.max(0, nowEpoch.value - new Date(health.deadline_at).getTime()))}`
-  }
-  if (health.status === 'late' && health.deadline_at) {
-    return `宽限窗口剩余 ${formatCountdown(Math.max(0, new Date(health.deadline_at).getTime() - nowEpoch.value))}`
-  }
-  if (health.expected_at) return `${health.status === 'pending' ? '首次应执行' : '下次应执行'} ${formatDate(health.expected_at)}`
-  return '等待有效的执行计划'
+  return describeProjectHealth(health, nowEpoch.value)
 }
-
-function pageDescription(tab: Tab): string {
-  return {
-    overview: '运行态势、成功率与风险信号',
-    servers: 'Agent 在线状态与配置收敛',
-    repositories: 'Restic 目标与凭据边界',
-    projects: '数据源、调度策略与下次执行',
-    snapshots: '快照索引、文件浏览与隔离恢复',
-    runs: '端到端备份执行证据',
-    notifications: '联系点、告警去重、重复提醒与恢复通知',
-    audit: '管理员、安全与恢复操作的持久化证据',
-    profile: '密码、二步验证与通行密钥',
-  }[tab]
-}
-
 function navBadge(tab: Tab): number {
   return {
     overview: attentionCount.value,
@@ -1526,57 +1151,6 @@ function navBadge(tab: Tab): number {
     audit: failedAuditEvents.value,
     profile: profile.value.passkeys.length,
   }[tab]
-}
-
-function auditActionCategory(action: string): Exclude<AuditCategory, 'all'> {
-  if (action.startsWith('auth.') || action === 'agent.enroll') return 'authentication'
-  if (action.startsWith('security.')) return 'security'
-  if (action.startsWith('backup.') || action.startsWith('retention.') || action.startsWith('snapshot.')) return 'backup'
-  return 'configuration'
-}
-
-function auditActionLabel(action: string): string {
-  return {
-    'auth.password': '密码登录',
-    'auth.second_factor': '二步验证登录',
-    'auth.passkey': '通行密钥登录',
-    'auth.logout': '退出登录',
-    'agent.enroll': 'Agent 注册',
-    'security.reauthenticate': '敏感操作重新认证',
-    'security.password.change': '修改管理员密码',
-    'security.totp.setup.begin': '开始设置二步验证',
-    'security.totp.enable': '启用二步验证',
-    'security.totp.disable': '停用二步验证',
-    'security.recovery_codes.regenerate': '重新生成恢复码',
-    'security.passkey.register.begin': '开始注册通行密钥',
-    'security.passkey.register': '注册通行密钥',
-    'security.passkey.delete': '移除通行密钥',
-    'server.create': '创建服务器',
-    'repository.create': '创建备份仓库',
-    'project.create': '创建备份项目',
-    'project.update': '更新备份项目',
-    'notification.channel.create': '创建通知渠道',
-    'notification.channel.update': '更新通知渠道',
-    'notification.channel.archive': '归档通知渠道',
-    'notification.channel.test': '测试通知渠道',
-    'notification.alert.evaluate': '手动评估告警',
-    'backup.run': '立即执行备份',
-    'retention.preview': '预览保留策略',
-    'snapshot.refresh': '同步快照索引',
-    'snapshot.protect': '修改快照保护',
-    'snapshot.browse': '浏览快照',
-    'snapshot.restore': '创建恢复任务',
-  }[action] ?? action
-}
-
-function auditCategoryLabel(category: ReturnType<typeof auditActionCategory>): string {
-  return { authentication: '认证', security: '安全', configuration: '配置', backup: '备份与恢复' }[category]
-}
-
-function auditResourceLabel(event: AuditEvent): string {
-  const type = { account: '管理员账号', server: '服务器', repository: '备份仓库', project: '备份项目', snapshot: '快照', passkey: '通行密钥' }[event.resource_type || '']
-  if (!type) return '—'
-  return event.resource_id ? `${type} · ${event.resource_id}` : type
 }
 
 function serverName(id: string): string {
@@ -1595,36 +1169,6 @@ function providerLabel(provider: Repository['provider']): string {
   return repositoryProvider(provider).label
 }
 
-function sourceTypeLabel(type: SourceType): string {
-  return { files: '文件与目录', mysql: 'MySQL', postgresql: 'PostgreSQL', docker: 'Docker' }[type]
-}
-
-function sourceSummary(source: Project['sources'][number]): string {
-  if (source.type === 'files') {
-    const paths = source.paths ?? []
-    const visible = paths.slice(0, 2).join(', ')
-    return `文件 · ${visible || '未配置路径'}${paths.length > 2 ? ` +${paths.length - 2}` : ''}`
-  }
-  if (source.type === 'docker') {
-    const containers = source.docker?.containers ?? []
-    return `Docker · ${containers.slice(0, 2).join(', ') || '未配置容器'}${containers.length > 2 ? ` +${containers.length - 2}` : ''}`
-  }
-  const database = source.database
-  if (!database) return sourceTypeLabel(source.type)
-  return `${sourceTypeLabel(source.type)} · ${database.database}@${database.host}:${database.port}`
-}
-
-function retentionSummary(project: Project): string {
-  const retention = project.policy?.retention
-  if (!retention?.enabled) return '不自动清理'
-  switch (retention.mode || 'gfs') {
-    case 'count': return `最多 ${retention.keep_last} 份`
-    case 'smart': return '智能：日 7 / 周 4 / 月 12'
-    case 'age': return `保留最近 ${retention.keep_within}`
-    default: return `GFS · 最近 ${retention.keep_last || 0} / 日 ${retention.keep_daily || 0} / 周 ${retention.keep_weekly || 0} / 月 ${retention.keep_monthly || 0}`
-  }
-}
-
 function latestRetentionPreview(projectID: string): Run | undefined {
   return runs.value.find((run) => run.project_id === projectID && run.stats?.operation === 'retention_preview')
 }
@@ -1636,156 +1180,8 @@ function retentionPreviewSummary(projectID: string): string {
   return `保留 ${Number(preview.stats?.snapshots_kept || 0)} 份 · 将删除 ${Number(preview.stats?.snapshots_removed || 0)} 份 · 未执行删除`
 }
 
-function runOperationLabel(run: Run): string {
-  return {
-    retention_preview: '清理预览',
-    retention: '快照清理',
-    prune: '空间回收',
-    verification: '仓库校验',
-    snapshot_sync: '快照同步',
-    snapshot_protect: '快照保护',
-    snapshot_browse: '目录浏览',
-    snapshot_restore: '安全恢复',
-  }[String(run.stats?.operation || '')] || '备份'
-}
-
-function runOperationGroup(run: Run): Exclude<RunOperationFilter, 'all'> {
-  const operation = String(run.stats?.operation || 'backup')
-  if (['retention_preview', 'retention', 'prune', 'verification'].includes(operation)) return 'maintenance'
-  if (['snapshot_browse', 'snapshot_restore'].includes(operation)) return 'recovery'
-  return 'backup'
-}
-
-function maintenanceSummary(project: Project): string {
-  const maintenance = project.policy?.maintenance
-  if (!maintenance?.separate) return '备份后执行（兼容模式）'
-  const tasks = []
-  if (project.policy?.retention.enabled) tasks.push(`清理 ${maintenance.retention_cron || '—'}`)
-  if (project.policy?.retention.prune) tasks.push(`Prune ${maintenance.prune_cron || '—'}`)
-  if (project.policy?.verification.mode && project.policy.verification.mode !== 'off') tasks.push(`校验 ${maintenance.verification_cron || '—'}`)
-  return tasks.join(' · ') || '无维护任务'
-}
-
-function verificationSummary(project: Project): string {
-  const verification = project.policy?.verification
-  if (!verification || verification.mode === 'off') return '关闭'
-  if (verification.mode === 'metadata') return '仓库结构'
-  if (verification.mode === 'subset') return `抽样 ${verification.read_data_subset || '—'}`
-  return '完整数据'
-}
-
-function scanSummary(project: Project): string {
-  const backup = project.policy?.backup
-  return `${backup?.one_file_system ? '不跨文件系统' : '允许跨文件系统'} · ${backup?.exclude_caches ? '忽略缓存' : '包含缓存'}`
-}
-
-function cronDescription(cron: string): string {
-  const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(cron)
-  if (daily) return `每天 ${clock(daily[2], daily[1])}`
-  const weekly = /^(\d{1,2}) (\d{1,2}) \* \* ([0-6])$/.exec(cron)
-  if (weekly) return `每${weekdays[Number(weekly[3])]} ${clock(weekly[2], weekly[1])}`
-  return `Cron ${cron}`
-}
-
-function clock(hour: string, minute: string): string {
-  return `${hour.padStart(2, '0')}:${minute.padStart(2, '0')}`
-}
-
-function formatNextRun(project: Project): string {
-  if (!project.enabled) return '项目已暂停'
-  if (!project.next_run_at) return '等待 Agent 应用计划'
-  try {
-    return new Intl.DateTimeFormat('zh-CN', {
-      timeZone: project.schedule.timezone,
-      month: 'numeric',
-      day: 'numeric',
-      weekday: 'short',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    }).format(new Date(project.next_run_at))
-  } catch {
-    return formatDate(project.next_run_at)
-  }
-}
-
-function statusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    pending: '待注册', online: '在线', offline: '离线', running: '执行中',
-    succeeded: '成功', partial: '部分成功', failed: '失败', timed_out: '超时',
-    canceled: '已取消', unknown: '状态未知',
-  }
-  return labels[status] ?? status
-}
-
 function installCommand(result: EnrollmentResult): string {
   return `sudo vaultmesh-agent --server ${apiBaseURL} --enrollment-token ${result.enrollment_token}`
-}
-
-function base64urlToBuffer(value: string): ArrayBuffer {
-  const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
-  const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4)
-  const binary = atob(padded)
-  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
-  return bytes.buffer
-}
-
-function bufferToBase64url(value: ArrayBuffer | null): string | null {
-  if (!value) return null
-  const bytes = new Uint8Array(value)
-  let binary = ''
-  bytes.forEach((byte) => { binary += String.fromCharCode(byte) })
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-}
-
-function parseCreationOptions(input: any): PublicKeyCredentialCreationOptions {
-  return {
-    ...input,
-    challenge: base64urlToBuffer(input.challenge),
-    user: { ...input.user, id: base64urlToBuffer(input.user.id) },
-    excludeCredentials: (input.excludeCredentials ?? []).map((item: any) => ({ ...item, id: base64urlToBuffer(item.id) })),
-  }
-}
-
-function parseRequestOptions(input: any): PublicKeyCredentialRequestOptions {
-  return {
-    ...input,
-    challenge: base64urlToBuffer(input.challenge),
-    allowCredentials: (input.allowCredentials ?? []).map((item: any) => ({ ...item, id: base64urlToBuffer(item.id) })),
-  }
-}
-
-function serializeRegistration(credential: PublicKeyCredential) {
-  const response = credential.response as AuthenticatorAttestationResponse
-  return {
-    id: credential.id,
-    rawId: bufferToBase64url(credential.rawId),
-    type: credential.type,
-    authenticatorAttachment: credential.authenticatorAttachment,
-    clientExtensionResults: credential.getClientExtensionResults(),
-    response: {
-      clientDataJSON: bufferToBase64url(response.clientDataJSON),
-      attestationObject: bufferToBase64url(response.attestationObject),
-      transports: typeof response.getTransports === 'function' ? response.getTransports() : [],
-    },
-  }
-}
-
-function serializeAssertion(credential: PublicKeyCredential) {
-  const response = credential.response as AuthenticatorAssertionResponse
-  return {
-    id: credential.id,
-    rawId: bufferToBase64url(credential.rawId),
-    type: credential.type,
-    authenticatorAttachment: credential.authenticatorAttachment,
-    clientExtensionResults: credential.getClientExtensionResults(),
-    response: {
-      clientDataJSON: bufferToBase64url(response.clientDataJSON),
-      authenticatorData: bufferToBase64url(response.authenticatorData),
-      signature: bufferToBase64url(response.signature),
-      userHandle: bufferToBase64url(response.userHandle),
-    },
-  }
 }
 
 onMounted(async () => {
@@ -1798,7 +1194,7 @@ onMounted(async () => {
     if (authenticated.value && !loading.value) void refreshData(true)
   }, 30000)
   try {
-    await api('/api/v1/auth/session')
+    await controlPlane.auth.session()
     authenticated.value = true
     await loadInitialData()
   } catch (cause) {
@@ -2302,6 +1698,7 @@ onBeforeUnmount(() => {
               </section>
               <section class="form-section compact-section"><div class="section-title"><span>2</span><div><strong>去重与路由</strong><small>持续故障只按周期重复提醒</small></div></div>
                 <label>重复提醒间隔（分钟）<input v-model.number="notificationForm.repeat_minutes" type="number" min="5" max="10080" required /><small class="field-help">默认 240 分钟。相同 Incident 在此期间不会重复发送。</small></label>
+                <label class="check-row security-choice"><input v-model="notificationForm.allow_private_address" type="checkbox" /><span><strong>允许访问私有网络地址</strong><small>仅用于自建 Gotify、ntfy、SMTP 或内网 Webhook。默认阻止回环与 RFC1918 地址；链路本地和云元数据地址始终禁止。</small></span></label>
                 <div class="project-routing"><strong>项目范围</strong><small>不勾选表示所有项目；新项目也会自动纳入。</small><div><label v-for="project in projects" :key="project.id"><input v-model="notificationForm.project_ids" type="checkbox" :value="project.id" /><span>{{ project.name }}<small>{{ serverName(project.server_id) }}</small></span></label></div></div>
               </section>
               <div class="form-actions"><button v-if="editingNotificationID" type="button" class="ghost" @click="resetNotificationForm">取消</button><button class="primary" :disabled="loading">{{ editingNotificationID ? '保存渠道' : '加密并创建渠道' }}</button></div>

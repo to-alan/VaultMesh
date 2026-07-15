@@ -429,6 +429,7 @@ func (s *Store) GetSnapshot(_ context.Context, projectID, snapshotID string) (do
 func (s *Store) UpsertRun(_ context.Context, report domain.RunReport) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	terminalDuplicate := false
 	if existingID, ok := s.runKeys[report.IdempotencyKey]; ok && existingID != report.ID {
 		return store.ErrConflict
 	}
@@ -438,16 +439,19 @@ func (s *Store) UpsertRun(_ context.Context, report domain.RunReport) error {
 		}
 		if existing.Status != domain.RunRunning {
 			// Terminal run facts are immutable. A delayed duplicate running report
-			// is acknowledged without regressing the stored result.
-			return nil
+			// is acknowledged without regressing the stored result. Continue so a
+			// related manual command can still be repaired idempotently.
+			terminalDuplicate = true
 		}
 	}
-	project, ok := s.projects[report.ProjectID]
-	if !ok || project.ServerID != report.ServerID {
-		return store.ErrNotFound
+	if !terminalDuplicate {
+		project, ok := s.projects[report.ProjectID]
+		if !ok || project.ServerID != report.ServerID {
+			return store.ErrNotFound
+		}
+		s.runKeys[report.IdempotencyKey] = report.ID
+		s.runs[report.ID] = cloneRun(report)
 	}
-	s.runKeys[report.IdempotencyKey] = report.ID
-	s.runs[report.ID] = cloneRun(report)
 	if commandID, ok := strings.CutPrefix(report.IdempotencyKey, "manual:"); ok {
 		now := time.Now().UTC()
 		s.accepted[commandID] = now

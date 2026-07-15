@@ -44,6 +44,7 @@ type AdminAuthConfig struct {
 	Username          string
 	Password          string
 	CookieSecure      bool
+	CookieSameSite    string
 	SessionTTL        time.Duration
 	WebAuthnRPID      string
 	WebAuthnRPName    string
@@ -57,6 +58,12 @@ type adminSession struct {
 }
 
 type pendingMFA struct {
+	ExpiresAt time.Time
+	Attempts  int
+}
+
+type pendingTOTPSetup struct {
+	Secret    string
 	ExpiresAt time.Time
 	Attempts  int
 }
@@ -84,19 +91,19 @@ type adminSecurityData struct {
 }
 
 type adminAuthenticator struct {
-	service      *Service
-	cookieSecure bool
-	sessionTTL   time.Duration
-	webAuthn     *webauthn.WebAuthn
+	service        *Service
+	cookieSecure   bool
+	cookieSameSite http.SameSite
+	sessionTTL     time.Duration
+	webAuthn       *webauthn.WebAuthn
 
-	mu             sync.Mutex
-	account        domain.AdminAccount
-	security       adminSecurityData
-	pendingTOTPKey string
-	pendingTOTPAt  time.Time
-	sessions       map[[32]byte]adminSession
-	pendingMFA     map[[32]byte]pendingMFA
-	ceremonies     map[[32]byte]webAuthnCeremony
+	mu          sync.Mutex
+	account     domain.AdminAccount
+	security    adminSecurityData
+	sessions    map[[32]byte]adminSession
+	pendingMFA  map[[32]byte]pendingMFA
+	pendingTOTP map[[32]byte]pendingTOTPSetup
+	ceremonies  map[[32]byte]webAuthnCeremony
 }
 
 type adminWebAuthnUser struct {
@@ -125,13 +132,22 @@ func newAdminAuthenticator(ctx context.Context, service *Service, config AdminAu
 	if config.SessionTTL <= 0 {
 		config.SessionTTL = defaultSessionTTL
 	}
+	cookieSameSite, err := parseCookieSameSite(config.CookieSameSite)
+	if err != nil {
+		return nil, err
+	}
+	if cookieSameSite == http.SameSiteNoneMode && !config.CookieSecure {
+		return nil, fmt.Errorf("SameSite=None administrator cookies require Secure")
+	}
 	authenticator := &adminAuthenticator{
-		service:      service,
-		cookieSecure: config.CookieSecure,
-		sessionTTL:   config.SessionTTL,
-		sessions:     make(map[[32]byte]adminSession),
-		pendingMFA:   make(map[[32]byte]pendingMFA),
-		ceremonies:   make(map[[32]byte]webAuthnCeremony),
+		service:        service,
+		cookieSecure:   config.CookieSecure,
+		cookieSameSite: cookieSameSite,
+		sessionTTL:     config.SessionTTL,
+		sessions:       make(map[[32]byte]adminSession),
+		pendingMFA:     make(map[[32]byte]pendingMFA),
+		pendingTOTP:    make(map[[32]byte]pendingTOTPSetup),
+		ceremonies:     make(map[[32]byte]webAuthnCeremony),
 	}
 	if config.WebAuthnRPID != "" || len(config.WebAuthnRPOrigins) > 0 {
 		if config.WebAuthnRPID == "" || len(config.WebAuthnRPOrigins) == 0 {
@@ -189,6 +205,19 @@ func newAdminAuthenticator(ctx context.Context, service *Service, config AdminAu
 	return authenticator, nil
 }
 
+func parseCookieSameSite(value string) (http.SameSite, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "lax":
+		return http.SameSiteLaxMode, nil
+	case "strict":
+		return http.SameSiteStrictMode, nil
+	case "none":
+		return http.SameSiteNoneMode, nil
+	default:
+		return http.SameSiteDefaultMode, fmt.Errorf("administrator cookie SameSite must be lax, strict, or none")
+	}
+}
+
 func validateAdminPassword(password string) error {
 	if len([]byte(password)) < passwordMinBytes || len([]byte(password)) > passwordMaxBytes {
 		return fmt.Errorf("administrator password must contain 12 to 72 bytes")
@@ -204,6 +233,12 @@ func (a *adminAuthenticator) authenticate(username, password string) bool {
 	validUsername := subtle.ConstantTimeCompare(usernameSum[:], storedUsernameSum[:]) == 1
 	validPassword := bcrypt.CompareHashAndPassword(a.account.PasswordHash, []byte(password)) == nil
 	return validUsername && validPassword
+}
+
+func (a *adminAuthenticator) verifyPassword(password string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return bcrypt.CompareHashAndPassword(a.account.PasswordHash, []byte(password)) == nil
 }
 
 func (a *adminAuthenticator) totpEnabled() bool {
@@ -321,7 +356,9 @@ func (a *adminAuthenticator) deleteSession(r *http.Request) {
 			continue
 		}
 		a.mu.Lock()
-		delete(a.sessions, sha256.Sum256([]byte(cookie.Value)))
+		tokenSum := sha256.Sum256([]byte(cookie.Value))
+		delete(a.sessions, tokenSum)
+		delete(a.pendingTOTP, tokenSum)
 		a.mu.Unlock()
 	}
 }
@@ -331,6 +368,8 @@ func (a *adminAuthenticator) revokeAllSessions() {
 	defer a.mu.Unlock()
 	a.sessions = make(map[[32]byte]adminSession)
 	a.pendingMFA = make(map[[32]byte]pendingMFA)
+	a.pendingTOTP = make(map[[32]byte]pendingTOTPSetup)
+	a.ceremonies = make(map[[32]byte]webAuthnCeremony)
 }
 
 func (a *adminAuthenticator) saveLocked(ctx context.Context) error {
@@ -359,8 +398,13 @@ func (a *adminAuthenticator) verifySecondFactorLocked(ctx context.Context, code 
 		}
 		expected, err := totp.GenerateCode(a.security.TOTPSecret, time.Unix(step*30, 0))
 		if err == nil && constantStringEqual(expected, code) {
+			previousStep := a.security.LastTOTPStep
 			a.security.LastTOTPStep = step
-			return a.saveLocked(ctx)
+			if err := a.saveLocked(ctx); err != nil {
+				a.security.LastTOTPStep = previousStep
+				return err
+			}
+			return nil
 		}
 	}
 	if allowRecovery {
@@ -368,8 +412,13 @@ func (a *adminAuthenticator) verifySecondFactorLocked(ctx context.Context, code 
 		candidate := recoveryCodeHash(normalized)
 		for index, hash := range a.security.RecoveryCodeHash {
 			if constantStringEqual(hash, candidate) {
+				previousHashes := append([]string(nil), a.security.RecoveryCodeHash...)
 				a.security.RecoveryCodeHash = append(a.security.RecoveryCodeHash[:index], a.security.RecoveryCodeHash[index+1:]...)
-				return a.saveLocked(ctx)
+				if err := a.saveLocked(ctx); err != nil {
+					a.security.RecoveryCodeHash = previousHashes
+					return err
+				}
+				return nil
 			}
 		}
 	}
@@ -391,7 +440,7 @@ func (a *adminAuthenticator) setCeremonyCookie(w http.ResponseWriter, token stri
 func (a *adminAuthenticator) setOpaqueCookie(w http.ResponseWriter, name, value string, maxAge time.Duration) {
 	http.SetCookie(w, &http.Cookie{
 		Name: name, Value: value, Path: "/",
-		Secure: a.cookieSecure, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		Secure: a.cookieSecure, HttpOnly: true, SameSite: a.cookieSameSite,
 	})
 	_ = maxAge // Expiry is enforced by the server; browser cookies remain non-persistent.
 }
@@ -407,7 +456,7 @@ func (a *adminAuthenticator) clearSessionCookies(w http.ResponseWriter) {
 	} {
 		http.SetCookie(w, &http.Cookie{
 			Name: cookie.name, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0),
-			Secure: cookie.secure, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+			Secure: cookie.secure, HttpOnly: true, SameSite: a.cookieSameSite,
 		})
 	}
 }
@@ -415,7 +464,7 @@ func (a *adminAuthenticator) clearSessionCookies(w http.ResponseWriter) {
 func (a *adminAuthenticator) clearCookie(w http.ResponseWriter, name string, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name: name, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0),
-		Secure: secure, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		Secure: secure, HttpOnly: true, SameSite: a.cookieSameSite,
 	})
 }
 
@@ -449,11 +498,30 @@ func (a *adminAuthenticator) removeExpiredLocked(now time.Time) {
 			delete(a.pendingMFA, token)
 		}
 	}
+	for token, setup := range a.pendingTOTP {
+		if !setup.ExpiresAt.After(now) {
+			delete(a.pendingTOTP, token)
+		}
+	}
 	for token, session := range a.ceremonies {
 		if !session.ExpiresAt.After(now) {
 			delete(a.ceremonies, token)
 		}
 	}
+}
+
+func (a *adminAuthenticator) sessionTokenSum(r *http.Request) ([32]byte, bool) {
+	cookie, err := r.Cookie(a.cookieName())
+	if err != nil || cookie.Value == "" {
+		return [32]byte{}, false
+	}
+	return sha256.Sum256([]byte(cookie.Value)), true
+}
+
+func cloneAdminSecurityData(value adminSecurityData) adminSecurityData {
+	value.RecoveryCodeHash = append([]string(nil), value.RecoveryCodeHash...)
+	value.Passkeys = append([]storedPasskey(nil), value.Passkeys...)
+	return value
 }
 
 func randomOpaqueToken() (string, [32]byte, error) {
@@ -499,4 +567,15 @@ func removeOldestMFA(sessions map[[32]byte]pendingMFA) {
 		}
 	}
 	delete(sessions, oldest)
+}
+
+func removeOldestTOTPSetup(setups map[[32]byte]pendingTOTPSetup) {
+	var oldest [32]byte
+	var expiry time.Time
+	for token, setup := range setups {
+		if expiry.IsZero() || setup.ExpiresAt.Before(expiry) {
+			oldest, expiry = token, setup.ExpiresAt
+		}
+	}
+	delete(setups, oldest)
 }

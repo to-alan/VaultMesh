@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -16,7 +17,15 @@ import (
 	"github.com/to-alan/vaultmesh/internal/domain"
 )
 
-var ErrNotModified = errors.New("configuration not modified")
+const (
+	maxControlPlaneResponse = 4 << 20
+	maxDiscardResponse      = 4 << 10
+)
+
+var (
+	ErrNotModified = errors.New("configuration not modified")
+	errRedirect    = errors.New("control plane redirects are not allowed")
+)
 
 type Client struct {
 	baseURL string
@@ -27,17 +36,26 @@ type Client struct {
 func NewClient(baseURL, version string) (*Client, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	parsed, err := url.Parse(baseURL)
-	if err != nil || parsed.Host == "" {
+	if err != nil || parsed.Host == "" || parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return nil, errors.New("control plane URL is invalid")
 	}
-	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1")) {
+	if parsed.EscapedPath() != "" && parsed.EscapedPath() != "/" {
+		return nil, errors.New("control plane URL must not contain a path")
+	}
+	host := parsed.Hostname()
+	isLoopback := host == "localhost"
+	if ip := net.ParseIP(host); ip != nil {
+		isLoopback = ip.IsLoopback()
+	}
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopback) {
 		return nil, errors.New("control plane URL must use HTTPS; HTTP is allowed only on localhost")
 	}
 	return &Client{
 		baseURL: baseURL,
 		version: version,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:       30 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return errRedirect },
 			Transport: &http.Transport{
 				MaxIdleConns:        20,
 				MaxIdleConnsPerHost: 10,
@@ -130,11 +148,33 @@ func (c *Client) doJSON(ctx context.Context, method, path, token string, input, 
 		return fmt.Errorf("control plane returned HTTP %d", response.StatusCode)
 	}
 	if output == nil || response.StatusCode == http.StatusNoContent {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxDiscardResponse))
 		return nil
 	}
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 4<<20))
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxControlPlaneResponse+1))
+	if err != nil {
+		return fmt.Errorf("read control plane response: %w", err)
+	}
+	if len(data) > maxControlPlaneResponse {
+		return errors.New("control plane response exceeds size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(output); err != nil {
 		return fmt.Errorf("decode control plane response: %w", err)
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return fmt.Errorf("decode control plane response: %w", err)
+	}
+	return nil
+}
+
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("response contains multiple JSON values")
+		}
+		return err
 	}
 	return nil
 }

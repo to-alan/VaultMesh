@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/pquerna/otp/totp"
 	"github.com/to-alan/vaultmesh/internal/domain"
 	"github.com/to-alan/vaultmesh/internal/secret"
+	"github.com/to-alan/vaultmesh/internal/store"
 	"github.com/to-alan/vaultmesh/internal/store/memory"
 )
 
@@ -354,6 +356,24 @@ func TestAdminLoginUsesProtectedCookieAndLogoutRevokesSession(t *testing.T) {
 	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/auth/session", cookie, nil, http.StatusUnauthorized, nil)
 }
 
+func TestAdminLoginSupportsSecureCrossSiteFrontendCookie(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{24}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), AdminAuthConfig{
+		Username: testAdminUsername, Password: testAdminPassword,
+		CookieSecure: true, CookieSameSite: "none",
+	}, []string{"https://console.other-site.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := loginAdmin(t, server.Handler())
+	if cookie.Name != secureSessionCookie || !cookie.Secure || cookie.SameSite != http.SameSiteNoneMode {
+		t.Fatalf("unexpected cross-site administrator cookie: %#v", cookie)
+	}
+}
+
 func TestAdminLoginRejectsInvalidCredentials(t *testing.T) {
 	sealer, err := secret.New(bytes.Repeat([]byte{4}, 32))
 	if err != nil {
@@ -627,6 +647,92 @@ func TestRecentAuthenticationRequiresSecondFactorWhenTOTPEnabled(t *testing.T) {
 		map[string]string{"password": testAdminPassword, "code": futureCode}, http.StatusNoContent, nil)
 }
 
+func TestSensitiveAccountVerificationIsRateLimitedPerSession(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{18}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false, nil)
+	adminCookie := loginAdmin(t, handler)
+	for attempt := 1; attempt <= authFailureLimit; attempt++ {
+		expected := http.StatusUnauthorized
+		if attempt == authFailureLimit {
+			expected = http.StatusTooManyRequests
+		}
+		requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/reauthenticate", adminCookie,
+			map[string]string{"password": "incorrect-password"}, expected, nil)
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/reauthenticate", adminCookie,
+		map[string]string{"password": testAdminPassword}, http.StatusTooManyRequests, nil)
+}
+
+func TestTOTPSetupIsBoundToTheStartingAdminSession(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{19}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false, nil)
+	startingSession := loginAdmin(t, handler)
+	otherSession := loginAdmin(t, handler)
+	var setup struct {
+		Secret string `json:"secret"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/totp/begin", startingSession,
+		map[string]string{"password": testAdminPassword}, http.StatusOK, &setup)
+	code, err := totp.GenerateCode(setup.Secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/totp/enable", otherSession,
+		map[string]string{"code": code}, http.StatusConflict, nil)
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/totp/enable", startingSession,
+		map[string]string{"code": code}, http.StatusOK, nil)
+}
+
+func TestSecondFactorStateRollsBackWhenPersistenceFails(t *testing.T) {
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{23}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	server, err := NewHTTPServer(service, slog.Default(), AdminAuthConfig{
+		Username: testAdminUsername, Password: testAdminPassword,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := server.Handler()
+	adminCookie := loginAdmin(t, handler)
+	var setup struct {
+		Secret string `json:"secret"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/totp/begin", adminCookie,
+		map[string]string{"password": testAdminPassword}, http.StatusOK, &setup)
+	activationCode, err := totp.GenerateCode(setup.Secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/totp/enable", adminCookie,
+		map[string]string{"code": activationCode}, http.StatusOK, nil)
+
+	server.adminAuth.mu.Lock()
+	previousStep := server.adminAuth.security.LastTOTPStep
+	server.adminAuth.mu.Unlock()
+	service.store = &failingAdminSaveStore{Store: dataStore}
+	nextCode, err := totp.GenerateCode(setup.Secret, time.Now().Add(30*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/profile/reauthenticate", adminCookie,
+		map[string]string{"password": testAdminPassword, "code": nextCode}, http.StatusInternalServerError, nil)
+	server.adminAuth.mu.Lock()
+	defer server.adminAuth.mu.Unlock()
+	if server.adminAuth.security.LastTOTPStep != previousStep {
+		t.Fatalf("failed persistence advanced TOTP replay state from %d to %d", previousStep, server.adminAuth.security.LastTOTPStep)
+	}
+}
+
 func TestPasskeyRegistrationBeginsWithDiscoverableCredentialPolicy(t *testing.T) {
 	sealer, err := secret.New(bytes.Repeat([]byte{9}, 32))
 	if err != nil {
@@ -720,6 +826,12 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 	if got := preflightResponse.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, http.MethodPatch) {
 		t.Fatalf("PATCH is missing from access-control-allow-methods %q", got)
 	}
+	if got := preflightResponse.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(got, "Retry-After") {
+		t.Fatalf("Retry-After is missing from access-control-expose-headers %q", got)
+	}
+	if got := preflightResponse.Header().Get("X-VaultMesh-API-Version"); got != "1" {
+		t.Fatalf("unexpected API version header %q", got)
+	}
 
 	forbidden := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	forbidden.Header.Set("Origin", "https://attacker.example.com")
@@ -727,6 +839,63 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 	handler.ServeHTTP(forbiddenResponse, forbidden)
 	if forbiddenResponse.Code != http.StatusForbidden {
 		t.Fatalf("expected forbidden origin to return 403, got %d", forbiddenResponse.Code)
+	}
+}
+
+func TestJSONEndpointsRejectBrowserSimpleContentTypes(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{21}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{"username":"admin","password":"incorrect"}`))
+	request.Header.Set("Content-Type", "text/plain")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("simple content type returned %d, want 415", response.Code)
+	}
+}
+
+func TestControlPlaneNeverServesFrontendDocuments(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{22}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false, nil)
+
+	for _, path := range []string{"/", "/index.html", "/settings/profile", "/api/v1/not-registered"} {
+		t.Run(path, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("GET %s returned %d, want 404", path, response.Code)
+			}
+			if got := response.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+				t.Fatalf("GET %s returned non-JSON content type %q", path, got)
+			}
+			var body struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+				t.Fatalf("GET %s returned invalid JSON: %v", path, err)
+			}
+			if body.Error.Code != "not_found" {
+				t.Fatalf("GET %s returned error code %q", path, body.Error.Code)
+			}
+			if strings.HasPrefix(path, "/api/") {
+				if got := response.Header().Get("Cache-Control"); got != "no-store" {
+					t.Fatalf("GET %s returned cache policy %q", path, got)
+				}
+				if got := response.Header().Get("X-VaultMesh-API-Version"); got != "1" {
+					t.Fatalf("GET %s returned API version %q", path, got)
+				}
+			}
+		})
 	}
 }
 
@@ -1333,6 +1502,14 @@ func newTestHTTPHandler(t *testing.T, service *Service, logger *slog.Logger, coo
 		t.Fatal(err)
 	}
 	return server.Handler()
+}
+
+type failingAdminSaveStore struct {
+	store.Store
+}
+
+func (*failingAdminSaveStore) SaveAdminAccount(context.Context, domain.AdminAccount) error {
+	return errors.New("injected administrator persistence failure")
 }
 
 func loginAdmin(t *testing.T, handler http.Handler) *http.Cookie {

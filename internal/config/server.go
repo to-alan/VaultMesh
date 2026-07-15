@@ -17,6 +17,7 @@ type Server struct {
 	MasterKey         string
 	AllowedOrigins    []string
 	CookieSecure      bool
+	CookieSameSite    string
 	WebAuthnRPID      string
 	WebAuthnRPName    string
 	WebAuthnRPOrigins []string
@@ -40,6 +41,7 @@ func LoadServer() (Server, error) {
 		MasterKey:         strings.TrimSpace(os.Getenv("VAULTMESH_MASTER_KEY")),
 		AllowedOrigins:    splitList(os.Getenv("VAULTMESH_ALLOWED_ORIGINS")),
 		CookieSecure:      cookieSecure,
+		CookieSameSite:    strings.ToLower(envOr("VAULTMESH_COOKIE_SAME_SITE", "lax")),
 		AutoMigrate:       autoMigrate,
 		WebAuthnRPID:      strings.TrimSpace(os.Getenv("VAULTMESH_WEBAUTHN_RP_ID")),
 		WebAuthnRPName:    envOr("VAULTMESH_WEBAUTHN_RP_NAME", "VaultMesh"),
@@ -65,6 +67,15 @@ func LoadServer() (Server, error) {
 	}
 	if config.MasterKey == "" {
 		return Server{}, fmt.Errorf("VAULTMESH_MASTER_KEY is required")
+	}
+	switch config.CookieSameSite {
+	case "lax", "strict":
+	case "none":
+		if !config.CookieSecure {
+			return Server{}, fmt.Errorf("VAULTMESH_COOKIE_SAME_SITE=none requires VAULTMESH_COOKIE_SECURE=true")
+		}
+	default:
+		return Server{}, fmt.Errorf("VAULTMESH_COOKIE_SAME_SITE must be lax, strict, or none")
 	}
 	for _, origin := range config.AllowedOrigins {
 		if err := validateOrigin(origin); err != nil {

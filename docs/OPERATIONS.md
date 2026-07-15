@@ -121,15 +121,16 @@ sudo find /var/lib/vaultmesh-agent/restores -mindepth 1 -maxdepth 1 -type d -pri
 3. 检查投递历史的状态、尝试次数和受限错误摘要。失败会持久化，并最多尝试五次，间隔依次为 1 分钟、5 分钟、15 分钟和 1 小时；
 4. 目标端返回 2xx 才算成功。重定向不会被跟随，避免令牌随跳转泄漏；
 5. 修改 Secret 时填写新值；普通编辑留空会保留旧值。API 和日志不会回显 Webhook URL、Token 或 SMTP 密码；
-6. 最终失败后，修复配置并使用“发送测试”。现有投递不会自动重开，后续新事件或重复提醒将使用新配置。
+6. 自建 Gotify、ntfy、SMTP 或 Webhook 如果解析到回环/RFC1918 地址，需要在渠道中显式开启“允许访问私有网络地址”；链路本地和云元数据地址始终拒绝；
+7. 最终失败后，修复配置并使用“发送测试”。现有投递不会自动重开，后续新事件或重复提醒将使用新配置。
 
-生产防火墙应只允许 Control Plane 访问实际使用的通知域名和 SMTP 端口。Webhook 可指向任意管理员配置的 HTTP(S) 地址，因此只有可信管理员可以管理通知渠道；高安全环境应同时使用出口代理或网络层 allowlist。
+生产防火墙应只允许 Control Plane 访问实际使用的通知域名和 SMTP 端口。通知客户端不读取环境代理，避免代理绕过目标地址校验；高安全环境应使用网络层 allowlist。只有可信管理员可以管理通知渠道。
 
 ## 上线前清单
 
 - Web 和 API 均经可信 HTTPS 反向代理，API 不直接暴露明文端口；
 - `VAULTMESH_ALLOWED_ORIGINS`、公开 API URL 和 WebAuthn RP 配置与实际域名完全一致；
-- `VAULTMESH_COOKIE_SECURE=true`，登录接口在反向代理/WAF 有速率限制；
+- `VAULTMESH_COOKIE_SECURE=true`；`VAULTMESH_COOKIE_SAME_SITE` 与前端部署关系一致；登录接口在反向代理/WAF 有速率限制；
 - `.env` 权限为 `0600`，主密钥、Restic 密码和对象存储凭据已异机托管；
 - 存储凭据限制到专用 Bucket/Prefix；生产环境评估版本控制、Object Lock 或独立删除身份；
 - 每个数据库来源已完成一次从逻辑导出到新实例的恢复验证；

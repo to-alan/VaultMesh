@@ -64,6 +64,7 @@ func main() {
 		Username:          config.AdminUsername,
 		Password:          config.AdminPassword,
 		CookieSecure:      config.CookieSecure,
+		CookieSameSite:    config.CookieSameSite,
 		WebAuthnRPID:      config.WebAuthnRPID,
 		WebAuthnRPName:    config.WebAuthnRPName,
 		WebAuthnRPOrigins: config.WebAuthnRPOrigins,
@@ -80,6 +81,7 @@ func main() {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	errCh := make(chan error, 1)
