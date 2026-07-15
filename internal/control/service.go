@@ -23,6 +23,7 @@ import (
 
 const enrollmentTTL = 15 * time.Minute
 const protectedSnapshotTag = "vaultmesh.protected=true"
+const defaultScheduleGrace = time.Hour
 
 var allowedRepositoryEnvironment = map[string]struct{}{
 	"AWS_ACCESS_KEY_ID":                {},
@@ -96,13 +97,18 @@ var allowedRepositoryOptions = map[string]map[string]struct{}{
 var dockerContainerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 
 type Service struct {
-	store  store.Store
-	sealer *secret.Sealer
-	now    func() time.Time
+	store              store.Store
+	sealer             *secret.Sealer
+	now                func() time.Time
+	notificationSender notificationSender
 }
 
 func NewService(dataStore store.Store, sealer *secret.Sealer) *Service {
-	return &Service{store: dataStore, sealer: sealer, now: func() time.Time { return time.Now().UTC() }}
+	return &Service{
+		store: dataStore, sealer: sealer,
+		now:                func() time.Time { return time.Now().UTC() },
+		notificationSender: sendNotification,
+	}
 }
 
 func (s *Service) CreateServer(ctx context.Context, name string) (domain.EnrollmentResult, error) {
@@ -298,80 +304,7 @@ func validSwiftEnvironment(environment map[string]string) bool {
 }
 
 func (s *Service) CreateProject(ctx context.Context, input domain.Project) (domain.Project, error) {
-	input.Name = strings.TrimSpace(input.Name)
-	if input.Name == "" || len(input.Name) > 100 {
-		return domain.Project{}, validationError("name", "must contain 1 to 100 characters")
-	}
-	if input.ServerID == "" || input.RepositoryID == "" {
-		return domain.Project{}, validationError("server_id", "server_id and repository_id are required")
-	}
-	if len(input.Sources) == 0 {
-		return domain.Project{}, validationError("sources", "at least one source is required")
-	}
-	for i := range input.Sources {
-		source := &input.Sources[i]
-		if source.ID == "" {
-			id, err := randomValue("src", 8)
-			if err != nil {
-				return domain.Project{}, err
-			}
-			source.ID = id
-		}
-		switch source.Type {
-		case "files":
-			if len(source.Paths) == 0 {
-				return domain.Project{}, validationError("sources.paths", "at least one path is required")
-			}
-			for index, path := range source.Paths {
-				cleaned, err := validateSourcePath(path)
-				if err != nil {
-					return domain.Project{}, validationError("sources.paths", err.Error())
-				}
-				source.Paths[index] = cleaned
-			}
-		case "mysql", "postgresql":
-			if err := s.prepareDatabaseSource(source); err != nil {
-				return domain.Project{}, err
-			}
-		case "docker":
-			if err := prepareDockerSource(source); err != nil {
-				return domain.Project{}, err
-			}
-		default:
-			return domain.Project{}, validationError("sources.type", "must be files, mysql, postgresql, or docker")
-		}
-	}
-	if input.Schedule.Timezone == "" {
-		input.Schedule.Timezone = "UTC"
-	}
-	if input.Schedule.MissedRunPolicy == "" {
-		input.Schedule.MissedRunPolicy = "skip"
-	}
-	if input.Schedule.ConcurrencyPolicy == "" {
-		input.Schedule.ConcurrencyPolicy = "forbid"
-	}
-	if input.Schedule.MaxRuntimeSeconds == 0 {
-		input.Schedule.MaxRuntimeSeconds = 6 * 60 * 60
-	}
-	if input.Schedule.JitterSeconds < 0 || input.Schedule.JitterSeconds > 3600 {
-		return domain.Project{}, validationError("schedule.jitter_seconds", "must be between 0 and 3600")
-	}
-	if input.Schedule.MaxRuntimeSeconds < 60 || input.Schedule.MaxRuntimeSeconds > 7*24*60*60 {
-		return domain.Project{}, validationError("schedule.max_runtime_seconds", "must be between 60 seconds and 7 days")
-	}
-	if input.Schedule.MissedRunPolicy != "skip" {
-		return domain.Project{}, validationError("schedule.missed_run_policy", "the current version supports only skip")
-	}
-	if input.Schedule.ConcurrencyPolicy != "forbid" {
-		return domain.Project{}, validationError("schedule.concurrency_policy", "the current version supports only forbid")
-	}
-	if err := schedule.Validate(input.Schedule.Cron, input.Schedule.Timezone); err != nil {
-		return domain.Project{}, validationError("schedule", err.Error())
-	}
-	if err := validateProjectPolicy(&input.Policy); err != nil {
-		return domain.Project{}, err
-	}
-	if err := validateMaintenancePolicy(&input.Policy); err != nil {
+	if err := s.prepareProject(&input, nil); err != nil {
 		return domain.Project{}, err
 	}
 	id, err := randomValue("prj", 10)
@@ -390,6 +323,138 @@ func (s *Service) CreateProject(ctx context.Context, input domain.Project) (doma
 	return publicProject(created, s.now()), nil
 }
 
+func (s *Service) UpdateProject(ctx context.Context, projectID string, input domain.Project) (domain.Project, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return domain.Project{}, validationError("project_id", "is required")
+	}
+	existing, err := s.store.GetProject(ctx, projectID)
+	if err != nil {
+		return domain.Project{}, err
+	}
+	if input.ServerID != "" && input.ServerID != existing.ServerID {
+		return domain.Project{}, validationError("server_id", "cannot be changed; create a new project to move backup ownership")
+	}
+	if input.RepositoryID != "" && input.RepositoryID != existing.RepositoryID {
+		return domain.Project{}, validationError("repository_id", "cannot be changed; create a new project to preserve the old recovery chain")
+	}
+	input.ID = existing.ID
+	input.ServerID = existing.ServerID
+	input.RepositoryID = existing.RepositoryID
+	input.Enabled = existing.Enabled
+	input.CreatedAt = existing.CreatedAt
+	if err := s.prepareProject(&input, &existing); err != nil {
+		return domain.Project{}, err
+	}
+	updated, err := s.store.UpdateProject(ctx, input, s.now())
+	if err != nil {
+		return domain.Project{}, err
+	}
+	return publicProject(updated, s.now()), nil
+}
+
+func (s *Service) prepareProject(input *domain.Project, existing *domain.Project) error {
+	input.Name = strings.TrimSpace(input.Name)
+	if input.Name == "" || len(input.Name) > 100 {
+		return validationError("name", "must contain 1 to 100 characters")
+	}
+	if input.ServerID == "" || input.RepositoryID == "" {
+		return validationError("server_id", "server_id and repository_id are required")
+	}
+	if len(input.Sources) == 0 {
+		return validationError("sources", "at least one source is required")
+	}
+	existingSources := make(map[string]domain.Source)
+	if existing != nil {
+		for _, source := range existing.Sources {
+			existingSources[source.ID] = source
+		}
+	}
+	seenSourceIDs := make(map[string]struct{}, len(input.Sources))
+	for index := range input.Sources {
+		source := &input.Sources[index]
+		if source.ID == "" {
+			id, err := randomValue("src", 8)
+			if err != nil {
+				return err
+			}
+			source.ID = id
+		}
+		if _, duplicated := seenSourceIDs[source.ID]; duplicated {
+			return validationError("sources.id", "source IDs must be unique")
+		}
+		seenSourceIDs[source.ID] = struct{}{}
+		switch source.Type {
+		case "files":
+			if len(source.Paths) == 0 {
+				return validationError("sources.paths", "at least one path is required")
+			}
+			for pathIndex, path := range source.Paths {
+				cleaned, err := validateSourcePath(path)
+				if err != nil {
+					return validationError("sources.paths", err.Error())
+				}
+				source.Paths[pathIndex] = cleaned
+			}
+			source.Database = nil
+			source.Docker = nil
+			source.SecretCiphertext = ""
+		case "mysql", "postgresql":
+			existingSecret := ""
+			if previous, ok := existingSources[source.ID]; ok && previous.Type == source.Type {
+				existingSecret = previous.SecretCiphertext
+			}
+			if err := s.prepareDatabaseSource(source, existingSecret); err != nil {
+				return err
+			}
+		case "docker":
+			if err := prepareDockerSource(source); err != nil {
+				return err
+			}
+			source.SecretCiphertext = ""
+		default:
+			return validationError("sources.type", "must be files, mysql, postgresql, or docker")
+		}
+	}
+	if input.Schedule.Timezone == "" {
+		input.Schedule.Timezone = "UTC"
+	}
+	if input.Schedule.MissedRunPolicy == "" {
+		input.Schedule.MissedRunPolicy = "skip"
+	}
+	if input.Schedule.ConcurrencyPolicy == "" {
+		input.Schedule.ConcurrencyPolicy = "forbid"
+	}
+	if input.Schedule.MaxRuntimeSeconds == 0 {
+		input.Schedule.MaxRuntimeSeconds = 6 * 60 * 60
+	}
+	if input.Schedule.GraceSeconds == 0 {
+		input.Schedule.GraceSeconds = 60 * 60
+	}
+	if input.Schedule.JitterSeconds < 0 || input.Schedule.JitterSeconds > 3600 {
+		return validationError("schedule.jitter_seconds", "must be between 0 and 3600")
+	}
+	if input.Schedule.MaxRuntimeSeconds < 60 || input.Schedule.MaxRuntimeSeconds > 7*24*60*60 {
+		return validationError("schedule.max_runtime_seconds", "must be between 60 seconds and 7 days")
+	}
+	if input.Schedule.GraceSeconds < 60 || input.Schedule.GraceSeconds > 7*24*60*60 {
+		return validationError("schedule.grace_seconds", "must be between 60 seconds and 7 days")
+	}
+	if input.Schedule.MissedRunPolicy != "skip" {
+		return validationError("schedule.missed_run_policy", "the current version supports only skip")
+	}
+	if input.Schedule.ConcurrencyPolicy != "forbid" {
+		return validationError("schedule.concurrency_policy", "the current version supports only forbid")
+	}
+	if err := schedule.Validate(input.Schedule.Cron, input.Schedule.Timezone); err != nil {
+		return validationError("schedule", err.Error())
+	}
+	if err := validateProjectPolicy(&input.Policy); err != nil {
+		return err
+	}
+	return validateMaintenancePolicy(&input.Policy)
+}
+
 func (s *Service) SetProjectEnabled(ctx context.Context, projectID string, enabled bool) (domain.Project, error) {
 	if strings.TrimSpace(projectID) == "" {
 		return domain.Project{}, validationError("project_id", "is required")
@@ -399,6 +464,94 @@ func (s *Service) SetProjectEnabled(ctx context.Context, projectID string, enabl
 		return domain.Project{}, err
 	}
 	return publicProject(project, s.now()), nil
+}
+
+func (s *Service) ProjectHealth(ctx context.Context) ([]domain.ProjectHealth, error) {
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	activityItems, err := s.store.ListProjectBackupActivity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	activity := make(map[string]domain.ProjectBackupActivity, len(activityItems))
+	for _, item := range activityItems {
+		activity[item.ProjectID] = item
+	}
+	now := s.now()
+	result := make([]domain.ProjectHealth, 0, len(projects))
+	for _, project := range projects {
+		item := activity[project.ID]
+		health := domain.ProjectHealth{
+			ProjectID:        project.ID,
+			LatestRunStatus:  item.LatestRunStatus,
+			LatestRunAt:      item.LatestRunAt,
+			LastSuccessfulAt: item.LastSuccessfulAt,
+		}
+		if !project.Enabled {
+			health.Status = "paused"
+			result = append(result, health)
+			continue
+		}
+		location, locationErr := time.LoadLocation(project.Schedule.Timezone)
+		parsed, scheduleErr := schedule.Parser.Parse(project.Schedule.Cron)
+		if locationErr != nil || scheduleErr != nil {
+			health.Status = "invalid"
+			result = append(result, health)
+			continue
+		}
+		reference := project.CreatedAt
+		if item.LastSuccessfulAt != nil {
+			reference = *item.LastSuccessfulAt
+		}
+		expected := parsed.Next(reference.In(location)).UTC()
+		graceSeconds := project.Schedule.GraceSeconds
+		if graceSeconds <= 0 {
+			graceSeconds = int(defaultScheduleGrace.Seconds())
+		}
+		maxRuntimeSeconds := project.Schedule.MaxRuntimeSeconds
+		if maxRuntimeSeconds <= 0 {
+			maxRuntimeSeconds = 6 * 60 * 60
+		}
+		deadline := expected.Add(time.Duration(project.Schedule.JitterSeconds+maxRuntimeSeconds+graceSeconds) * time.Second)
+		health.ExpectedAt = &expected
+		health.DeadlineAt = &deadline
+		switch {
+		case now.Before(expected):
+			if item.LastSuccessfulAt == nil {
+				health.Status = "pending"
+			} else {
+				health.Status = "healthy"
+			}
+		case now.Before(deadline):
+			health.Status = "late"
+		default:
+			health.Status = "overdue"
+		}
+		result = append(result, health)
+	}
+	return result, nil
+}
+
+func (s *Service) Dashboard(ctx context.Context, since time.Time) (domain.Dashboard, error) {
+	dashboard, err := s.store.Dashboard(ctx, since)
+	if err != nil {
+		return domain.Dashboard{}, err
+	}
+	health, err := s.ProjectHealth(ctx)
+	if err != nil {
+		return domain.Dashboard{}, err
+	}
+	for _, item := range health {
+		switch item.Status {
+		case "late":
+			dashboard.ProjectsLate++
+		case "overdue":
+			dashboard.ProjectsOverdue++
+		}
+	}
+	return dashboard, nil
 }
 
 func (s *Service) DesiredConfig(ctx context.Context, serverID string) (domain.AgentConfig, error) {
@@ -538,7 +691,7 @@ func (s *Service) ClaimCommands(ctx context.Context, serverID string) ([]domain.
 	return s.store.ClaimCommands(ctx, serverID, now, now.Add(2*time.Minute), 10)
 }
 
-func (s *Service) prepareDatabaseSource(source *domain.Source) error {
+func (s *Service) prepareDatabaseSource(source *domain.Source, existingSecret string) error {
 	if source.Database == nil {
 		return validationError("sources.database", "database configuration is required")
 	}
@@ -546,8 +699,11 @@ func (s *Service) prepareDatabaseSource(source *domain.Source) error {
 	database.Host = strings.TrimSpace(database.Host)
 	database.Username = strings.TrimSpace(database.Username)
 	database.Database = strings.TrimSpace(database.Database)
-	if database.Host == "" || database.Username == "" || database.Database == "" || database.Password == "" {
-		return validationError("sources.database", "host, username, password, and database are required")
+	if database.Host == "" || database.Username == "" || database.Database == "" {
+		return validationError("sources.database", "host, username, and database are required")
+	}
+	if database.Password == "" && existingSecret == "" {
+		return validationError("sources.database.password", "password is required for a new database source")
 	}
 	if strings.ContainsAny(database.Host, "\r\n") || strings.ContainsAny(database.Username, "\r\n") || strings.ContainsAny(database.Database, "\r\n") {
 		return validationError("sources.database", "database fields cannot contain newlines")
@@ -565,11 +721,15 @@ func (s *Service) prepareDatabaseSource(source *domain.Source) error {
 	if database.Port < 1 || database.Port > 65535 {
 		return validationError("sources.database.port", "must be between 1 and 65535")
 	}
-	sealed, err := s.sealer.Seal([]byte(database.Password))
-	if err != nil {
-		return err
+	if database.Password == "" {
+		source.SecretCiphertext = existingSecret
+	} else {
+		sealed, err := s.sealer.Seal([]byte(database.Password))
+		if err != nil {
+			return err
+		}
+		source.SecretCiphertext = string(sealed)
 	}
-	source.SecretCiphertext = string(sealed)
 	database.Password = ""
 	source.Paths = nil
 	source.Excludes = nil
@@ -845,6 +1005,9 @@ func validateSourcePath(value string) (string, error) {
 }
 
 func publicProject(project domain.Project, now time.Time) domain.Project {
+	if project.Schedule.GraceSeconds <= 0 {
+		project.Schedule.GraceSeconds = int(defaultScheduleGrace.Seconds())
+	}
 	if project.Enabled {
 		if location, err := time.LoadLocation(project.Schedule.Timezone); err == nil {
 			if parsed, err := schedule.Parser.Parse(project.Schedule.Cron); err == nil {

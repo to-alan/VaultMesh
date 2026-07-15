@@ -90,6 +90,7 @@ func main() {
 
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go service.RunNotificationWorker(signalCtx, logger)
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {

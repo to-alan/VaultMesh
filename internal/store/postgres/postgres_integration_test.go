@@ -47,6 +47,28 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	if err != nil || loadedAdmin.Username != admin.Username || string(loadedAdmin.SecurityData) != string(admin.SecurityData) {
 		t.Fatalf("administrator security data was not persisted: %#v err=%v", loadedAdmin, err)
 	}
+	auditEvent := domain.AuditEvent{
+		ID: "aud_pg_" + suffix, Actor: admin.Username, Action: "security.test",
+		ResourceType: "account", Outcome: domain.AuditSucceeded, ClientIP: "127.0.0.1",
+		StatusCode: 204, CreatedAt: now,
+	}
+	if err := dataStore.AppendAuditEvent(ctx, auditEvent); err != nil {
+		t.Fatal(err)
+	}
+	auditEvents, err := dataStore.ListAuditEvents(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundAuditEvent := false
+	for _, event := range auditEvents {
+		if event.ID == auditEvent.ID {
+			foundAuditEvent = event.Action == auditEvent.Action && event.StatusCode == auditEvent.StatusCode
+			break
+		}
+	}
+	if !foundAuditEvent {
+		t.Fatalf("audit event was not persisted: %#v", auditEvents)
+	}
 	enrollmentHash := sha256.Sum256([]byte("enrollment-" + suffix))
 	credentialHash := sha256.Sum256([]byte("credential-" + suffix))
 	_, err = dataStore.CreateServer(ctx, domain.Server{ID: serverID, Name: "Postgres integration", CreatedAt: now}, enrollmentHash[:], now.Add(time.Minute))

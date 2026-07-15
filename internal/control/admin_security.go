@@ -357,8 +357,10 @@ func (s *HTTPServer) finishPasskeyRegistration(w http.ResponseWriter, r *http.Re
 		s.writeError(w, http.StatusInternalServerError, "internal_error", "passkey could not be saved", nil)
 		return
 	}
+	credentialID := base64.RawURLEncoding.EncodeToString(credential.ID)
+	setAuditResourceID(w, credentialID)
 	s.writeJSON(w, http.StatusCreated, map[string]any{
-		"id": base64.RawURLEncoding.EncodeToString(credential.ID), "name": ceremony.Name, "created_at": now,
+		"id": credentialID, "name": ceremony.Name, "created_at": now,
 	})
 }
 

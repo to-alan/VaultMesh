@@ -17,14 +17,21 @@ import (
 )
 
 const (
-	maxRequestBody       = 1 << 20
-	maxSnapshotClockSkew = 5 * time.Minute
+	maxRequestBody     = 1 << 20
+	maxAgentClockSkew  = 5 * time.Minute
+	maxRunIDLength     = 128
+	maxRunKeyLength    = 512
+	maxRunErrorLength  = 16 << 10
+	maxRunErrorCodeLen = 128
 )
 
 type HTTPServer struct {
 	service        *Service
 	logger         *slog.Logger
 	adminAuth      *adminAuthenticator
+	passwordLimits *authAttemptLimiter
+	secondFactors  *authAttemptLimiter
+	auditFailures  *auditFailureSampler
 	allowedOrigins map[string]struct{}
 }
 
@@ -43,6 +50,9 @@ func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthC
 		service:        service,
 		logger:         logger,
 		adminAuth:      adminAuth,
+		passwordLimits: newAuthAttemptLimiter(),
+		secondFactors:  newAuthAttemptLimiter(),
+		auditFailures:  newAuditFailureSampler(),
 		allowedOrigins: origins,
 	}, nil
 }
@@ -51,12 +61,12 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/v1/meta", s.meta)
-	mux.HandleFunc("POST /api/v1/enroll", s.enrollAgent)
-	mux.HandleFunc("POST /api/v1/auth/login", s.login)
-	mux.HandleFunc("POST /api/v1/auth/totp", s.completeTOTPLogin)
+	mux.Handle("POST /api/v1/enroll", s.auditPublic(auditSpec{Action: "agent.enroll", Actor: "agent", ResourceType: "server"}, http.HandlerFunc(s.enrollAgent)))
+	mux.Handle("POST /api/v1/auth/login", s.auditPublic(auditSpec{Action: "auth.password", Actor: "administrator", ResourceType: "account"}, http.HandlerFunc(s.login)))
+	mux.Handle("POST /api/v1/auth/totp", s.auditPublic(auditSpec{Action: "auth.second_factor", Actor: "administrator", ResourceType: "account"}, http.HandlerFunc(s.completeTOTPLogin)))
 	mux.HandleFunc("POST /api/v1/auth/passkey/begin", s.beginPasskeyLogin)
-	mux.HandleFunc("POST /api/v1/auth/passkey/finish", s.finishPasskeyLogin)
-	mux.HandleFunc("POST /api/v1/auth/logout", s.logout)
+	mux.Handle("POST /api/v1/auth/passkey/finish", s.auditPublic(auditSpec{Action: "auth.passkey", Actor: "administrator", ResourceType: "account"}, http.HandlerFunc(s.finishPasskeyLogin)))
+	mux.Handle("POST /api/v1/auth/logout", s.auditPublic(auditSpec{Action: "auth.logout", ResourceType: "account", SkipAnonymousSuccess: true}, http.HandlerFunc(s.logout)))
 	mux.Handle("GET /api/v1/auth/session", s.admin(http.HandlerFunc(s.session)))
 	mux.Handle("GET /api/v1/profile", s.admin(http.HandlerFunc(s.profile)))
 	mux.Handle("POST /api/v1/profile/reauthenticate", s.admin(http.HandlerFunc(s.reauthenticate)))
@@ -76,7 +86,9 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("POST /api/v1/repositories", s.admin(http.HandlerFunc(s.createRepository)))
 	mux.Handle("GET /api/v1/projects", s.admin(http.HandlerFunc(s.listProjects)))
 	mux.Handle("POST /api/v1/projects", s.admin(http.HandlerFunc(s.createProject)))
+	mux.Handle("PUT /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.replaceProject)))
 	mux.Handle("PATCH /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.updateProject)))
+	mux.Handle("GET /api/v1/project-health", s.admin(http.HandlerFunc(s.listProjectHealth)))
 	mux.Handle("POST /api/v1/projects/{projectID}/run", s.admin(http.HandlerFunc(s.createManualRun)))
 	mux.Handle("POST /api/v1/projects/{projectID}/retention-preview", s.admin(http.HandlerFunc(s.createRetentionPreview)))
 	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/refresh", s.admin(http.HandlerFunc(s.refreshSnapshots)))
@@ -85,6 +97,16 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/restore", s.admin(http.HandlerFunc(s.restoreSnapshot)))
 	mux.Handle("GET /api/v1/snapshots", s.admin(http.HandlerFunc(s.listSnapshots)))
 	mux.Handle("GET /api/v1/runs", s.admin(http.HandlerFunc(s.listRuns)))
+	mux.Handle("GET /api/v1/audit-events", s.admin(http.HandlerFunc(s.listAuditEvents)))
+	mux.Handle("GET /api/v1/notification-channels", s.admin(http.HandlerFunc(s.listNotificationChannels)))
+	mux.Handle("POST /api/v1/notification-channels", s.admin(http.HandlerFunc(s.createNotificationChannel)))
+	mux.Handle("PUT /api/v1/notification-channels/{channelID}", s.admin(http.HandlerFunc(s.replaceNotificationChannel)))
+	mux.Handle("PATCH /api/v1/notification-channels/{channelID}", s.admin(http.HandlerFunc(s.updateNotificationChannel)))
+	mux.Handle("DELETE /api/v1/notification-channels/{channelID}", s.admin(http.HandlerFunc(s.deleteNotificationChannel)))
+	mux.Handle("POST /api/v1/notification-channels/{channelID}/test", s.admin(http.HandlerFunc(s.testNotificationChannel)))
+	mux.Handle("GET /api/v1/alert-incidents", s.admin(http.HandlerFunc(s.listAlertIncidents)))
+	mux.Handle("GET /api/v1/notification-deliveries", s.admin(http.HandlerFunc(s.listNotificationDeliveries)))
+	mux.Handle("POST /api/v1/alerts/evaluate", s.admin(http.HandlerFunc(s.evaluateAlerts)))
 
 	mux.Handle("POST /api/v1/agent/heartbeat", s.agent(http.HandlerFunc(s.agentHeartbeat)))
 	mux.Handle("GET /api/v1/agent/config", s.agent(http.HandlerFunc(s.agentConfig)))
@@ -114,6 +136,10 @@ func (s *HTTPServer) meta(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *HTTPServer) login(w http.ResponseWriter, r *http.Request) {
+	clientKey := authClientKey(r)
+	if !s.allowAuthenticationAttempt(w, s.passwordLimits, clientKey, time.Now()) {
+		return
+	}
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -122,9 +148,13 @@ func (s *HTTPServer) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.adminAuth.authenticate(strings.TrimSpace(input.Username), input.Password) {
+		if s.recordAuthenticationFailure(w, s.passwordLimits, clientKey, time.Now()) {
+			return
+		}
 		s.writeError(w, http.StatusUnauthorized, "invalid_credentials", "username or password is incorrect", nil)
 		return
 	}
+	s.passwordLimits.recordSuccess(clientKey)
 	if s.adminAuth.totpEnabled() {
 		token, err := s.adminAuth.createPendingMFA(time.Now())
 		if err != nil {
@@ -140,6 +170,10 @@ func (s *HTTPServer) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) completeTOTPLogin(w http.ResponseWriter, r *http.Request) {
+	clientKey := authClientKey(r)
+	if !s.allowAuthenticationAttempt(w, s.secondFactors, clientKey, time.Now()) {
+		return
+	}
 	var input struct {
 		Code string `json:"code"`
 	}
@@ -147,9 +181,13 @@ func (s *HTTPServer) completeTOTPLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.adminAuth.completePendingMFA(r.Context(), r, input.Code, time.Now()); err != nil {
+		if s.recordAuthenticationFailure(w, s.secondFactors, clientKey, time.Now()) {
+			return
+		}
 		s.writeError(w, http.StatusUnauthorized, "invalid_second_factor", "verification code is invalid or the login attempt expired", nil)
 		return
 	}
+	s.secondFactors.recordSuccess(clientKey)
 	s.adminAuth.clearCookie(w, s.adminAuth.mfaCookieName(), s.adminAuth.cookieSecure)
 	s.issueAdminSession(w)
 }
@@ -194,6 +232,7 @@ func (s *HTTPServer) createServer(w http.ResponseWriter, r *http.Request) {
 		s.handleServiceError(w, err)
 		return
 	}
+	setAuditResourceID(w, result.Server.ID)
 	s.writeJSON(w, http.StatusCreated, result)
 }
 
@@ -219,6 +258,7 @@ func (s *HTTPServer) enrollAgent(w http.ResponseWriter, r *http.Request) {
 		s.handleServiceError(w, err)
 		return
 	}
+	setAuditResourceID(w, identity.AgentID)
 	s.writeJSON(w, http.StatusCreated, identity)
 }
 
@@ -232,6 +272,7 @@ func (s *HTTPServer) createRepository(w http.ResponseWriter, r *http.Request) {
 		s.handleServiceError(w, err)
 		return
 	}
+	setAuditResourceID(w, repository.ID)
 	s.writeJSON(w, http.StatusCreated, repository)
 }
 
@@ -254,6 +295,7 @@ func (s *HTTPServer) createProject(w http.ResponseWriter, r *http.Request) {
 		s.handleServiceError(w, err)
 		return
 	}
+	setAuditResourceID(w, project.ID)
 	s.writeJSON(w, http.StatusCreated, project)
 }
 
@@ -266,6 +308,29 @@ func (s *HTTPServer) listProjects(w http.ResponseWriter, r *http.Request) {
 	now := s.service.now()
 	for projectIndex := range items {
 		items[projectIndex] = publicProject(items[projectIndex], now)
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *HTTPServer) replaceProject(w http.ResponseWriter, r *http.Request) {
+	var input domain.Project
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	project, err := s.service.UpdateProject(r.Context(), r.PathValue("projectID"), input)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, project.ID)
+	s.writeJSON(w, http.StatusOK, project)
+}
+
+func (s *HTTPServer) listProjectHealth(w http.ResponseWriter, r *http.Request) {
+	items, err := s.service.ProjectHealth(r.Context())
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
@@ -385,8 +450,126 @@ func (s *HTTPServer) listRuns(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
+func (s *HTTPServer) listAuditEvents(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	items, err := s.service.Store().ListAuditEvents(r.Context(), limit)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *HTTPServer) listNotificationChannels(w http.ResponseWriter, r *http.Request) {
+	items, err := s.service.ListNotificationChannels(r.Context())
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *HTTPServer) createNotificationChannel(w http.ResponseWriter, r *http.Request) {
+	var input domain.NotificationChannel
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	channel, err := s.service.CreateNotificationChannel(r.Context(), input)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, channel.ID)
+	s.writeJSON(w, http.StatusCreated, channel)
+}
+
+func (s *HTTPServer) replaceNotificationChannel(w http.ResponseWriter, r *http.Request) {
+	var input domain.NotificationChannel
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	channel, err := s.service.UpdateNotificationChannel(r.Context(), r.PathValue("channelID"), input)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, channel.ID)
+	s.writeJSON(w, http.StatusOK, channel)
+}
+
+func (s *HTTPServer) updateNotificationChannel(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	if input.Enabled == nil {
+		s.writeError(w, http.StatusBadRequest, "validation_failed", "enabled is required", nil)
+		return
+	}
+	channel, err := s.service.SetNotificationChannelEnabled(r.Context(), r.PathValue("channelID"), *input.Enabled)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, channel.ID)
+	s.writeJSON(w, http.StatusOK, channel)
+}
+
+func (s *HTTPServer) deleteNotificationChannel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("channelID")
+	if err := s.service.Store().ArchiveNotificationChannel(r.Context(), id, s.service.now()); err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *HTTPServer) testNotificationChannel(w http.ResponseWriter, r *http.Request) {
+	if err := s.service.TestNotificationChannel(r.Context(), r.PathValue("channelID")); err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, r.PathValue("channelID"))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *HTTPServer) listAlertIncidents(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	items, err := s.service.Store().ListAlertIncidents(r.Context(), limit)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *HTTPServer) listNotificationDeliveries(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	items, err := s.service.Store().ListNotificationDeliveries(r.Context(), limit)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *HTTPServer) evaluateAlerts(w http.ResponseWriter, r *http.Request) {
+	if err := s.service.EvaluateAlerts(r.Context()); err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	if err := s.service.DeliverNotifications(r.Context()); err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *HTTPServer) dashboard(w http.ResponseWriter, r *http.Request) {
-	dashboard, err := s.service.Store().Dashboard(r.Context(), time.Now().Add(-24*time.Hour))
+	dashboard, err := s.service.Dashboard(r.Context(), time.Now().Add(-24*time.Hour))
 	if err != nil {
 		s.handleServiceError(w, err)
 		return
@@ -438,12 +621,9 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 	if !s.decodeJSON(w, r, &report) {
 		return
 	}
-	if report.ID == "" || report.IdempotencyKey == "" || report.ProjectID == "" || report.StartedAt.IsZero() {
-		s.writeError(w, http.StatusBadRequest, "validation_failed", "run identity, project and start time are required", nil)
-		return
-	}
-	if !validRunStatus(report.Status) {
-		s.writeError(w, http.StatusBadRequest, "validation_failed", "invalid run status", nil)
+	receivedAt := s.service.now()
+	if err := validateRunReport(report, receivedAt); err != nil {
+		s.writeError(w, http.StatusBadRequest, "validation_failed", err.Error(), nil)
 		return
 	}
 	report.ServerID = server.ID
@@ -482,7 +662,7 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			hasSnapshotInventory = true
-			snapshotSyncedAt = snapshotSyncTime(report.FinishedAt, s.service.now())
+			snapshotSyncedAt = snapshotSyncTime(report.FinishedAt, receivedAt)
 		}
 	}
 	if err := s.service.Store().UpsertRun(r.Context(), report); err != nil {
@@ -500,11 +680,22 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) admin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := s.adminAuth.session(r, time.Now()); !ok {
+		session, ok := s.adminAuth.session(r, time.Now())
+		if !ok {
 			s.writeError(w, http.StatusUnauthorized, "unauthorized", "administrator login required", nil)
 			return
 		}
-		next.ServeHTTP(w, r)
+		spec, audited := adminAuditSpecs[r.Pattern]
+		if !audited {
+			next.ServeHTTP(w, r)
+			return
+		}
+		metrics := &responseMetricsWriter{ResponseWriter: w}
+		next.ServeHTTP(metrics, r)
+		if metrics.auditResourceID != "" {
+			spec.ResourceID = metrics.auditResourceID
+		}
+		s.appendAuditEvent(r, spec, session.Username, responseStatus(metrics))
 	})
 }
 
@@ -535,7 +726,7 @@ func (s *HTTPServer) cors(next http.Handler) http.Handler {
 			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
 			w.Header().Set("Access-Control-Max-Age", "600")
 			w.Header().Add("Vary", "Origin")
@@ -562,10 +753,75 @@ func snapshotSyncTime(finishedAt *time.Time, receivedAt time.Time) time.Time {
 		return receivedAt
 	}
 	candidate := finishedAt.UTC()
-	if candidate.Before(receivedAt.Add(-maxSnapshotClockSkew)) || candidate.After(receivedAt.Add(maxSnapshotClockSkew)) {
+	if candidate.Before(receivedAt.Add(-maxAgentClockSkew)) || candidate.After(receivedAt.Add(maxAgentClockSkew)) {
 		return receivedAt
 	}
 	return candidate
+}
+
+func validateRunReport(report domain.RunReport, receivedAt time.Time) error {
+	if strings.TrimSpace(report.ID) == "" || strings.TrimSpace(report.IdempotencyKey) == "" || strings.TrimSpace(report.ProjectID) == "" {
+		return errors.New("run identity and project are required")
+	}
+	if len(report.ID) > maxRunIDLength || len(report.ProjectID) > maxRunIDLength || len(report.IdempotencyKey) > maxRunKeyLength {
+		return errors.New("run identity or idempotency key is too long")
+	}
+	if report.ScheduledAt.IsZero() || report.StartedAt.IsZero() {
+		return errors.New("run schedule and start time are required")
+	}
+	if !validRunStatus(report.Status) {
+		return errors.New("invalid run status")
+	}
+	if len(report.ErrorCode) > maxRunErrorCodeLen || len(report.ErrorMessage) > maxRunErrorLength {
+		return errors.New("run error details are too long")
+	}
+	if report.ScheduledAt.After(report.StartedAt) {
+		return errors.New("run schedule time must not be after its start time")
+	}
+	if report.StartedAt.After(receivedAt.Add(maxAgentClockSkew)) {
+		return errors.New("run start time is too far in the future")
+	}
+	if report.Status == domain.RunRunning {
+		if report.FinishedAt != nil {
+			return errors.New("a running run must not have a finish time")
+		}
+		return nil
+	}
+	if report.FinishedAt == nil {
+		return errors.New("a terminal run must have a finish time")
+	}
+	if report.FinishedAt.Before(report.StartedAt) {
+		return errors.New("run finish time must not be before its start time")
+	}
+	if report.FinishedAt.After(receivedAt.Add(maxAgentClockSkew)) {
+		return errors.New("run finish time is too far in the future")
+	}
+	return nil
+}
+
+func (s *HTTPServer) allowAuthenticationAttempt(w http.ResponseWriter, limiter *authAttemptLimiter, clientKey string, now time.Time) bool {
+	if retryAfter, blocked := limiter.retryAfter(clientKey, now); blocked {
+		s.writeAuthenticationRateLimit(w, retryAfter)
+		return false
+	}
+	return true
+}
+
+func (s *HTTPServer) recordAuthenticationFailure(w http.ResponseWriter, limiter *authAttemptLimiter, clientKey string, now time.Time) bool {
+	if retryAfter, blocked := limiter.recordFailure(clientKey, now); blocked {
+		s.writeAuthenticationRateLimit(w, retryAfter)
+		return true
+	}
+	return false
+}
+
+func (s *HTTPServer) writeAuthenticationRateLimit(w http.ResponseWriter, retryAfter time.Duration) {
+	seconds := int((retryAfter + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	s.writeError(w, http.StatusTooManyRequests, "rate_limited", "too many authentication attempts; retry later", nil)
 }
 
 func (s *HTTPServer) securityHeaders(next http.Handler) http.Handler {
@@ -583,9 +839,65 @@ func (s *HTTPServer) securityHeaders(next http.Handler) http.Handler {
 func (s *HTTPServer) logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		s.logger.Info("http request", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
+		metrics := &responseMetricsWriter{ResponseWriter: w}
+		next.ServeHTTP(metrics, r)
+		status := responseStatus(metrics)
+		s.logger.Info("http request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"response_bytes", metrics.bytes,
+			"duration", time.Since(start),
+		)
 	})
+}
+
+type responseMetricsWriter struct {
+	http.ResponseWriter
+	status          int
+	bytes           int
+	auditResourceID string
+}
+
+func (w *responseMetricsWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *responseMetricsWriter) Write(payload []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	written, err := w.ResponseWriter.Write(payload)
+	w.bytes += written
+	return written, err
+}
+
+// Unwrap lets http.ResponseController reach optional capabilities implemented
+// by the underlying writer without coupling this metrics wrapper to them.
+func (w *responseMetricsWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func setAuditResourceID(w http.ResponseWriter, resourceID string) {
+	for w != nil {
+		if metrics, ok := w.(*responseMetricsWriter); ok {
+			metrics.auditResourceID = resourceID
+			return
+		}
+		unwrapper, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+		next := unwrapper.Unwrap()
+		if next == w {
+			return
+		}
+		w = next
+	}
 }
 
 func (s *HTTPServer) decodeJSON(w http.ResponseWriter, r *http.Request, output any) bool {

@@ -14,6 +14,9 @@ const (
 	RunCanceled  = "canceled"
 	RunTimedOut  = "timed_out"
 	RunUnknown   = "unknown"
+
+	AuditSucceeded = "succeeded"
+	AuditFailed    = "failed"
 )
 
 type Server struct {
@@ -71,6 +74,7 @@ type Schedule struct {
 	Timezone          string `json:"timezone"`
 	JitterSeconds     int    `json:"jitter_seconds"`
 	MaxRuntimeSeconds int    `json:"max_runtime_seconds"`
+	GraceSeconds      int    `json:"grace_seconds"`
 	MissedRunPolicy   string `json:"missed_run_policy"`
 	ConcurrencyPolicy string `json:"concurrency_policy"`
 }
@@ -213,12 +217,90 @@ type SnapshotEntry struct {
 }
 
 type Dashboard struct {
-	ServersTotal  int `json:"servers_total"`
-	ServersOnline int `json:"servers_online"`
-	ProjectsTotal int `json:"projects_total"`
-	RunsSucceeded int `json:"runs_succeeded"`
-	RunsFailed    int `json:"runs_failed"`
-	RunsPartial   int `json:"runs_partial"`
+	ServersTotal    int `json:"servers_total"`
+	ServersOnline   int `json:"servers_online"`
+	ProjectsTotal   int `json:"projects_total"`
+	RunsSucceeded   int `json:"runs_succeeded"`
+	RunsFailed      int `json:"runs_failed"`
+	RunsPartial     int `json:"runs_partial"`
+	ProjectsLate    int `json:"projects_late"`
+	ProjectsOverdue int `json:"projects_overdue"`
+}
+
+// ProjectBackupActivity contains the minimum run history needed to derive
+// schedule health without exposing or rescanning arbitrary run payloads.
+type ProjectBackupActivity struct {
+	ProjectID        string     `json:"project_id"`
+	LatestRunID      string     `json:"latest_run_id,omitempty"`
+	LatestRunStatus  string     `json:"latest_run_status,omitempty"`
+	LatestRunAt      *time.Time `json:"latest_run_at,omitempty"`
+	LastSuccessfulAt *time.Time `json:"last_successful_at,omitempty"`
+}
+
+// NotificationChannel is a user-defined contact point. Config is accepted on
+// writes only; SecretCiphertext is the encrypted-at-rest representation and is
+// never serialized by the management API.
+type NotificationChannel struct {
+	ID                    string            `json:"id"`
+	Name                  string            `json:"name"`
+	Type                  string            `json:"type"`
+	Enabled               bool              `json:"enabled"`
+	SendResolved          bool              `json:"send_resolved"`
+	RepeatIntervalSeconds int               `json:"repeat_interval_seconds"`
+	EventTypes            []string          `json:"event_types"`
+	ProjectIDs            []string          `json:"project_ids,omitempty"`
+	Config                map[string]string `json:"config,omitempty"`
+	Destination           string            `json:"destination,omitempty"`
+	Configured            bool              `json:"configured"`
+	SecretCiphertext      []byte            `json:"-"`
+	CreatedAt             time.Time         `json:"created_at"`
+	UpdatedAt             time.Time         `json:"updated_at"`
+	DeletedAt             *time.Time        `json:"-"`
+}
+
+type AlertIncident struct {
+	ID              string     `json:"id"`
+	Fingerprint     string     `json:"fingerprint"`
+	Kind            string     `json:"kind"`
+	ProjectID       string     `json:"project_id"`
+	ProjectName     string     `json:"project_name"`
+	Status          string     `json:"status"`
+	Severity        string     `json:"severity"`
+	Summary         string     `json:"summary"`
+	Description     string     `json:"description"`
+	SourceEventID   string     `json:"source_event_id"`
+	OccurrenceCount int        `json:"occurrence_count"`
+	StartedAt       time.Time  `json:"started_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
+}
+
+type NotificationDelivery struct {
+	ID            string     `json:"id"`
+	AlertID       string     `json:"alert_id"`
+	ChannelID     string     `json:"channel_id"`
+	ChannelName   string     `json:"channel_name,omitempty"`
+	Transition    string     `json:"transition"`
+	DedupeKey     string     `json:"-"`
+	Status        string     `json:"status"`
+	AttemptCount  int        `json:"attempt_count"`
+	NextAttemptAt time.Time  `json:"next_attempt_at"`
+	LeaseUntil    *time.Time `json:"-"`
+	LastError     string     `json:"last_error,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	SentAt        *time.Time `json:"sent_at,omitempty"`
+}
+
+// ProjectHealth distinguishes a job that is merely inside its execution/grace
+// window from one that has actually missed its recovery-point objective.
+type ProjectHealth struct {
+	ProjectID        string     `json:"project_id"`
+	Status           string     `json:"status"`
+	LatestRunStatus  string     `json:"latest_run_status,omitempty"`
+	LatestRunAt      *time.Time `json:"latest_run_at,omitempty"`
+	LastSuccessfulAt *time.Time `json:"last_successful_at,omitempty"`
+	ExpectedAt       *time.Time `json:"expected_at,omitempty"`
+	DeadlineAt       *time.Time `json:"deadline_at,omitempty"`
 }
 
 type Command struct {
@@ -230,6 +312,21 @@ type Command struct {
 	LeaseUntil *time.Time     `json:"lease_until,omitempty"`
 	Attempts   int            `json:"attempts"`
 	CreatedAt  time.Time      `json:"created_at"`
+}
+
+// AuditEvent is an append-only record of a security-sensitive control-plane
+// action. It deliberately contains no request body or arbitrary metadata so
+// credentials and source configuration cannot leak into the audit trail.
+type AuditEvent struct {
+	ID           string    `json:"id"`
+	Actor        string    `json:"actor"`
+	Action       string    `json:"action"`
+	ResourceType string    `json:"resource_type,omitempty"`
+	ResourceID   string    `json:"resource_id,omitempty"`
+	Outcome      string    `json:"outcome"`
+	ClientIP     string    `json:"client_ip"`
+	StatusCode   int       `json:"status_code"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // AdminAccount is the single control-plane administrator identity. SecurityData

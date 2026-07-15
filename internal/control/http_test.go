@@ -366,6 +366,150 @@ func TestAdminLoginRejectsInvalidCredentials(t *testing.T) {
 	}, http.StatusUnauthorized, nil)
 }
 
+func TestAdminLoginRateLimitIsBoundedPerClient(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{4}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false, nil)
+
+	login := func(remoteAddress, password string) *httptest.ResponseRecorder {
+		t.Helper()
+		data, err := json.Marshal(map[string]string{"username": testAdminUsername, "password": password})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(data))
+		request.RemoteAddr = remoteAddress
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	for attempt := 1; attempt < authFailureLimit; attempt++ {
+		if response := login("198.51.100.10:5000", "wrong-password"); response.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401, got %d", attempt, response.Code)
+		}
+	}
+	blocked := login("198.51.100.10:5000", "wrong-password")
+	if blocked.Code != http.StatusTooManyRequests || blocked.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected fifth failure to return 429 with Retry-After, got %d and %q", blocked.Code, blocked.Header().Get("Retry-After"))
+	}
+	if response := login("198.51.100.10:5000", testAdminPassword); response.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected blocked client to remain limited, got %d", response.Code)
+	}
+	if response := login("198.51.100.11:5000", testAdminPassword); response.Code != http.StatusOK {
+		t.Fatalf("expected an independent client to log in, got %d", response.Code)
+	}
+}
+
+func TestAuditTrailRecordsSuccessfulAndFailedSensitiveActions(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{10}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, NewService(memory.New(), sealer), slog.Default(), false, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/v1/auth/logout", "", nil, http.StatusNoContent, nil)
+	adminCookie := loginAdmin(t, handler)
+
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/servers", adminCookie,
+		map[string]string{"name": "Audited server"}, http.StatusCreated, nil)
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/repositories", adminCookie,
+		domain.Repository{Name: "Invalid repository", Provider: "unsupported", URL: "invalid"},
+		http.StatusUnprocessableEntity, nil)
+
+	var result struct {
+		Items []domain.AuditEvent `json:"items"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/audit-events?limit=20", adminCookie,
+		nil, http.StatusOK, &result)
+	assertEvent := func(action, outcome string, status int) domain.AuditEvent {
+		t.Helper()
+		for _, event := range result.Items {
+			if event.Action == action && event.Outcome == outcome && event.StatusCode == status {
+				if event.ID == "" || event.Actor == "" || event.ClientIP == "" || event.CreatedAt.IsZero() {
+					t.Fatalf("audit event is incomplete: %#v", event)
+				}
+				return event
+			}
+		}
+		t.Fatalf("missing audit event action=%s outcome=%s status=%d: %#v", action, outcome, status, result.Items)
+		return domain.AuditEvent{}
+	}
+	assertEvent("auth.password", domain.AuditSucceeded, http.StatusOK)
+	if event := assertEvent("server.create", domain.AuditSucceeded, http.StatusCreated); event.ResourceID == "" {
+		t.Fatalf("created server audit event omitted its resource ID: %#v", event)
+	}
+	assertEvent("repository.create", domain.AuditFailed, http.StatusUnprocessableEntity)
+	for _, event := range result.Items {
+		if event.Action == "auth.logout" {
+			t.Fatalf("anonymous no-op logout created audit noise: %#v", event)
+		}
+	}
+}
+
+func TestPublicAuditFailureSamplerPreventsWriteAmplification(t *testing.T) {
+	sampler := newAuditFailureSampler()
+	now := time.Date(2026, time.July, 15, 3, 0, 0, 0, time.UTC)
+	if !sampler.allow("auth.password", "198.51.100.40", http.StatusUnauthorized, now) {
+		t.Fatal("first public failure was unexpectedly suppressed")
+	}
+	if sampler.allow("auth.password", "198.51.100.40", http.StatusUnauthorized, now.Add(30*time.Second)) {
+		t.Fatal("duplicate public failure was not sampled")
+	}
+	if !sampler.allow("auth.password", "198.51.100.40", http.StatusTooManyRequests, now.Add(30*time.Second)) {
+		t.Fatal("a different HTTP status should have an independent sample")
+	}
+	if !sampler.allow("auth.password", "198.51.100.40", http.StatusUnauthorized, now.Add(publicAuditFailureSampleWindow)) {
+		t.Fatal("public failure sample window did not expire")
+	}
+}
+
+func TestAuthClientKeyTrustsForwardedAddressOnlyFromLoopback(t *testing.T) {
+	proxied := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
+	proxied.RemoteAddr = "127.0.0.1:4321"
+	proxied.Header.Set("X-Forwarded-For", "198.51.100.20, 127.0.0.1")
+	if got := authClientKey(proxied); got != "198.51.100.20" {
+		t.Fatalf("proxied client key = %q", got)
+	}
+
+	direct := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
+	direct.RemoteAddr = "203.0.113.10:4321"
+	direct.Header.Set("X-Forwarded-For", "198.51.100.21")
+	if got := authClientKey(direct); got != "203.0.113.10" {
+		t.Fatalf("untrusted forwarded address changed client key to %q", got)
+	}
+}
+
+func TestAuthAttemptLimiterUsesProgressiveLockoutAndSuccessReset(t *testing.T) {
+	limiter := newAuthAttemptLimiter()
+	clientKey := "198.51.100.30"
+	now := time.Date(2026, time.July, 15, 2, 0, 0, 0, time.UTC)
+	for attempt := 1; attempt < authFailureLimit; attempt++ {
+		if retryAfter, blocked := limiter.recordFailure(clientKey, now); blocked || retryAfter != 0 {
+			t.Fatalf("attempt %d was limited early for %s", attempt, retryAfter)
+		}
+	}
+	if retryAfter, blocked := limiter.recordFailure(clientKey, now); !blocked || retryAfter != authInitialLockout {
+		t.Fatalf("first lockout = (%s, %v), want (%s, true)", retryAfter, blocked, authInitialLockout)
+	}
+	if retryAfter, blocked := limiter.retryAfter(clientKey, now.Add(30*time.Second)); !blocked || retryAfter != 30*time.Second {
+		t.Fatalf("active lockout = (%s, %v), want (30s, true)", retryAfter, blocked)
+	}
+	afterFirstLockout := now.Add(authInitialLockout)
+	if retryAfter, blocked := limiter.retryAfter(clientKey, afterFirstLockout); blocked || retryAfter != 0 {
+		t.Fatalf("expired lockout remained active for %s", retryAfter)
+	}
+	if retryAfter, blocked := limiter.recordFailure(clientKey, afterFirstLockout); !blocked || retryAfter != 2*authInitialLockout {
+		t.Fatalf("second lockout = (%s, %v), want (%s, true)", retryAfter, blocked, 2*authInitialLockout)
+	}
+	limiter.recordSuccess(clientKey)
+	if retryAfter, blocked := limiter.retryAfter(clientKey, afterFirstLockout); blocked || retryAfter != 0 {
+		t.Fatalf("successful authentication did not reset limiter: (%s, %v)", retryAfter, blocked)
+	}
+}
+
 func TestAdministratorPasswordChangePersistsAndRevokesSession(t *testing.T) {
 	dataStore := memory.New()
 	sealer, err := secret.New(bytes.Repeat([]byte{5}, 32))
@@ -586,6 +730,26 @@ func TestCORSAllowsConfiguredOriginAndRejectsOthers(t *testing.T) {
 	}
 }
 
+func TestResponseMetricsWriterCapturesStatusAndBytes(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	metrics := &responseMetricsWriter{ResponseWriter: recorder}
+	written, err := metrics.Write([]byte("response"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics.WriteHeader(http.StatusInternalServerError)
+	if written != len("response") || metrics.bytes != len("response") || metrics.status != http.StatusOK {
+		t.Fatalf("unexpected implicit response metrics: %#v", metrics)
+	}
+
+	recorder = httptest.NewRecorder()
+	metrics = &responseMetricsWriter{ResponseWriter: recorder}
+	metrics.WriteHeader(http.StatusNoContent)
+	if metrics.status != http.StatusNoContent || metrics.bytes != 0 {
+		t.Fatalf("unexpected explicit response metrics: %#v", metrics)
+	}
+}
+
 func TestSnapshotSyncTimeBoundsAgentClockSkew(t *testing.T) {
 	receivedAt := time.Date(2026, time.July, 15, 1, 2, 3, 0, time.UTC)
 	closeFinishedAt := receivedAt.Add(-time.Minute)
@@ -604,6 +768,72 @@ func TestSnapshotSyncTimeBoundsAgentClockSkew(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if got := snapshotSyncTime(test.finishedAt, receivedAt); !got.Equal(test.want) {
 				t.Fatalf("snapshotSyncTime() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateRunReportRejectsMalformedTimelines(t *testing.T) {
+	receivedAt := time.Date(2026, time.July, 15, 1, 2, 3, 0, time.UTC)
+	validReport := func() domain.RunReport {
+		finishedAt := receivedAt.Add(-time.Minute)
+		return domain.RunReport{
+			ID:             "run_valid",
+			IdempotencyKey: "project:2026-07-15T01:00:00Z",
+			ProjectID:      "project",
+			ScheduledAt:    receivedAt.Add(-3 * time.Minute),
+			StartedAt:      receivedAt.Add(-2 * time.Minute),
+			FinishedAt:     &finishedAt,
+			Status:         domain.RunSucceeded,
+		}
+	}
+
+	tests := map[string]struct {
+		mutate    func(*domain.RunReport)
+		wantError bool
+	}{
+		"valid terminal": {},
+		"valid delayed report": {mutate: func(report *domain.RunReport) {
+			report.ScheduledAt = receivedAt.Add(-25 * time.Hour)
+			report.StartedAt = receivedAt.Add(-24 * time.Hour)
+			finishedAt := receivedAt.Add(-24*time.Hour + time.Minute)
+			report.FinishedAt = &finishedAt
+		}},
+		"missing scheduled time": {mutate: func(report *domain.RunReport) {
+			report.ScheduledAt = time.Time{}
+		}, wantError: true},
+		"terminal without finish": {mutate: func(report *domain.RunReport) {
+			report.FinishedAt = nil
+		}, wantError: true},
+		"running with finish": {mutate: func(report *domain.RunReport) {
+			report.Status = domain.RunRunning
+		}, wantError: true},
+		"finish before start": {mutate: func(report *domain.RunReport) {
+			finishedAt := report.StartedAt.Add(-time.Second)
+			report.FinishedAt = &finishedAt
+		}, wantError: true},
+		"schedule after start": {mutate: func(report *domain.RunReport) {
+			report.ScheduledAt = report.StartedAt.Add(time.Second)
+		}, wantError: true},
+		"future start": {mutate: func(report *domain.RunReport) {
+			report.ScheduledAt = receivedAt.Add(maxAgentClockSkew + time.Minute)
+			report.StartedAt = report.ScheduledAt
+			finishedAt := report.StartedAt.Add(time.Second)
+			report.FinishedAt = &finishedAt
+		}, wantError: true},
+		"oversized error": {mutate: func(report *domain.RunReport) {
+			report.ErrorMessage = strings.Repeat("x", maxRunErrorLength+1)
+		}, wantError: true},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			report := validReport()
+			if test.mutate != nil {
+				test.mutate(&report)
+			}
+			if err := validateRunReport(report, receivedAt); (err != nil) != test.wantError {
+				t.Fatalf("validateRunReport() error = %v, wantError = %v", err, test.wantError)
 			}
 		})
 	}
@@ -681,6 +911,143 @@ func TestDatabaseSourcePasswordIsSealedAtRestAndDeliveredOnlyToAgent(t *testing.
 	if got.SecretCiphertext != "" || got.Database == nil || got.Database.Password != "database-password" {
 		t.Fatalf("agent did not receive decrypted database password: %#v", got)
 	}
+}
+
+func TestUpdateProjectPreservesExistingDatabasePasswordAndAdvancesRevision(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{10}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	enrollment, err := service.CreateServer(ctx, "Editable database host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "editable-db", OS: "linux", Arch: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{
+		Provider: "local", Name: "Editable repository", URL: "/tmp/editable-repository", Password: "restic-password",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "MySQL before edit",
+		Sources: []domain.Source{{
+			Type: "mysql", Required: true,
+			Database: &domain.DatabaseSource{Host: "127.0.0.1", Port: 3306, Username: "backup", Password: "original-secret", Database: "application"},
+		}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := service.UpdateProject(ctx, created.ID, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "MySQL after edit",
+		Sources: []domain.Source{{
+			ID: created.Sources[0].ID, Type: "mysql", Required: true,
+			Database: &domain.DatabaseSource{Host: "db.internal", Port: 3306, Username: "backup", Database: "application"},
+		}},
+		Schedule: domain.Schedule{Cron: "30 3 * * *", Timezone: "UTC", GraceSeconds: 1800},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "MySQL after edit" || updated.Revision != 2 || updated.Schedule.GraceSeconds != 1800 {
+		t.Fatalf("project edit was not applied: %#v", updated)
+	}
+	if updated.Sources[0].Database == nil || updated.Sources[0].Database.Password != "" || updated.Sources[0].SecretCiphertext != "" {
+		t.Fatalf("public project leaked database secret after edit: %#v", updated.Sources[0])
+	}
+	config, err := service.DesiredConfig(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Revision != 2 || len(config.Projects) != 1 || config.Projects[0].Sources[0].Database.Password != "original-secret" {
+		t.Fatalf("database password was not preserved for the Agent: %#v", config)
+	}
+	_, err = service.UpdateProject(ctx, created.ID, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: "repo_different", Name: "Move chain",
+		Sources: created.Sources, Schedule: created.Schedule,
+	})
+	if err == nil || !strings.Contains(err.Error(), "recovery chain") {
+		t.Fatalf("expected repository move to be rejected, got %v", err)
+	}
+}
+
+func TestProjectHealthDetectsMissingBackupReports(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{11}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	current := time.Date(2026, time.July, 15, 0, 0, 0, 0, time.UTC)
+	enrollment, err := service.CreateServer(ctx, "RPO host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "rpo-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "RPO repository", URL: "/tmp/rpo-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return current }
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Hourly evidence",
+		Sources: []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{
+			Cron: "0 1 * * *", Timezone: "UTC", MaxRuntimeSeconds: 3600, GraceSeconds: 1800,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHealth := func(want string) domain.ProjectHealth {
+		t.Helper()
+		items, err := service.ProjectHealth(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 1 || items[0].ProjectID != project.ID || items[0].Status != want {
+			t.Fatalf("health at %s = %#v, want %s", current, items, want)
+		}
+		return items[0]
+	}
+	assertHealth("pending")
+	current = time.Date(2026, time.July, 15, 1, 15, 0, 0, time.UTC)
+	late := assertHealth("late")
+	wantDeadline := time.Date(2026, time.July, 15, 2, 30, 0, 0, time.UTC)
+	if late.DeadlineAt == nil || !late.DeadlineAt.Equal(wantDeadline) {
+		t.Fatalf("deadline = %v, want %v", late.DeadlineAt, wantDeadline)
+	}
+	current = wantDeadline.Add(time.Minute)
+	assertHealth("overdue")
+	dashboard, err := service.Dashboard(ctx, current.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.ProjectsOverdue != 1 || dashboard.ProjectsLate != 0 {
+		t.Fatalf("dashboard did not include RPO breach: %#v", dashboard)
+	}
+	started := time.Date(2026, time.July, 15, 1, 20, 0, 0, time.UTC)
+	finished := started.Add(10 * time.Minute)
+	if err := dataStore.UpsertRun(ctx, domain.RunReport{
+		ID: "run_rpo_success", IdempotencyKey: "scheduled:rpo-success", ProjectID: project.ID, ServerID: identity.AgentID,
+		ScheduledAt: time.Date(2026, time.July, 15, 1, 0, 0, 0, time.UTC), StartedAt: started, FinishedAt: &finished,
+		Status: domain.RunSucceeded, Stats: map[string]any{"operation": "backup"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertHealth("healthy")
 }
 
 func TestGlobalRepositoryCanBeAssignedToDockerProject(t *testing.T) {
@@ -841,6 +1208,71 @@ func TestRetentionModesAreValidatedAndNormalized(t *testing.T) {
 	separate.Maintenance.PruneCron = "not a cron"
 	if err := validateMaintenancePolicy(&separate); err == nil {
 		t.Fatal("invalid prune maintenance schedule was accepted")
+	}
+}
+
+func TestNotificationChannelHTTPFlowKeepsSecretsWriteOnly(t *testing.T) {
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{23}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := newTestHTTPHandler(t, service, logger, false, []string{"https://console.example.com"})
+	adminCookie := loginAdmin(t, handler)
+
+	var created domain.NotificationChannel
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/notification-channels", adminCookie, domain.NotificationChannel{
+		Name: "Operations webhook", Type: "webhook", Enabled: true, SendResolved: true,
+		RepeatIntervalSeconds: 14400, EventTypes: []string{"backup_failure", "rpo_overdue"},
+		Config: map[string]string{
+			"url": "https://alerts.example.com/private-token", "method": "POST",
+			"authorization": "Bearer private-authorization", "headers": `{"X-Environment":"test"}`,
+		},
+	}, http.StatusCreated, &created)
+	if created.ID == "" || !created.Configured || created.Destination != "alerts.example.com" {
+		t.Fatalf("unexpected public notification channel: %#v", created)
+	}
+	if created.Config["url"] != "" || created.Config["authorization"] != "" || created.Config["headers"] != "" {
+		t.Fatalf("notification channel response leaked a secret: %#v", created.Config)
+	}
+
+	var testedURL string
+	service.notificationSender = func(_ context.Context, _ domain.NotificationChannel, config map[string]string, _ domain.AlertIncident, _ string) error {
+		testedURL = config["url"]
+		return nil
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/notification-channels/"+created.ID+"/test", adminCookie,
+		nil, http.StatusNoContent, nil)
+	if testedURL != "https://alerts.example.com/private-token" {
+		t.Fatalf("test notification did not receive decrypted configuration: %q", testedURL)
+	}
+
+	created.Name = "Renamed operations webhook"
+	created.Config = nil
+	var updated domain.NotificationChannel
+	requestJSONWithCookie(t, handler, http.MethodPut, "/api/v1/notification-channels/"+created.ID, adminCookie,
+		created, http.StatusOK, &updated)
+	if updated.Name != created.Name || updated.Destination != "alerts.example.com" {
+		t.Fatalf("blank secret update did not preserve configuration: %#v", updated)
+	}
+
+	var disabled domain.NotificationChannel
+	requestJSONWithCookie(t, handler, http.MethodPatch, "/api/v1/notification-channels/"+created.ID, adminCookie,
+		map[string]bool{"enabled": false}, http.StatusOK, &disabled)
+	if disabled.Enabled {
+		t.Fatal("notification channel remained enabled")
+	}
+	requestJSONWithCookie(t, handler, http.MethodDelete, "/api/v1/notification-channels/"+created.ID, adminCookie,
+		nil, http.StatusNoContent, nil)
+	var listed struct {
+		Items []domain.NotificationChannel `json:"items"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/notification-channels", adminCookie,
+		nil, http.StatusOK, &listed)
+	if len(listed.Items) != 0 {
+		t.Fatalf("archived notification channel was still listed: %#v", listed.Items)
 	}
 }
 

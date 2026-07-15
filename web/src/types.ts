@@ -5,6 +5,8 @@ export interface Dashboard {
   runs_succeeded: number
   runs_failed: number
   runs_partial: number
+  projects_late: number
+  projects_overdue: number
 }
 
 export interface Server {
@@ -52,6 +54,7 @@ export interface Schedule {
   timezone: string
   jitter_seconds: number
   max_runtime_seconds: number
+  grace_seconds: number
   missed_run_policy: 'skip'
   concurrency_policy: 'forbid'
 }
@@ -103,6 +106,16 @@ export interface Project {
   updated_at: string
 }
 
+export interface ProjectHealth {
+  project_id: string
+  status: 'healthy' | 'pending' | 'late' | 'overdue' | 'paused' | 'invalid'
+  latest_run_status?: string
+  latest_run_at?: string
+  last_successful_at?: string
+  expected_at?: string
+  deadline_at?: string
+}
+
 export interface Run {
   id: string
   idempotency_key: string
@@ -116,6 +129,65 @@ export interface Run {
   error_code?: string
   error_message?: string
   stats?: Record<string, unknown>
+}
+
+export interface AuditEvent {
+  id: string
+  actor: string
+  action: string
+  resource_type?: string
+  resource_id?: string
+  outcome: 'succeeded' | 'failed'
+  client_ip: string
+  status_code: number
+  created_at: string
+}
+
+export interface NotificationChannel {
+  id: string
+  name: string
+  type: string
+  enabled: boolean
+  send_resolved: boolean
+  repeat_interval_seconds: number
+  event_types: ('backup_failure' | 'rpo_overdue')[]
+  project_ids?: string[]
+  config?: Record<string, string>
+  destination?: string
+  configured: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface AlertIncident {
+  id: string
+  fingerprint: string
+  kind: 'backup_failure' | 'rpo_overdue'
+  project_id: string
+  project_name: string
+  status: 'firing' | 'resolved'
+  severity: 'warning' | 'critical' | string
+  summary: string
+  description: string
+  source_event_id: string
+  occurrence_count: number
+  started_at: string
+  updated_at: string
+  resolved_at?: string
+}
+
+export interface NotificationDelivery {
+  id: string
+  alert_id: string
+  channel_id: string
+  channel_name?: string
+  transition: 'firing' | 'repeat' | 'resolved'
+  status: 'pending' | 'delivering' | 'sent' | 'failed'
+  attempt_count: number
+  next_attempt_at: string
+  last_error?: string
+  created_at: string
+  sent_at?: string
 }
 
 export interface Snapshot {

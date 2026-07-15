@@ -33,6 +33,12 @@ type Store struct {
 	completed    map[string]time.Time
 	runs         map[string]domain.RunReport
 	runKeys      map[string]string
+	channels     map[string]domain.NotificationChannel
+	alerts       map[string]domain.AlertIncident
+	deliveries   map[string]domain.NotificationDelivery
+	deliveryKeys map[string]string
+	auditEvents  []domain.AuditEvent
+	auditIDs     map[string]struct{}
 }
 
 func New() *Store {
@@ -49,6 +55,11 @@ func New() *Store {
 		completed:    make(map[string]time.Time),
 		runs:         make(map[string]domain.RunReport),
 		runKeys:      make(map[string]string),
+		channels:     make(map[string]domain.NotificationChannel),
+		alerts:       make(map[string]domain.AlertIncident),
+		deliveries:   make(map[string]domain.NotificationDelivery),
+		deliveryKeys: make(map[string]string),
+		auditIDs:     make(map[string]struct{}),
 	}
 }
 
@@ -208,6 +219,16 @@ func (s *Store) CreateProject(_ context.Context, project domain.Project) (domain
 	return cloneProject(project), nil
 }
 
+func (s *Store) GetProject(_ context.Context, id string) (domain.Project, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	project, ok := s.projects[id]
+	if !ok {
+		return domain.Project{}, store.ErrNotFound
+	}
+	return cloneProject(project), nil
+}
+
 func (s *Store) ListProjects(context.Context) ([]domain.Project, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -217,6 +238,35 @@ func (s *Store) ListProjects(context.Context) ([]domain.Project, error) {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.Before(result[j].CreatedAt) })
 	return result, nil
+}
+
+func (s *Store) UpdateProject(_ context.Context, project domain.Project, updatedAt time.Time) (domain.Project, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.projects[project.ID]
+	if !ok {
+		return domain.Project{}, store.ErrNotFound
+	}
+	if project.ServerID != current.ServerID || project.RepositoryID != current.RepositoryID {
+		return domain.Project{}, store.ErrConflict
+	}
+	for id, candidate := range s.projects {
+		if id != project.ID && candidate.ServerID == project.ServerID && candidate.Name == project.Name {
+			return domain.Project{}, store.ErrConflict
+		}
+	}
+	server, ok := s.servers[current.ServerID]
+	if !ok {
+		return domain.Project{}, store.ErrNotFound
+	}
+	server.DesiredRevision++
+	project.Enabled = current.Enabled
+	project.Revision = server.DesiredRevision
+	project.CreatedAt = current.CreatedAt
+	project.UpdatedAt = updatedAt
+	s.servers[server.ID] = server
+	s.projects[project.ID] = cloneProject(project)
+	return cloneProject(project), nil
 }
 
 func (s *Store) SetProjectEnabled(_ context.Context, id string, enabled bool, updatedAt time.Time) (domain.Project, error) {
@@ -425,6 +475,287 @@ func (s *Store) ListRuns(_ context.Context, limit int) ([]domain.RunReport, erro
 	return result, nil
 }
 
+func (s *Store) ListProjectBackupActivity(_ context.Context) ([]domain.ProjectBackupActivity, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	activity := make(map[string]domain.ProjectBackupActivity, len(s.projects))
+	for id := range s.projects {
+		activity[id] = domain.ProjectBackupActivity{ProjectID: id}
+	}
+	for _, report := range s.runs {
+		operation, _ := report.Stats["operation"].(string)
+		if operation != "" && operation != "backup" {
+			continue
+		}
+		item, ok := activity[report.ProjectID]
+		if !ok {
+			continue
+		}
+		if item.LatestRunAt == nil || report.StartedAt.After(*item.LatestRunAt) {
+			startedAt := report.StartedAt
+			item.LatestRunAt = &startedAt
+			item.LatestRunID = report.ID
+			item.LatestRunStatus = report.Status
+		}
+		if report.Status == domain.RunSucceeded {
+			succeededAt := report.StartedAt
+			if report.FinishedAt != nil {
+				succeededAt = *report.FinishedAt
+			}
+			if item.LastSuccessfulAt == nil || succeededAt.After(*item.LastSuccessfulAt) {
+				item.LastSuccessfulAt = &succeededAt
+			}
+		}
+		activity[report.ProjectID] = item
+	}
+	result := make([]domain.ProjectBackupActivity, 0, len(activity))
+	for _, item := range activity {
+		result = append(result, item)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ProjectID < result[j].ProjectID })
+	return result, nil
+}
+
+func (s *Store) CreateNotificationChannel(_ context.Context, channel domain.NotificationChannel) (domain.NotificationChannel, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.channels {
+		if existing.DeletedAt == nil && existing.Name == channel.Name {
+			return domain.NotificationChannel{}, store.ErrConflict
+		}
+	}
+	if _, exists := s.channels[channel.ID]; exists {
+		return domain.NotificationChannel{}, store.ErrConflict
+	}
+	s.channels[channel.ID] = cloneNotificationChannel(channel)
+	return cloneNotificationChannel(channel), nil
+}
+
+func (s *Store) GetNotificationChannel(_ context.Context, id string) (domain.NotificationChannel, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	channel, ok := s.channels[id]
+	if !ok {
+		return domain.NotificationChannel{}, store.ErrNotFound
+	}
+	return cloneNotificationChannel(channel), nil
+}
+
+func (s *Store) ListNotificationChannels(context.Context) ([]domain.NotificationChannel, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]domain.NotificationChannel, 0, len(s.channels))
+	for _, channel := range s.channels {
+		if channel.DeletedAt == nil {
+			result = append(result, cloneNotificationChannel(channel))
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.Before(result[j].CreatedAt) })
+	return result, nil
+}
+
+func (s *Store) UpdateNotificationChannel(_ context.Context, channel domain.NotificationChannel) (domain.NotificationChannel, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.channels[channel.ID]
+	if !ok || current.DeletedAt != nil {
+		return domain.NotificationChannel{}, store.ErrNotFound
+	}
+	for id, existing := range s.channels {
+		if id != channel.ID && existing.DeletedAt == nil && existing.Name == channel.Name {
+			return domain.NotificationChannel{}, store.ErrConflict
+		}
+	}
+	channel.CreatedAt = current.CreatedAt
+	s.channels[channel.ID] = cloneNotificationChannel(channel)
+	return cloneNotificationChannel(channel), nil
+}
+
+func (s *Store) ArchiveNotificationChannel(_ context.Context, id string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	channel, ok := s.channels[id]
+	if !ok || channel.DeletedAt != nil {
+		return store.ErrNotFound
+	}
+	channel.Enabled = false
+	channel.DeletedAt = &at
+	channel.UpdatedAt = at
+	s.channels[id] = channel
+	return nil
+}
+
+func (s *Store) CreateAlertIncident(_ context.Context, alert domain.AlertIncident) (domain.AlertIncident, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.alerts {
+		if existing.Fingerprint == alert.Fingerprint && existing.Status == "firing" {
+			return domain.AlertIncident{}, store.ErrConflict
+		}
+	}
+	if _, exists := s.alerts[alert.ID]; exists {
+		return domain.AlertIncident{}, store.ErrConflict
+	}
+	s.alerts[alert.ID] = alert
+	return alert, nil
+}
+
+func (s *Store) GetAlertIncident(_ context.Context, id string) (domain.AlertIncident, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	alert, ok := s.alerts[id]
+	if !ok {
+		return domain.AlertIncident{}, store.ErrNotFound
+	}
+	return alert, nil
+}
+
+func (s *Store) GetFiringAlertIncident(_ context.Context, fingerprint string) (domain.AlertIncident, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, alert := range s.alerts {
+		if alert.Fingerprint == fingerprint && alert.Status == "firing" {
+			return alert, nil
+		}
+	}
+	return domain.AlertIncident{}, store.ErrNotFound
+}
+
+func (s *Store) UpdateAlertIncident(_ context.Context, alert domain.AlertIncident) (domain.AlertIncident, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.alerts[alert.ID]; !ok {
+		return domain.AlertIncident{}, store.ErrNotFound
+	}
+	s.alerts[alert.ID] = alert
+	return alert, nil
+}
+
+func (s *Store) ListAlertIncidents(_ context.Context, limit int) ([]domain.AlertIncident, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	result := make([]domain.AlertIncident, 0, len(s.alerts))
+	for _, alert := range s.alerts {
+		result = append(result, alert)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].UpdatedAt.After(result[j].UpdatedAt) })
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+func (s *Store) CreateNotificationDelivery(_ context.Context, delivery domain.NotificationDelivery) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.deliveryKeys[delivery.DedupeKey]; exists {
+		return store.ErrConflict
+	}
+	if _, exists := s.deliveries[delivery.ID]; exists {
+		return store.ErrConflict
+	}
+	s.deliveryKeys[delivery.DedupeKey] = delivery.ID
+	s.deliveries[delivery.ID] = delivery
+	return nil
+}
+
+func (s *Store) ClaimNotificationDeliveries(_ context.Context, now, leaseUntil time.Time, limit int) ([]domain.NotificationDelivery, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	var candidates []domain.NotificationDelivery
+	for _, delivery := range s.deliveries {
+		eligible := delivery.Status == "pending" && !delivery.NextAttemptAt.After(now)
+		eligible = eligible || (delivery.Status == "delivering" && delivery.LeaseUntil != nil && !delivery.LeaseUntil.After(now))
+		if eligible {
+			candidates = append(candidates, delivery)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].CreatedAt.Before(candidates[j].CreatedAt) })
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	for index := range candidates {
+		delivery := candidates[index]
+		delivery.Status = "delivering"
+		delivery.AttemptCount++
+		delivery.LeaseUntil = &leaseUntil
+		s.deliveries[delivery.ID] = delivery
+		candidates[index] = delivery
+	}
+	return candidates, nil
+}
+
+func (s *Store) CompleteNotificationDelivery(_ context.Context, id string, sent bool, lastError string, completedAt, nextAttemptAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delivery, ok := s.deliveries[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	delivery.LeaseUntil = nil
+	delivery.LastError = lastError
+	if sent {
+		delivery.Status = "sent"
+		delivery.SentAt = &completedAt
+	} else if nextAttemptAt.IsZero() {
+		delivery.Status = "failed"
+	} else {
+		delivery.Status = "pending"
+		delivery.NextAttemptAt = nextAttemptAt
+	}
+	s.deliveries[id] = delivery
+	return nil
+}
+
+func (s *Store) ListNotificationDeliveries(_ context.Context, limit int) ([]domain.NotificationDelivery, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	result := make([]domain.NotificationDelivery, 0, len(s.deliveries))
+	for _, delivery := range s.deliveries {
+		delivery.ChannelName = s.channels[delivery.ChannelID].Name
+		result = append(result, delivery)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
+func (s *Store) AppendAuditEvent(_ context.Context, event domain.AuditEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.auditIDs[event.ID]; exists {
+		return store.ErrConflict
+	}
+	s.auditIDs[event.ID] = struct{}{}
+	s.auditEvents = append(s.auditEvents, event)
+	return nil
+}
+
+func (s *Store) ListAuditEvents(_ context.Context, limit int) ([]domain.AuditEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	result := append([]domain.AuditEvent(nil), s.auditEvents...)
+	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.After(result[j].CreatedAt) })
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result, nil
+}
+
 func (s *Store) Dashboard(_ context.Context, since time.Time) (domain.Dashboard, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -479,6 +810,14 @@ func cloneRepository(repository domain.Repository) domain.Repository {
 		repository.Options = cloneMap(repository.Options)
 	}
 	return repository
+}
+
+func cloneNotificationChannel(channel domain.NotificationChannel) domain.NotificationChannel {
+	channel.SecretCiphertext = append([]byte(nil), channel.SecretCiphertext...)
+	channel.EventTypes = append([]string(nil), channel.EventTypes...)
+	channel.ProjectIDs = append([]string(nil), channel.ProjectIDs...)
+	channel.Config = cloneMap(channel.Config)
+	return channel
 }
 
 func cloneProject(project domain.Project) domain.Project {

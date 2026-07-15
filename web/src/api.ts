@@ -7,6 +7,7 @@ export class APIError extends Error {
     message: string,
     public readonly code: string,
     public readonly status: number,
+    public readonly retryAfterSeconds?: number,
   ) {
     super(message)
   }
@@ -32,7 +33,8 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     } catch {
       // Use the bounded generic message above for non-JSON proxy errors.
     }
-    throw new APIError(message, code, response.status)
+    const retryAfter = Number.parseInt(response.headers.get('Retry-After') || '', 10)
+    throw new APIError(message, code, response.status, Number.isFinite(retryAfter) ? retryAfter : undefined)
   }
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>

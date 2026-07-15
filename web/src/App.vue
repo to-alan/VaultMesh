@@ -13,16 +13,21 @@ import {
   repositoryProviderGroups,
   repositoryProviders,
 } from './repositories'
-import type { Dashboard, EnrollmentResult, Passkey, Profile, Project, Repository, Run, Server, Snapshot, SnapshotEntry } from './types'
+import { notificationDefaults, notificationProvider, notificationProviderGroups, notificationProviders } from './notifications'
+import type { AlertIncident, AuditEvent, Dashboard, EnrollmentResult, NotificationChannel, NotificationDelivery, Passkey, Profile, Project, ProjectHealth, Repository, Run, Server, Snapshot, SnapshotEntry } from './types'
 
-type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'snapshots' | 'runs' | 'profile'
+type Tab = 'overview' | 'servers' | 'repositories' | 'projects' | 'snapshots' | 'runs' | 'notifications' | 'audit' | 'profile'
 type SourceType = 'files' | 'mysql' | 'postgresql' | 'docker'
 type ScheduleMode = 'daily' | 'weekly' | 'custom'
+type AuditCategory = 'all' | 'authentication' | 'security' | 'configuration' | 'backup'
+type RunStatusFilter = 'all' | 'active' | 'succeeded' | 'attention'
+type RunOperationFilter = 'all' | 'backup' | 'maintenance' | 'recovery'
 type SecurityModal = 'password' | 'totp-setup' | 'totp-manage' | 'passkey-add' | 'passkey-delete' | 'reauthenticate' | null
 type PendingPasskeyAction = 'add' | 'delete' | null
 
 interface ProjectSourceDraft {
   key: number
+  id?: string
   type: SourceType
   required: boolean
   paths: string
@@ -32,6 +37,7 @@ interface ProjectSourceDraft {
   username: string
   password: string
   database: string
+  password_configured: boolean
   containers: string
   include_volumes: boolean
 }
@@ -40,6 +46,7 @@ let sourceSequence = 0
 
 const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 const commonTimezones = ['Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Tokyo', 'UTC', 'Europe/London', 'America/New_York']
+const tabs: Tab[] = ['overview', 'servers', 'repositories', 'projects', 'snapshots', 'runs', 'notifications', 'audit', 'profile']
 const apiBaseURL = getAPIBaseURL()
 const currentOrigin = window.location.origin
 
@@ -49,12 +56,17 @@ const mfaCode = ref('')
 const mfaLoginRequired = ref(false)
 const authenticated = ref(false)
 const authReady = ref(false)
-const activeTab = ref<Tab>('overview')
+const activeTab = ref<Tab>(tabFromLocation())
 const loading = ref(false)
+const backgroundRefreshing = ref(false)
 const error = ref('')
 const success = ref('')
+const syncError = ref('')
+const pageError = ref('')
 const nowEpoch = ref(Date.now())
 const lastUpdatedAt = ref<number | null>(null)
+const loadedTabs = reactive(new Set<Tab>())
+const loadingTabs = reactive(new Set<Tab>())
 const queuedProjectIDs = ref<Set<string>>(new Set())
 const queuedPreviewProjectIDs = ref<Set<string>>(new Set())
 let clockTimer: number | undefined
@@ -68,11 +80,27 @@ const dashboard = ref<Dashboard>({
   runs_succeeded: 0,
   runs_failed: 0,
   runs_partial: 0,
+  projects_late: 0,
+  projects_overdue: 0,
 })
 const servers = ref<Server[]>([])
 const repositories = ref<Repository[]>([])
 const projects = ref<Project[]>([])
+const projectHealthItems = ref<ProjectHealth[]>([])
 const runs = ref<Run[]>([])
+const auditEvents = ref<AuditEvent[]>([])
+const notificationChannels = ref<NotificationChannel[]>([])
+const alertIncidents = ref<AlertIncident[]>([])
+const notificationDeliveries = ref<NotificationDelivery[]>([])
+const testingChannelIDs = ref<Set<string>>(new Set())
+const editingNotificationID = ref('')
+const auditOutcomeFilter = ref<'all' | AuditEvent['outcome']>('all')
+const auditCategoryFilter = ref<AuditCategory>('all')
+const projectSearch = ref('')
+const projectStateFilter = ref<'all' | 'enabled' | 'paused' | 'at_risk'>('all')
+const runSearch = ref('')
+const runStatusFilter = ref<RunStatusFilter>('all')
+const runOperationFilter = ref<RunOperationFilter>('all')
 const snapshots = ref<Snapshot[]>([])
 const snapshotProjectFilter = ref('')
 const selectedSnapshotID = ref('')
@@ -82,6 +110,7 @@ const pendingRestorePath = ref<string | null>(null)
 const snapshotBrowseCommandID = ref('')
 const snapshotRestoreCommandID = ref('')
 const enrollment = ref<EnrollmentResult | null>(null)
+const editingProjectID = ref('')
 const profile = ref<Profile>({ username: '', totp_enabled: false, recovery_codes_remaining: 0, passkeys: [], webauthn_available: false, webauthn_rp_id: '' })
 const totpSetup = ref<{ secret: string; qr_code: string } | null>(null)
 const recoveryCodes = ref<string[]>([])
@@ -95,6 +124,18 @@ const reauthenticationForm = reactive({ password: '', code: '' })
 
 const passwordForm = reactive({ current_password: '', new_password: '', confirm_password: '', verification_code: '' })
 const securityForm = reactive({ password: '', code: '' })
+
+const notificationForm = reactive({
+  type: 'webhook',
+  name: '',
+  enabled: true,
+  send_resolved: true,
+  repeat_minutes: 240,
+  backup_failure: true,
+  rpo_overdue: true,
+  project_ids: [] as string[],
+  config: notificationDefaults('webhook') as Record<string, string>,
+})
 
 const serverForm = reactive({ name: '' })
 const repositoryForm = reactive({
@@ -116,6 +157,7 @@ const projectForm = reactive({
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
   jitter_minutes: 5,
   max_runtime_hours: 6,
+  grace_minutes: 60,
   one_file_system: true,
   exclude_caches: true,
   exclude_if_present: '.nobackup',
@@ -138,6 +180,9 @@ const projectForm = reactive({
 })
 
 const activeRepositoryProvider = computed(() => repositoryProvider(repositoryForm.provider))
+const activeNotificationProvider = computed(() => notificationProvider(notificationForm.type))
+const firingAlertCount = computed(() => alertIncidents.value.filter((item) => item.status === 'firing').length)
+const failedDeliveryCount = computed(() => notificationDeliveries.value.filter((item) => item.status === 'failed').length)
 const repositoryFields = computed(() => activeRepositoryProvider.value.fields.filter((field) => repositoryFieldVisible(field, repositoryForm.values)))
 const repositoryURL = computed(() => buildRepositoryTarget(repositoryForm.provider, repositoryForm.values, repositoryForm.prefix))
 const repositoryMissing = computed(() => missingRepositoryFields(repositoryForm.provider, repositoryForm.values))
@@ -159,7 +204,15 @@ watch(snapshotProjectFilter, (projectID) => {
   pendingRestorePath.value = null
 })
 
+watch(activeTab, (tab) => {
+  pageError.value = ''
+  if (authenticated.value) void loadTabData(tab)
+})
+
 const projectNames = computed(() => new Map(projects.value.map((project) => [project.id, project.name])))
+const projectHealthByID = computed(() => new Map(projectHealthItems.value.map((item) => [item.project_id, item])))
+const rpoRiskCount = computed(() => projectHealthItems.value.filter((item) => ['late', 'overdue'].includes(item.status)).length)
+const editingProject = computed(() => projects.value.find((project) => project.id === editingProjectID.value))
 const backupRuns = computed(() => runs.value.filter((run) => {
   const operation = String(run.stats?.operation || 'backup')
   return operation === 'backup'
@@ -189,6 +242,18 @@ const nextBackupCountdown = computed(() => {
   if (!nextScheduledProject.value) return '--:--:--'
   return formatCountdown(Math.max(0, nextScheduledProject.value.at - nowEpoch.value))
 })
+const filteredAuditEvents = computed(() => auditEvents.value.filter((event) => (
+  (auditOutcomeFilter.value === 'all' || event.outcome === auditOutcomeFilter.value)
+  && (auditCategoryFilter.value === 'all' || auditActionCategory(event.action) === auditCategoryFilter.value)
+)))
+const auditEventsLast24Hours = computed(() => {
+  const cutoff = nowEpoch.value - 24 * 60 * 60 * 1000
+  return auditEvents.value.filter((event) => new Date(event.created_at).getTime() >= cutoff).length
+})
+const failedAuditEvents = computed(() => auditEvents.value.filter((event) => event.outcome === 'failed').length)
+const securityAuditEvents = computed(() => auditEvents.value.filter((event) => (
+  ['authentication', 'security'].includes(auditActionCategory(event.action))
+)).length)
 
 const runTrend = computed(() => {
   const points = Array.from({ length: 7 }, (_, index) => {
@@ -259,6 +324,51 @@ const projectGroups = computed(() => {
   return groups
 })
 
+const filteredProjectGroups = computed(() => {
+  const query = projectSearch.value.trim().toLocaleLowerCase('zh-CN')
+  return projectGroups.value.map((group) => {
+    const serverMatches = !query || [group.name, group.server?.hostname, group.server?.id]
+      .some((value) => value?.toLocaleLowerCase('zh-CN').includes(query))
+    const items = group.projects.filter((project) => {
+      const health = projectHealthByID.value.get(project.id)
+      const stateMatches = projectStateFilter.value === 'all'
+        || (projectStateFilter.value === 'enabled' && project.enabled)
+        || (projectStateFilter.value === 'paused' && !project.enabled)
+        || (projectStateFilter.value === 'at_risk' && ['late', 'overdue'].includes(health?.status || ''))
+      const textMatches = serverMatches || [project.name, project.id, repositoryName(project.repository_id), ...project.sources.map(sourceSummary)]
+        .some((value) => value.toLocaleLowerCase('zh-CN').includes(query))
+      return stateMatches && textMatches
+    })
+    return { ...group, projects: items }
+  }).filter((group) => !query && projectStateFilter.value === 'all' ? true : group.projects.length > 0)
+})
+const filteredProjectCount = computed(() => filteredProjectGroups.value.reduce((total, group) => total + group.projects.length, 0))
+
+const activeRunCount = computed(() => runs.value.filter((run) => ['pending', 'running'].includes(run.status)).length)
+const attentionRunCount = computed(() => runs.value.filter((run) => ['partial', 'failed', 'timed_out', 'canceled', 'unknown'].includes(run.status)).length)
+const filteredRuns = computed(() => {
+  const query = runSearch.value.trim().toLocaleLowerCase('zh-CN')
+  return runs.value.filter((run) => {
+    const statusMatches = runStatusFilter.value === 'all'
+      || (runStatusFilter.value === 'active' && ['pending', 'running'].includes(run.status))
+      || (runStatusFilter.value === 'succeeded' && run.status === 'succeeded')
+      || (runStatusFilter.value === 'attention' && ['partial', 'failed', 'timed_out', 'canceled', 'unknown'].includes(run.status))
+    const operation = runOperationGroup(run)
+    const operationMatches = runOperationFilter.value === 'all' || runOperationFilter.value === operation
+    const textMatches = !query || [
+      run.id,
+      run.snapshot_id,
+      run.error_code,
+      run.error_message,
+      run.status,
+      projectNames.value.get(run.project_id),
+      serverName(run.server_id),
+      runOperationLabel(run),
+    ].some((value) => String(value || '').toLocaleLowerCase('zh-CN').includes(query))
+    return statusMatches && operationMatches && textMatches
+  })
+})
+
 const filteredSnapshots = computed(() => snapshots.value.filter((snapshot) => (
   !snapshotProjectFilter.value || snapshot.project_id === snapshotProjectFilter.value
 )))
@@ -324,7 +434,7 @@ async function login() {
     authenticated.value = true
     mfaLoginRequired.value = false
     passwordInput.value = ''
-    await loadAll()
+    await loadInitialData()
   } catch (cause) {
     authenticated.value = false
     showError(cause)
@@ -341,7 +451,7 @@ async function completeMFA() {
     authenticated.value = true
     mfaLoginRequired.value = false
     mfaCode.value = ''
-    await loadAll()
+    await loadInitialData()
   } catch (cause) {
     showError(cause)
   } finally {
@@ -366,7 +476,7 @@ async function loginWithPasskey() {
     await api('/api/v1/auth/passkey/finish', { method: 'POST', body: JSON.stringify(serializeAssertion(credential)) })
     authenticated.value = true
     mfaLoginRequired.value = false
-    await loadAll()
+    await loadInitialData()
   } catch (cause) {
     showError(cause)
   } finally {
@@ -384,38 +494,98 @@ async function logout() {
     mfaLoginRequired.value = false
     passwordInput.value = ''
     error.value = ''
+    success.value = ''
+    syncError.value = ''
+    pageError.value = ''
+    loadedTabs.clear()
+    loadingTabs.clear()
+    snapshots.value = []
+    auditEvents.value = []
+    notificationChannels.value = []
+    alertIncidents.value = []
+    notificationDeliveries.value = []
   }
 }
 
-async function loadAll() {
-  loading.value = true
-  error.value = ''
+async function loadInitialData() {
+  await loadCoreData()
+  await loadTabData(activeTab.value, true)
+}
+
+async function loadCoreData() {
+  const [dashboardResult, serverResult, repositoryResult, projectResult, projectHealthResult, runResult, profileResult] = await Promise.all([
+    api<Dashboard>('/api/v1/dashboard'),
+    api<{ items: Server[] }>('/api/v1/servers'),
+    api<{ items: Repository[] }>('/api/v1/repositories'),
+    api<{ items: Project[] }>('/api/v1/projects'),
+    api<{ items: ProjectHealth[] }>('/api/v1/project-health'),
+    api<{ items: Run[] }>('/api/v1/runs?limit=100'),
+    api<Profile>('/api/v1/profile'),
+  ])
+  dashboard.value = dashboardResult
+  servers.value = serverResult.items ?? []
+  repositories.value = repositoryResult.items ?? []
+  projects.value = projectResult.items ?? []
+  projectHealthItems.value = projectHealthResult.items ?? []
+  runs.value = runResult.items ?? []
+  profile.value = profileResult
+  lastUpdatedAt.value = Date.now()
+  selectDefaults()
+}
+
+async function loadSnapshotsData() {
+  const result = await api<{ items: Snapshot[] }>('/api/v1/snapshots?limit=1000')
+  snapshots.value = (result.items ?? []).map((snapshot) => ({
+    ...snapshot,
+    paths: snapshot.paths ?? [],
+    tags: snapshot.tags ?? [],
+  }))
+  loadedTabs.add('snapshots')
+  selectDefaults()
+}
+
+async function loadAuditData() {
+  const result = await api<{ items: AuditEvent[] }>('/api/v1/audit-events?limit=200')
+  auditEvents.value = result.items ?? []
+  loadedTabs.add('audit')
+}
+
+async function loadNotificationData() {
+  const [channelResult, incidentResult, deliveryResult] = await Promise.all([
+    api<{ items: NotificationChannel[] }>('/api/v1/notification-channels'),
+    api<{ items: AlertIncident[] }>('/api/v1/alert-incidents?limit=200'),
+    api<{ items: NotificationDelivery[] }>('/api/v1/notification-deliveries?limit=200'),
+  ])
+  notificationChannels.value = channelResult.items ?? []
+  alertIncidents.value = incidentResult.items ?? []
+  notificationDeliveries.value = deliveryResult.items ?? []
+  loadedTabs.add('notifications')
+}
+
+async function loadRunsData() {
+  const result = await api<{ items: Run[] }>('/api/v1/runs?limit=100')
+  runs.value = result.items ?? []
+}
+
+async function loadTabData(tab: Tab, force = false) {
+  if (!['snapshots', 'audit', 'notifications'].includes(tab)) return
+  if ((!force && loadedTabs.has(tab)) || loadingTabs.has(tab)) return
+  loadingTabs.add(tab)
+  if (tab === activeTab.value) pageError.value = ''
   try {
-    const [dashboardResult, serverResult, repositoryResult, projectResult, runResult, snapshotResult, profileResult] = await Promise.all([
-      api<Dashboard>('/api/v1/dashboard'),
-      api<{ items: Server[] }>('/api/v1/servers'),
-      api<{ items: Repository[] }>('/api/v1/repositories'),
-      api<{ items: Project[] }>('/api/v1/projects'),
-      api<{ items: Run[] }>('/api/v1/runs?limit=100'),
-      api<{ items: Snapshot[] }>('/api/v1/snapshots?limit=1000'),
-      api<Profile>('/api/v1/profile'),
-    ])
-    dashboard.value = dashboardResult
-    servers.value = serverResult.items ?? []
-    repositories.value = repositoryResult.items ?? []
-    projects.value = projectResult.items ?? []
-    runs.value = runResult.items ?? []
-    snapshots.value = (snapshotResult.items ?? []).map((snapshot) => ({
-      ...snapshot,
-      paths: snapshot.paths ?? [],
-      tags: snapshot.tags ?? [],
-    }))
-    profile.value = profileResult
-    lastUpdatedAt.value = Date.now()
-    selectDefaults()
+    if (tab === 'snapshots') await loadSnapshotsData()
+    else if (tab === 'notifications') await loadNotificationData()
+    else await loadAuditData()
+  } catch (cause) {
+    if (tab === activeTab.value) pageError.value = errorMessage(cause)
+    if (cause instanceof APIError && cause.status === 401) showError(cause)
   } finally {
-    loading.value = false
+    loadingTabs.delete(tab)
   }
+}
+
+async function refreshSnapshotContext() {
+  await Promise.all([loadRunsData(), loadSnapshotsData()])
 }
 
 async function changePassword() {
@@ -458,7 +628,7 @@ async function enableTOTP() {
     recoveryCodes.value = result.recovery_codes
     totpSetup.value = null
     totpActivationCode.value = ''
-    await loadAll()
+    await loadCoreData()
     securityModalStep.value = 'recovery'
     success.value = '二步验证已启用。恢复码只展示这一次，请立即离线保存。'
   })
@@ -482,7 +652,7 @@ async function regenerateRecoveryCodes() {
       method: 'POST', body: JSON.stringify(securityForm),
     })
     recoveryCodes.value = result.recovery_codes
-    await loadAll()
+    await loadCoreData()
     securityModalStep.value = 'recovery'
     success.value = '旧恢复码已失效。请立即保存这组新恢复码。'
   })
@@ -515,7 +685,7 @@ async function registerPasskey() {
       method: 'POST', body: JSON.stringify(serializeRegistration(credential)),
     })
     passkeyName.value = ''
-    await loadAll()
+    await loadCoreData()
     securityModal.value = null
     success.value = '通行密钥已注册，可在登录页直接使用。'
   })
@@ -534,7 +704,7 @@ async function deletePasskey(passkey: Passkey) {
       }
       throw cause
     }
-    await loadAll()
+    await loadCoreData()
     securityModal.value = null
     success.value = `已删除通行密钥“${passkey.name}”。`
   })
@@ -646,8 +816,8 @@ async function createServer() {
       body: JSON.stringify({ name: serverForm.name }),
     })
     serverForm.name = ''
-    await loadAll()
-    activeTab.value = 'servers'
+    await loadCoreData()
+    navigateTo('servers')
     success.value = '服务器已创建。注册令牌只会完整显示这一次。'
   })
 }
@@ -670,16 +840,130 @@ async function createRepository() {
     repositoryForm.prefix = 'vaultmesh'
     repositoryForm.password = ''
     repositoryForm.values = repositoryDefaults(repositoryForm.provider)
-    await loadAll()
+    await loadCoreData()
     success.value = '独立备份仓库已加密保存，可分配给任意服务器上的项目。'
   })
 }
 
-async function createProject() {
+function changeNotificationType() {
+  notificationForm.config = notificationDefaults(notificationForm.type)
+}
+
+function resetNotificationForm() {
+  editingNotificationID.value = ''
+  Object.assign(notificationForm, {
+    type: 'webhook', name: '', enabled: true, send_resolved: true, repeat_minutes: 240,
+    backup_failure: true, rpo_overdue: true, project_ids: [], config: notificationDefaults('webhook'),
+  })
+}
+
+function editNotificationChannel(channel: NotificationChannel) {
+  editingNotificationID.value = channel.id
+  Object.assign(notificationForm, {
+    type: channel.type,
+    name: channel.name,
+    enabled: channel.enabled,
+    send_resolved: channel.send_resolved,
+    repeat_minutes: Math.round(channel.repeat_interval_seconds / 60),
+    backup_failure: channel.event_types.includes('backup_failure'),
+    rpo_overdue: channel.event_types.includes('rpo_overdue'),
+    project_ids: [...(channel.project_ids ?? [])],
+    config: { ...notificationDefaults(channel.type), ...(channel.config ?? {}) },
+  })
+  window.requestAnimationFrame(() => document.getElementById('notification-builder')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+}
+
+async function saveNotificationChannel() {
+  await perform(async () => {
+    const eventTypes = [
+      notificationForm.backup_failure ? 'backup_failure' : '',
+      notificationForm.rpo_overdue ? 'rpo_overdue' : '',
+    ].filter(Boolean)
+    if (!eventTypes.length) throw new Error('至少选择一种告警事件。')
+    const id = editingNotificationID.value
+    await api<NotificationChannel>(id ? `/api/v1/notification-channels/${encodeURIComponent(id)}` : '/api/v1/notification-channels', {
+      method: id ? 'PUT' : 'POST',
+      body: JSON.stringify({
+        name: notificationForm.name,
+        type: notificationForm.type,
+        enabled: notificationForm.enabled,
+        send_resolved: notificationForm.send_resolved,
+        repeat_interval_seconds: Number(notificationForm.repeat_minutes) * 60,
+        event_types: eventTypes,
+        project_ids: notificationForm.project_ids,
+        config: notificationForm.config,
+      }),
+    })
+    resetNotificationForm()
+    await loadNotificationData()
+    success.value = id ? '通知渠道已更新；留空的 Secret 字段保持原配置。' : '通知渠道已加密保存。建议立即发送测试消息。'
+  })
+}
+
+async function toggleNotificationChannel(channel: NotificationChannel) {
+  await perform(async () => {
+    await api(`/api/v1/notification-channels/${encodeURIComponent(channel.id)}`, {
+      method: 'PATCH', body: JSON.stringify({ enabled: !channel.enabled }),
+    })
+    await loadNotificationData()
+    success.value = channel.enabled ? `${channel.name} 已停用，不再创建新投递。` : `${channel.name} 已启用。`
+  })
+}
+
+async function testNotificationChannel(channel: NotificationChannel) {
+  testingChannelIDs.value = new Set([...testingChannelIDs.value, channel.id])
+  await perform(async () => {
+    await api(`/api/v1/notification-channels/${encodeURIComponent(channel.id)}/test`, { method: 'POST' })
+    success.value = `测试消息已通过 ${channel.name} 发出。`
+  })
+  const next = new Set(testingChannelIDs.value)
+  next.delete(channel.id)
+  testingChannelIDs.value = next
+}
+
+async function archiveNotificationChannel(channel: NotificationChannel) {
+  if (!window.confirm(`归档通知渠道“${channel.name}”？历史投递记录会保留。`)) return
+  await perform(async () => {
+    await api(`/api/v1/notification-channels/${encodeURIComponent(channel.id)}`, { method: 'DELETE' })
+    if (editingNotificationID.value === channel.id) resetNotificationForm()
+    await loadNotificationData()
+    success.value = `${channel.name} 已归档。`
+  })
+}
+
+async function evaluateAlertsNow() {
+  await perform(async () => {
+    await api('/api/v1/alerts/evaluate', { method: 'POST' })
+    await Promise.all([loadNotificationData(), loadCoreData()])
+    success.value = '已重新评估运行事实和 RPO，并处理当前可投递消息。'
+  })
+}
+
+function notificationTypeLabel(type: string): string {
+  return notificationProvider(type).label
+}
+
+function alertKindLabel(kind: string): string {
+  return kind === 'rpo_overdue' ? 'RPO 超时' : kind === 'backup_failure' ? '备份失败' : kind
+}
+
+function notificationTransitionLabel(transition: string): string {
+  return transition === 'resolved' ? '恢复' : transition === 'repeat' ? '重复提醒' : '首次告警'
+}
+
+function repeatIntervalLabel(seconds: number): string {
+  const minutes = Math.round(seconds / 60)
+  if (minutes % 1440 === 0) return `${minutes / 1440} 天`
+  if (minutes % 60 === 0) return `${minutes / 60} 小时`
+  return `${minutes} 分钟`
+}
+
+async function saveProject() {
   await perform(async () => {
     const sources = projectForm.sources.map((source) => {
       if (source.type === 'files') {
         return {
+          id: source.id,
           type: source.type,
           paths: lines(source.paths),
           excludes: lines(source.excludes),
@@ -688,6 +972,7 @@ async function createProject() {
       }
       if (source.type === 'docker') {
         return {
+          id: source.id,
           type: source.type,
           docker: {
             containers: lines(source.containers),
@@ -697,6 +982,7 @@ async function createProject() {
         }
       }
       return {
+        id: source.id,
         type: source.type,
         database: {
           host: source.host,
@@ -708,58 +994,62 @@ async function createProject() {
         required: source.required,
       }
     })
-    await api<Project>('/api/v1/projects', {
-      method: 'POST',
-      body: JSON.stringify({
-        server_id: projectForm.server_id,
-        repository_id: projectForm.repository_id,
-        name: projectForm.name,
-        sources,
-        schedule: {
-          cron: projectCron.value,
+    const payload = {
+      server_id: projectForm.server_id,
+      repository_id: projectForm.repository_id,
+      name: projectForm.name,
+      sources,
+      schedule: {
+        cron: projectCron.value,
+        timezone: projectForm.timezone,
+        jitter_seconds: Number(projectForm.jitter_minutes) * 60,
+        max_runtime_seconds: Number(projectForm.max_runtime_hours) * 3600,
+        grace_seconds: Number(projectForm.grace_minutes) * 60,
+        missed_run_policy: 'skip',
+        concurrency_policy: 'forbid',
+      },
+      policy: {
+        backup: {
+          one_file_system: projectForm.one_file_system,
+          exclude_caches: projectForm.exclude_caches,
+          exclude_if_present: lines(projectForm.exclude_if_present),
+          exclude_larger_than: projectForm.exclude_larger_than.trim(),
+        },
+        retention: {
+          enabled: projectForm.retention_enabled,
+          mode: projectForm.retention_mode,
+          keep_last: Number(projectForm.keep_last),
+          keep_hourly: Number(projectForm.keep_hourly),
+          keep_daily: Number(projectForm.keep_daily),
+          keep_weekly: Number(projectForm.keep_weekly),
+          keep_monthly: Number(projectForm.keep_monthly),
+          keep_yearly: Number(projectForm.keep_yearly),
+          keep_within: projectForm.keep_within.trim(),
+          prune: projectForm.prune,
+        },
+        verification: {
+          mode: projectForm.verification_mode,
+          read_data_subset: projectForm.verification_mode === 'subset' ? projectForm.read_data_subset : '',
+        },
+        maintenance: {
+          separate: true,
           timezone: projectForm.timezone,
-          jitter_seconds: Number(projectForm.jitter_minutes) * 60,
-          max_runtime_seconds: Number(projectForm.max_runtime_hours) * 3600,
-          missed_run_policy: 'skip',
-          concurrency_policy: 'forbid',
+          retention_cron: projectForm.retention_enabled ? projectForm.retention_cron.trim() : '',
+          prune_cron: projectForm.retention_enabled && projectForm.prune ? projectForm.prune_cron.trim() : '',
+          verification_cron: projectForm.verification_mode !== 'off' ? projectForm.verification_cron.trim() : '',
         },
-        policy: {
-          backup: {
-            one_file_system: projectForm.one_file_system,
-            exclude_caches: projectForm.exclude_caches,
-            exclude_if_present: lines(projectForm.exclude_if_present),
-            exclude_larger_than: projectForm.exclude_larger_than.trim(),
-          },
-          retention: {
-            enabled: projectForm.retention_enabled,
-            mode: projectForm.retention_mode,
-            keep_last: Number(projectForm.keep_last),
-            keep_hourly: Number(projectForm.keep_hourly),
-            keep_daily: Number(projectForm.keep_daily),
-            keep_weekly: Number(projectForm.keep_weekly),
-            keep_monthly: Number(projectForm.keep_monthly),
-            keep_yearly: Number(projectForm.keep_yearly),
-            keep_within: projectForm.keep_within.trim(),
-            prune: projectForm.prune,
-          },
-          verification: {
-            mode: projectForm.verification_mode,
-            read_data_subset: projectForm.verification_mode === 'subset' ? projectForm.read_data_subset : '',
-          },
-          maintenance: {
-            separate: true,
-            timezone: projectForm.timezone,
-            retention_cron: projectForm.retention_enabled ? projectForm.retention_cron.trim() : '',
-            prune_cron: projectForm.retention_enabled && projectForm.prune ? projectForm.prune_cron.trim() : '',
-            verification_cron: projectForm.verification_mode !== 'off' ? projectForm.verification_cron.trim() : '',
-          },
-        },
-      }),
+      },
+    }
+    const projectID = editingProjectID.value
+    await api<Project>(projectID ? `/api/v1/projects/${encodeURIComponent(projectID)}` : '/api/v1/projects', {
+      method: projectID ? 'PUT' : 'POST',
+      body: JSON.stringify(payload),
     })
-    projectForm.name = ''
-    projectForm.sources = [newProjectSource('files')]
-    await loadAll()
-    success.value = '项目已创建，Agent 将在下一次同步时应用配置。'
+    resetProjectForm()
+    await loadCoreData()
+    success.value = projectID
+      ? '项目配置已更新，Agent 将在下一次同步时原子替换执行计划。'
+      : '项目已创建，Agent 将在下一次同步时应用配置。'
   })
 }
 
@@ -776,9 +1066,108 @@ function newProjectSource(type: SourceType): ProjectSourceDraft {
     username: '',
     password: '',
     database: '',
+    password_configured: false,
     containers: '',
     include_volumes: true,
   }
+}
+
+function resetProjectForm() {
+  editingProjectID.value = ''
+  Object.assign(projectForm, {
+    server_id: servers.value[0]?.id ?? '',
+    repository_id: repositories.value[0]?.id ?? '',
+    name: '',
+    sources: [newProjectSource('files')],
+    schedule_mode: 'daily' as ScheduleMode,
+    schedule_time: '02:00',
+    weekday: '1',
+    custom_cron: '0 2 * * *',
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    jitter_minutes: 5,
+    max_runtime_hours: 6,
+    grace_minutes: 60,
+    one_file_system: true,
+    exclude_caches: true,
+    exclude_if_present: '.nobackup',
+    exclude_larger_than: '',
+    retention_enabled: true,
+    retention_mode: 'count' as const,
+    keep_last: 14,
+    keep_hourly: 0,
+    keep_daily: 7,
+    keep_weekly: 4,
+    keep_monthly: 12,
+    keep_yearly: 3,
+    keep_within: '90d',
+    prune: false,
+    verification_mode: 'off' as const,
+    read_data_subset: '1%',
+    retention_cron: '30 3 * * *',
+    prune_cron: '0 4 * * 0',
+    verification_cron: '0 5 * * 0',
+  })
+}
+
+function openProjectEditor(project: Project) {
+  const daily = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(project.schedule.cron)
+  const weekly = /^(\d{1,2}) (\d{1,2}) \* \* ([0-6])$/.exec(project.schedule.cron)
+  const retention = project.policy?.retention
+  const verification = project.policy?.verification
+  const maintenance = project.policy?.maintenance
+  const backup = project.policy?.backup
+  editingProjectID.value = project.id
+  Object.assign(projectForm, {
+    server_id: project.server_id,
+    repository_id: project.repository_id,
+    name: project.name,
+    sources: project.sources.map((source) => ({
+      key: ++sourceSequence,
+      id: source.id,
+      type: source.type,
+      required: source.required,
+      paths: source.paths?.join('\n') || '',
+      excludes: source.excludes?.join('\n') || '',
+      host: source.database?.host || '127.0.0.1',
+      port: source.database?.port || (source.type === 'mysql' ? 3306 : source.type === 'postgresql' ? 5432 : 0),
+      username: source.database?.username || '',
+      password: '',
+      database: source.database?.database || '',
+      password_configured: Boolean(source.database),
+      containers: source.docker?.containers.join('\n') || '',
+      include_volumes: source.docker?.include_volumes ?? true,
+    })),
+    schedule_mode: daily ? 'daily' : weekly ? 'weekly' : 'custom',
+    schedule_time: daily ? clock(daily[2], daily[1]) : weekly ? clock(weekly[2], weekly[1]) : '02:00',
+    weekday: weekly?.[3] || '1',
+    custom_cron: project.schedule.cron,
+    timezone: project.schedule.timezone,
+    jitter_minutes: Math.round(project.schedule.jitter_seconds / 60),
+    max_runtime_hours: Math.max(1, Math.round(project.schedule.max_runtime_seconds / 3600)),
+    grace_minutes: Math.max(1, Math.round((project.schedule.grace_seconds || 3600) / 60)),
+    one_file_system: backup?.one_file_system ?? true,
+    exclude_caches: backup?.exclude_caches ?? true,
+    exclude_if_present: backup?.exclude_if_present?.join('\n') || '',
+    exclude_larger_than: backup?.exclude_larger_than || '',
+    retention_enabled: retention?.enabled ?? false,
+    retention_mode: retention?.mode || 'gfs',
+    keep_last: retention?.keep_last ?? 0,
+    keep_hourly: retention?.keep_hourly ?? 0,
+    keep_daily: retention?.keep_daily ?? 0,
+    keep_weekly: retention?.keep_weekly ?? 0,
+    keep_monthly: retention?.keep_monthly ?? 0,
+    keep_yearly: retention?.keep_yearly ?? 0,
+    keep_within: retention?.keep_within || '90d',
+    prune: retention?.prune ?? false,
+    verification_mode: verification?.mode || 'off',
+    read_data_subset: verification?.read_data_subset || '1%',
+    retention_cron: maintenance?.retention_cron || '30 3 * * *',
+    prune_cron: maintenance?.prune_cron || '0 4 * * 0',
+    verification_cron: maintenance?.verification_cron || '0 5 * * 0',
+  })
+  window.requestAnimationFrame(() => {
+    document.getElementById('project-builder')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
 }
 
 function addProjectSource(type: SourceType) {
@@ -791,6 +1180,8 @@ function removeProjectSource(index: number) {
 
 function changeSourceType(source: ProjectSourceDraft) {
   source.port = source.type === 'mysql' ? 3306 : source.type === 'postgresql' ? 5432 : 0
+  source.password = ''
+  source.password_configured = false
 }
 
 function generateRepositoryPassword() {
@@ -922,7 +1313,7 @@ function queueSnapshotPolls() {
   for (const delay of [12000, 24000, 36000]) {
     const timer = window.setTimeout(() => {
       snapshotPollTimers.delete(timer)
-      if (authenticated.value && !loading.value) void loadAll().catch(showError)
+      if (authenticated.value && !loading.value) void refreshSnapshotContext().catch(showError)
     }, delay)
     snapshotPollTimers.add(timer)
   }
@@ -935,17 +1326,28 @@ async function toggleProject(project: Project) {
       method: 'PATCH',
       body: JSON.stringify({ enabled }),
     })
-    await loadAll()
+    await loadCoreData()
     success.value = enabled ? `${project.name} 已恢复，Agent 将重新加载执行计划。` : `${project.name} 已暂停，不再接受计划或手动备份。`
   })
 }
 
-async function refreshData() {
+async function refreshData(silent = false) {
+  if (backgroundRefreshing.value || loading.value) return
+  backgroundRefreshing.value = true
+  if (!silent) {
+    error.value = ''
+    success.value = ''
+  }
   try {
-    await loadAll()
-    success.value = '运行数据已刷新。'
+    await loadCoreData()
+    await loadTabData(activeTab.value, true)
+    syncError.value = ''
+    if (!silent) success.value = pageError.value ? '核心运行数据已刷新；当前页面的扩展数据仍需重试。' : '当前页面数据已刷新。'
   } catch (cause) {
-    showError(cause)
+    syncError.value = errorMessage(cause)
+    if (!silent) showError(cause)
+  } finally {
+    backgroundRefreshing.value = false
   }
 }
 
@@ -970,12 +1372,50 @@ function showError(cause: unknown) {
       error.value = '登录已过期，请重新登录'
       return
     }
-    error.value = cause.code === 'invalid_credentials' && !authenticated.value ? '用户名或密码错误' : cause.message
+    error.value = errorMessage(cause)
   } else if (cause instanceof Error) {
     error.value = cause.message
   } else {
     error.value = '发生未知错误'
   }
+}
+
+function errorMessage(cause: unknown): string {
+  if (cause instanceof APIError) {
+    if (cause.code === 'invalid_credentials' && !authenticated.value) return '用户名或密码错误'
+    if (cause.code === 'rate_limited' || cause.status === 429) {
+      return cause.retryAfterSeconds
+        ? `操作过于频繁，请在 ${cause.retryAfterSeconds} 秒后重试。`
+        : '操作过于频繁，请稍后重试。'
+    }
+    return cause.message
+  }
+  if (cause instanceof Error) return cause.message
+  return '发生未知错误'
+}
+
+function tabFromLocation(): Tab {
+  const candidate = window.location.hash.replace(/^#\/?/, '') as Tab
+  return tabs.includes(candidate) ? candidate : 'overview'
+}
+
+function navigateTo(tab: Tab) {
+  if (tab === activeTab.value) return
+  window.history.pushState(null, '', `#${tab}`)
+  activeTab.value = tab
+  window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+}
+
+function syncTabFromLocation() {
+  const tab = tabFromLocation()
+  if (tab !== activeTab.value) {
+    activeTab.value = tab
+    window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+  }
+}
+
+function retryActiveTabData() {
+  void loadTabData(activeTab.value, true)
 }
 
 function lines(value: string): string[] {
@@ -1034,6 +1474,32 @@ function formatCountdown(milliseconds: number): string {
   return days ? `${days}天 ${clock}` : clock
 }
 
+function projectHealthLabel(health?: ProjectHealth): string {
+  const labels: Record<string, string> = {
+    healthy: 'RPO 正常',
+    pending: '等待首次备份',
+    late: '备份迟到',
+    overdue: 'RPO 已超时',
+    paused: '监控已暂停',
+    invalid: '计划无效',
+  }
+  return labels[health?.status || ''] || '状态计算中'
+}
+
+function projectHealthSummary(health?: ProjectHealth): string {
+  if (!health) return '正在计算计划健康状态'
+  if (health.status === 'paused') return '项目暂停后不计算 RPO'
+  if (health.status === 'invalid') return 'Cron 或时区无法解析，请编辑项目修复'
+  if (health.status === 'overdue' && health.deadline_at) {
+    return `超过完成时限 ${formatCountdown(Math.max(0, nowEpoch.value - new Date(health.deadline_at).getTime()))}`
+  }
+  if (health.status === 'late' && health.deadline_at) {
+    return `宽限窗口剩余 ${formatCountdown(Math.max(0, new Date(health.deadline_at).getTime() - nowEpoch.value))}`
+  }
+  if (health.expected_at) return `${health.status === 'pending' ? '首次应执行' : '下次应执行'} ${formatDate(health.expected_at)}`
+  return '等待有效的执行计划'
+}
+
 function pageDescription(tab: Tab): string {
   return {
     overview: '运行态势、成功率与风险信号',
@@ -1042,6 +1508,8 @@ function pageDescription(tab: Tab): string {
     projects: '数据源、调度策略与下次执行',
     snapshots: '快照索引、文件浏览与隔离恢复',
     runs: '端到端备份执行证据',
+    notifications: '联系点、告警去重、重复提醒与恢复通知',
+    audit: '管理员、安全与恢复操作的持久化证据',
     profile: '密码、二步验证与通行密钥',
   }[tab]
 }
@@ -1054,8 +1522,61 @@ function navBadge(tab: Tab): number {
     projects: projects.value.length,
     snapshots: snapshots.value.length,
     runs: runs.value.length,
+    notifications: firingAlertCount.value,
+    audit: failedAuditEvents.value,
     profile: profile.value.passkeys.length,
   }[tab]
+}
+
+function auditActionCategory(action: string): Exclude<AuditCategory, 'all'> {
+  if (action.startsWith('auth.') || action === 'agent.enroll') return 'authentication'
+  if (action.startsWith('security.')) return 'security'
+  if (action.startsWith('backup.') || action.startsWith('retention.') || action.startsWith('snapshot.')) return 'backup'
+  return 'configuration'
+}
+
+function auditActionLabel(action: string): string {
+  return {
+    'auth.password': '密码登录',
+    'auth.second_factor': '二步验证登录',
+    'auth.passkey': '通行密钥登录',
+    'auth.logout': '退出登录',
+    'agent.enroll': 'Agent 注册',
+    'security.reauthenticate': '敏感操作重新认证',
+    'security.password.change': '修改管理员密码',
+    'security.totp.setup.begin': '开始设置二步验证',
+    'security.totp.enable': '启用二步验证',
+    'security.totp.disable': '停用二步验证',
+    'security.recovery_codes.regenerate': '重新生成恢复码',
+    'security.passkey.register.begin': '开始注册通行密钥',
+    'security.passkey.register': '注册通行密钥',
+    'security.passkey.delete': '移除通行密钥',
+    'server.create': '创建服务器',
+    'repository.create': '创建备份仓库',
+    'project.create': '创建备份项目',
+    'project.update': '更新备份项目',
+    'notification.channel.create': '创建通知渠道',
+    'notification.channel.update': '更新通知渠道',
+    'notification.channel.archive': '归档通知渠道',
+    'notification.channel.test': '测试通知渠道',
+    'notification.alert.evaluate': '手动评估告警',
+    'backup.run': '立即执行备份',
+    'retention.preview': '预览保留策略',
+    'snapshot.refresh': '同步快照索引',
+    'snapshot.protect': '修改快照保护',
+    'snapshot.browse': '浏览快照',
+    'snapshot.restore': '创建恢复任务',
+  }[action] ?? action
+}
+
+function auditCategoryLabel(category: ReturnType<typeof auditActionCategory>): string {
+  return { authentication: '认证', security: '安全', configuration: '配置', backup: '备份与恢复' }[category]
+}
+
+function auditResourceLabel(event: AuditEvent): string {
+  const type = { account: '管理员账号', server: '服务器', repository: '备份仓库', project: '备份项目', snapshot: '快照', passkey: '通行密钥' }[event.resource_type || '']
+  if (!type) return '—'
+  return event.resource_id ? `${type} · ${event.resource_id}` : type
 }
 
 function serverName(id: string): string {
@@ -1126,6 +1647,13 @@ function runOperationLabel(run: Run): string {
     snapshot_browse: '目录浏览',
     snapshot_restore: '安全恢复',
   }[String(run.stats?.operation || '')] || '备份'
+}
+
+function runOperationGroup(run: Run): Exclude<RunOperationFilter, 'all'> {
+  const operation = String(run.stats?.operation || 'backup')
+  if (['retention_preview', 'retention', 'prune', 'verification'].includes(operation)) return 'maintenance'
+  if (['snapshot_browse', 'snapshot_restore'].includes(operation)) return 'recovery'
+  return 'backup'
 }
 
 function maintenanceSummary(project: Project): string {
@@ -1261,14 +1789,18 @@ function serializeAssertion(credential: PublicKeyCredential) {
 }
 
 onMounted(async () => {
+  if (!window.location.hash || !tabs.includes(window.location.hash.replace(/^#\/?/, '') as Tab)) {
+    window.history.replaceState(null, '', `#${activeTab.value}`)
+  }
+  window.addEventListener('popstate', syncTabFromLocation)
   clockTimer = window.setInterval(() => { nowEpoch.value = Date.now() }, 1000)
   refreshTimer = window.setInterval(() => {
-    if (authenticated.value && !loading.value) void loadAll().catch(showError)
+    if (authenticated.value && !loading.value) void refreshData(true)
   }, 30000)
   try {
     await api('/api/v1/auth/session')
     authenticated.value = true
-    await loadAll()
+    await loadInitialData()
   } catch (cause) {
     authenticated.value = false
     if (!(cause instanceof APIError && cause.status === 401)) showError(cause)
@@ -1278,6 +1810,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('popstate', syncTabFromLocation)
   if (clockTimer) window.clearInterval(clockTimer)
   if (refreshTimer) window.clearInterval(refreshTimer)
   snapshotPollTimers.forEach((timer) => window.clearTimeout(timer))
@@ -1332,7 +1865,8 @@ onBeforeUnmount(() => {
         <button v-for="item in ([
           ['overview', '运行总览', '01'], ['servers', '服务器', '02'], ['repositories', '备份仓库', '03'],
           ['projects', '备份项目', '04'], ['snapshots', '快照恢复', '05'], ['runs', '运行记录', '06'],
-        ] as [Tab, string, string][] )" :key="item[0]" type="button" :class="{ active: activeTab === item[0] }" @click="activeTab = item[0]">
+          ['notifications', '通知与告警', '07'], ['audit', '审计日志', '08'],
+        ] as [Tab, string, string][] )" :key="item[0]" type="button" :class="{ active: activeTab === item[0] }" @click="navigateTo(item[0])">
           <span class="nav-index">{{ item[2] }}</span><span class="nav-label">{{ item[1] }}</span><span v-if="navBadge(item[0])" class="nav-badge">{{ navBadge(item[0]) }}</span>
         </button>
       </nav>
@@ -1341,29 +1875,31 @@ onBeforeUnmount(() => {
         <code>{{ apiBaseURL.replace(/^https?:\/\//, '') }}</code>
         <small>Control Plane 与 Web 独立运行</small>
       </div>
-      <button type="button" class="sidebar-account" :class="{ active: activeTab === 'profile' }" @click="activeTab = 'profile'">
+      <button type="button" class="sidebar-account" :class="{ active: activeTab === 'profile' }" @click="navigateTo('profile')">
         <span class="account-avatar">{{ (profile.username || 'A').slice(0, 1).toUpperCase() }}</span>
         <span><strong>{{ profile.username || '管理员' }}</strong><small>个人中心与安全</small></span>
         <span class="account-chevron">›</span>
       </button>
       <div class="sidebar-footer">
-        <button type="button" class="ghost" @click="refreshData" :disabled="loading">{{ loading ? '同步中…' : '刷新' }}</button>
+        <button type="button" class="ghost" @click="refreshData()" :disabled="loading || backgroundRefreshing">{{ backgroundRefreshing ? '同步中…' : '刷新' }}</button>
         <button type="button" class="ghost" @click="logout">退出</button>
       </div>
     </aside>
 
-    <section class="workspace">
+    <section class="workspace" :aria-busy="loading || backgroundRefreshing || loadingTabs.has(activeTab)">
       <header class="topbar">
         <div>
           <p class="breadcrumb">VAULTMESH <span>/</span> {{ activeTab.toUpperCase() }}</p>
-          <h1>{{ { overview: '备份总览', servers: '服务器', repositories: '备份仓库', projects: '备份项目', snapshots: '快照恢复', runs: '运行记录', profile: '个人中心' }[activeTab] }}</h1>
+          <h1>{{ { overview: '备份总览', servers: '服务器', repositories: '备份仓库', projects: '备份项目', snapshots: '快照恢复', runs: '运行记录', notifications: '通知与告警', audit: '审计日志', profile: '个人中心' }[activeTab] }}</h1>
           <p class="page-description">{{ pageDescription(activeTab) }}</p>
         </div>
-        <div class="topbar-status"><button type="button" class="scope-pill interactive" :disabled="loading" @click="refreshData">{{ loading ? 'SYNCING…' : '刷新实时数据' }}</button><button type="button" class="live-indicator interactive" @click="activeTab = 'servers'"><i></i>{{ dashboard.servers_online }}/{{ dashboard.servers_total }} Agent 在线</button></div>
+        <div class="topbar-status"><button type="button" class="scope-pill interactive" :class="{ warning: syncError }" :disabled="loading || backgroundRefreshing" @click="refreshData()">{{ backgroundRefreshing ? 'SYNCING…' : syncError ? '同步异常 · 重试' : '刷新实时数据' }}</button><button type="button" class="live-indicator interactive" @click="navigateTo('servers')"><i></i>{{ dashboard.servers_online }}/{{ dashboard.servers_total }} Agent 在线</button></div>
       </header>
 
       <p v-if="error" class="message error" role="alert">{{ error }}</p>
       <p v-if="success" class="message success" role="status" aria-live="polite">{{ success }}</p>
+      <div v-if="loadingTabs.has(activeTab)" class="page-load-state" role="status"><i></i><span>正在加载{{ activeTab === 'snapshots' ? '快照索引' : '审计事件' }}…</span></div>
+      <div v-else-if="pageError" class="page-load-state failed" role="alert"><span>{{ pageError }}</span><button type="button" class="text-button" @click="retryActiveTabData">重试当前页面</button></div>
 
       <template v-if="activeTab === 'overview'">
         <div class="overview-strip">
@@ -1375,7 +1911,7 @@ onBeforeUnmount(() => {
           <article class="metric"><header><span>SUCCESS RATE</span><i class="metric-signal" :class="successRate >= 95 ? 'good' : successRate >= 80 ? 'warn' : 'bad'"></i></header><div class="metric-value"><strong>{{ successRate }}<small>%</small></strong><em>{{ successfulRunCount }}/{{ totalRunCount }}</em></div><footer>最近 100 次 <span>{{ totalRunCount ? '有效样本' : '等待数据' }}</span></footer></article>
           <article class="metric"><header><span>24H SNAPSHOTS</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ dashboard.runs_succeeded }}</strong><em>success</em></div><footer>有效快照 <span>{{ dashboard.runs_partial }} 次部分成功</span></footer></article>
           <article class="metric"><header><span>PROTECTED SOURCES</span><i class="metric-signal"></i></header><div class="metric-value"><strong>{{ protectedSourceCount }}</strong><em>{{ projects.length }} projects</em></div><footer>文件与数据库 <span>{{ repositories.length }} 个仓库</span></footer></article>
-          <article class="metric" :class="{ alert: attentionCount > 0 }"><header><span>NEEDS ATTENTION</span><i class="metric-signal" :class="attentionCount ? 'bad' : 'good'"></i></header><div class="metric-value"><strong>{{ attentionCount }}</strong><em>24 hours</em></div><footer>失败或部分成功 <span>{{ attentionCount ? '需要处理' : '状态正常' }}</span></footer></article>
+          <article class="metric" :class="{ alert: attentionCount + rpoRiskCount > 0 }"><header><span>NEEDS ATTENTION</span><i class="metric-signal" :class="attentionCount + rpoRiskCount ? 'bad' : 'good'"></i></header><div class="metric-value"><strong>{{ attentionCount + rpoRiskCount }}</strong><em>RUN / RPO</em></div><footer>{{ attentionCount }} 次异常运行 · {{ rpoRiskCount }} 个 RPO 风险 <span>{{ attentionCount + rpoRiskCount ? '需要处理' : '状态正常' }}</span></footer></article>
           <article class="metric countdown-metric"><header><span>NEXT BACKUP</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ nextBackupCountdown }}</strong></div><footer><template v-if="nextScheduledProject"><span>{{ nextScheduledProject.project.name }}</span><span>{{ formatNextRun(nextScheduledProject.project) }}</span></template><template v-else><span>暂无已启用计划</span></template></footer></article>
         </div>
 
@@ -1411,7 +1947,7 @@ onBeforeUnmount(() => {
 
         <div class="dashboard-grid secondary-dashboard">
           <section class="panel health-panel">
-            <div class="panel-heading compact-heading"><div><p class="eyebrow">PROTECTION MATRIX</p><h2>项目健康度</h2></div><button class="text-button" @click="activeTab = 'projects'">管理项目 →</button></div>
+            <div class="panel-heading compact-heading"><div><p class="eyebrow">PROTECTION MATRIX</p><h2>项目健康度</h2></div><button class="text-button" @click="navigateTo('projects')">管理项目 →</button></div>
             <div v-if="!projectHealth.length" class="empty-state compact-empty">尚未创建备份项目。</div>
             <div v-else class="table-wrap"><table class="dense-table"><thead><tr><th>项目</th><th>数据源</th><th>最近结果</th><th>耗时</th><th>下次计划</th></tr></thead><tbody>
               <tr v-for="row in projectHealth" :key="row.project.id"><td><strong>{{ row.project.name }}</strong><small>{{ serverName(row.project.server_id) }}</small></td><td><div class="source-dots"><i v-for="source in row.project.sources" :key="source.id" :class="source.type" :title="sourceSummary(source)"></i><span>{{ row.project.sources.length }}</span></div></td><td><span class="status-pill" :class="row.status">{{ row.latest ? statusLabel(row.status) : '无运行' }}</span><small>{{ row.latest ? formatDate(row.latest.started_at) : '等待首次执行' }}</small></td><td>{{ row.latest ? formatDuration(row.latest) : '—' }}</td><td><strong>{{ formatNextRun(row.project) }}</strong><small>{{ cronDescription(row.project.schedule.cron) }}</small></td></tr>
@@ -1419,14 +1955,14 @@ onBeforeUnmount(() => {
           </section>
 
           <section class="panel infrastructure-panel">
-            <div class="panel-heading compact-heading"><div><p class="eyebrow">INFRASTRUCTURE</p><h2>Agent 状态</h2></div><button class="text-button" @click="activeTab = 'servers'">全部 →</button></div>
+            <div class="panel-heading compact-heading"><div><p class="eyebrow">INFRASTRUCTURE</p><h2>Agent 状态</h2></div><button class="text-button" @click="navigateTo('servers')">全部 →</button></div>
             <div v-if="!servers.length" class="empty-state compact-empty">暂无 Agent。</div>
             <div v-else class="server-density-list"><article v-for="server in servers.slice(0, 6)" :key="server.id"><span class="server-state" :class="server.status"></span><div><strong>{{ server.name }}</strong><small>{{ server.hostname || '尚未注册' }} · {{ server.agent_version || '—' }}</small></div><div class="revision-meter"><span><i :style="{ width: `${server.desired_revision ? Math.min(100, server.applied_revision / server.desired_revision * 100) : 100}%` }"></i></span><small>rev {{ server.applied_revision }}/{{ server.desired_revision }}</small></div></article></div>
           </section>
         </div>
 
         <section class="panel recent-panel">
-          <div class="panel-heading compact-heading"><div><p class="eyebrow">EVENT STREAM</p><h2>最近运行</h2></div><button class="text-button" @click="activeTab = 'runs'">查看 100 条记录 →</button></div>
+          <div class="panel-heading compact-heading"><div><p class="eyebrow">EVENT STREAM</p><h2>最近运行</h2></div><button class="text-button" @click="navigateTo('runs')">查看 100 条记录 →</button></div>
           <div v-if="!runs.length" class="empty-state compact-empty">尚无运行记录。图表会在 Agent 上报首个结果后自动生成。</div>
           <div v-else class="recent-run-grid"><article v-for="run in runs.slice(0, 8)" :key="run.id"><span class="status-line" :class="run.status"></span><div><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ formatDate(run.started_at) }}</small></div><span class="status-copy">{{ statusLabel(run.status) }}</span><code>{{ formatDuration(run) }}</code></article></div>
         </section>
@@ -1489,10 +2025,18 @@ onBeforeUnmount(() => {
       <template v-else-if="activeTab === 'projects'">
         <div class="content-grid projects-grid">
           <section class="panel">
-            <div class="panel-heading"><div><p class="eyebrow">DESIRED STATE</p><h2>项目列表</h2></div></div>
+            <div class="panel-heading filter-heading">
+              <div><p class="eyebrow">DESIRED STATE</p><h2>项目列表</h2></div>
+              <div class="data-toolbar project-toolbar">
+                <label class="search-field"><span>搜索</span><input v-model.trim="projectSearch" type="search" placeholder="项目、服务器、仓库或数据源" /></label>
+                <label><span>状态</span><select v-model="projectStateFilter"><option value="all">全部状态</option><option value="enabled">运行中</option><option value="at_risk">RPO 风险</option><option value="paused">已暂停</option></select></label>
+                <strong>{{ filteredProjectCount }}/{{ projects.length }}</strong>
+              </div>
+            </div>
             <div v-if="!servers.length" class="empty-state">请先添加服务器，再为对应 Agent 创建备份项目。</div>
+            <div v-else-if="!filteredProjectGroups.length" class="empty-state">没有匹配当前条件的备份项目。</div>
             <div v-else class="project-server-list">
-              <section v-for="group in projectGroups" :key="group.id" class="project-server-group">
+              <section v-for="group in filteredProjectGroups" :key="group.id" class="project-server-group">
                 <header class="project-server-heading">
                   <div><span class="server-state" :class="group.server?.status"></span><div><strong>{{ group.name }}</strong><small>{{ group.server?.hostname || 'Agent 尚未注册' }} · {{ group.projects.length }} 个项目</small></div></div>
                   <span v-if="group.server" class="status-pill" :class="group.server.status">{{ statusLabel(group.server.status) }}</span>
@@ -1502,10 +2046,15 @@ onBeforeUnmount(() => {
               <article v-for="project in group.projects" :key="project.id" class="project-card" :class="{ 'project-disabled': !project.enabled }">
                 <div class="project-top">
                   <div><strong>{{ project.name }}</strong><small>{{ serverName(project.server_id) }} · {{ repositoryName(project.repository_id) }}</small></div>
-                  <div class="project-actions"><span class="status-pill" :class="project.enabled ? 'online' : 'neutral'">{{ project.enabled ? `Revision ${project.revision}` : '已暂停' }}</span><button type="button" class="text-button" :disabled="loading" @click="toggleProject(project)">{{ project.enabled ? '暂停' : '恢复' }}</button><button v-if="project.policy?.retention.enabled" type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedPreviewProjectIDs.has(project.id)" @click="previewRetention(project)">{{ queuedPreviewProjectIDs.has(project.id) ? '预览排队中' : '清理预览' }}</button><button type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
+                  <div class="project-actions"><span class="status-pill" :class="project.enabled ? 'online' : 'neutral'">{{ project.enabled ? `Revision ${project.revision}` : '已暂停' }}</span><button type="button" class="text-button" :disabled="loading" @click="openProjectEditor(project)">编辑</button><button type="button" class="text-button" :disabled="loading" @click="toggleProject(project)">{{ project.enabled ? '暂停' : '恢复' }}</button><button v-if="project.policy?.retention.enabled" type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedPreviewProjectIDs.has(project.id)" @click="previewRetention(project)">{{ queuedPreviewProjectIDs.has(project.id) ? '预览排队中' : '清理预览' }}</button><button type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
                 </div>
                 <div class="project-source-list">
                   <span v-for="source in project.sources" :key="source.id" class="source-chip" :class="source.type">{{ sourceSummary(source) }}</span>
+                </div>
+                <div class="rpo-strip" :class="projectHealthByID.get(project.id)?.status || 'unknown'">
+                  <span class="rpo-state-dot"></span>
+                  <div><small>RECOVERY POINT OBJECTIVE</small><strong>{{ projectHealthLabel(projectHealthByID.get(project.id)) }}</strong></div>
+                  <span>{{ projectHealthSummary(projectHealthByID.get(project.id)) }}</span>
                 </div>
                 <div class="schedule-overview">
                   <div><small>执行计划</small><strong>{{ cronDescription(project.schedule.cron) }}</strong><span>{{ project.schedule.timezone }}<template v-if="project.schedule.jitter_seconds"> · 最多延后 {{ Math.round(project.schedule.jitter_seconds / 60) }} 分钟</template></span></div>
@@ -1523,11 +2072,14 @@ onBeforeUnmount(() => {
               </section>
             </div>
           </section>
-          <aside class="panel form-panel project-builder"><p class="eyebrow">NEW PROJECT</p><h2>创建备份项目</h2><p class="form-intro">一个项目可以组合文件、Docker、MySQL 和 PostgreSQL 数据源，并在同一个 Restic 快照中归档。</p>
-            <form @submit.prevent="createProject">
+          <aside id="project-builder" class="panel form-panel project-builder" :class="{ editing: editingProjectID }">
+            <div class="builder-heading"><div><p class="eyebrow">{{ editingProjectID ? 'EDIT DESIRED STATE' : 'NEW PROJECT' }}</p><h2>{{ editingProjectID ? `编辑 ${editingProject?.name || '备份项目'}` : '创建备份项目' }}</h2></div><button v-if="editingProjectID" type="button" class="ghost compact" @click="resetProjectForm">取消编辑</button></div>
+            <p class="form-intro">一个项目可以组合文件、Docker、MySQL 和 PostgreSQL 数据源，并在同一个 Restic 快照中归档。</p>
+            <div v-if="editingProjectID" class="editing-notice"><strong>原地更新执行策略</strong><span>服务器与仓库保持不变，以保留 Agent 所有权和既有快照恢复链；保存后会生成新的配置 Revision。</span></div>
+            <form @submit.prevent="saveProject">
               <section class="form-section">
                 <div class="section-title"><span>1</span><div><strong>基础信息</strong><small>选择 Agent 和快照写入位置</small></div></div>
-                <div class="form-row"><label>执行服务器<select v-model="projectForm.server_id" required @change="selectDefaults"><option value="" disabled>选择运行备份的 Agent</option><option v-for="server in servers" :key="server.id" :value="server.id">{{ server.name }}</option></select></label><label>备份仓库<select v-model="projectForm.repository_id" required><option value="" disabled>选择独立存储渠道</option><option v-for="repository in repositories" :key="repository.id" :value="repository.id">{{ repository.name }} · {{ providerLabel(repository.provider) }}</option></select></label></div>
+                <div class="form-row"><label>执行服务器<select v-model="projectForm.server_id" required :disabled="Boolean(editingProjectID)" @change="selectDefaults"><option value="" disabled>选择运行备份的 Agent</option><option v-for="server in servers" :key="server.id" :value="server.id">{{ server.name }}</option></select></label><label>备份仓库<select v-model="projectForm.repository_id" required :disabled="Boolean(editingProjectID)"><option value="" disabled>选择独立存储渠道</option><option v-for="repository in repositories" :key="repository.id" :value="repository.id">{{ repository.name }} · {{ providerLabel(repository.provider) }}</option></select></label></div>
                 <label>项目名称<input v-model="projectForm.name" required maxlength="100" placeholder="例如：应用数据每日备份" /></label>
               </section>
 
@@ -1549,7 +2101,7 @@ onBeforeUnmount(() => {
                     <div class="database-note"><strong>{{ sourceTypeLabel(source.type) }} 逻辑备份</strong><span>Agent 将执行 {{ source.type === 'mysql' ? 'mysqldump' : 'pg_dump' }}，临时凭据和产物仅保存在目标服务器。</span></div>
                     <div class="form-row database-host"><label>数据库地址<input v-model="source.host" required placeholder="127.0.0.1" /></label><label>端口<input v-model.number="source.port" required type="number" min="1" max="65535" /></label></div>
                     <div class="form-row"><label>数据库名称<input v-model="source.database" required placeholder="application" /></label><label>备份用户<input v-model="source.username" required autocomplete="off" placeholder="vaultmesh_backup" /></label></div>
-                    <label>数据库密码<input v-model="source.password" required type="password" autocomplete="new-password" /><small class="field-help">提交后使用主密钥加密，管理 API 不会再次返回明文。</small></label>
+                    <label>数据库密码<input v-model="source.password" :required="!source.password_configured" type="password" autocomplete="new-password" :placeholder="source.password_configured ? '留空保持当前密码' : '输入数据库密码'" /><small class="field-help">{{ source.password_configured ? '当前已有加密密码；留空保持不变，填写新值才会替换。' : '提交后使用主密钥加密，管理 API 不会再次返回明文。' }}</small></label>
                   </template>
                 </article>
                 <div class="source-add-row"><span>添加数据源</span><button type="button" class="ghost compact" @click="addProjectSource('files')">+ 文件</button><button type="button" class="ghost compact" @click="addProjectSource('docker')">+ Docker</button><button type="button" class="ghost compact" @click="addProjectSource('mysql')">+ MySQL</button><button type="button" class="ghost compact" @click="addProjectSource('postgresql')">+ PostgreSQL</button></div>
@@ -1566,6 +2118,7 @@ onBeforeUnmount(() => {
                 <div v-if="projectForm.schedule_mode === 'weekly'" class="weekday-grid" role="group" aria-label="选择星期"><button v-for="(day, index) in weekdays" :key="day" type="button" :class="{ active: projectForm.weekday === String(index) }" @click="projectForm.weekday = String(index)">{{ day }}</button></div>
                 <label>时区<input v-model="projectForm.timezone" required list="timezone-options" /><datalist id="timezone-options"><option v-for="timezone in commonTimezones" :key="timezone" :value="timezone" /></datalist></label>
                 <div class="form-row"><label>随机延迟<select v-model.number="projectForm.jitter_minutes"><option :value="0">不延迟</option><option :value="5">最多 5 分钟</option><option :value="10">最多 10 分钟</option><option :value="30">最多 30 分钟</option><option :value="60">最多 60 分钟</option></select></label><label>最长运行时间<select v-model.number="projectForm.max_runtime_hours"><option :value="1">1 小时</option><option :value="3">3 小时</option><option :value="6">6 小时</option><option :value="12">12 小时</option><option :value="24">24 小时</option></select></label></div>
+                <label>完成时限宽限（分钟）<input v-model.number="projectForm.grace_minutes" type="number" min="1" max="10080" required /><small class="field-help">计划到点后先进入“迟到”；超过随机延迟 + 最长运行时间 + 此宽限仍无成功备份，才标记为 RPO 超时。</small></label>
                 <div class="schedule-preview"><span>计划预览</span><strong>{{ projectSchedulePreview }}</strong><code>{{ projectCron }}</code></div>
               </section>
               <section class="form-section">
@@ -1598,7 +2151,7 @@ onBeforeUnmount(() => {
                 </div>
                 <p class="policy-reference">字段与执行语义直接采用 <a href="https://restic.readthedocs.io/en/stable/040_backup.html" target="_blank" rel="noreferrer">Restic backup</a>、<a href="https://restic.readthedocs.io/en/stable/060_forget.html" target="_blank" rel="noreferrer">forget/prune</a> 和 <a href="https://kopia.io/docs/reference/command-line/common/policy-set/" target="_blank" rel="noreferrer">Kopia policy</a> 的成熟模型。</p>
               </section>
-              <button class="primary" :disabled="loading || !servers.length || !repositories.length">创建并下发</button>
+              <div class="form-actions project-form-actions"><button v-if="editingProjectID" type="button" class="ghost" @click="resetProjectForm">取消</button><button class="primary" :disabled="loading || !servers.length || !repositories.length">{{ editingProjectID ? '保存并下发新 Revision' : '创建并下发' }}</button></div>
             </form>
           </aside>
         </div>
@@ -1679,11 +2232,123 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-else-if="activeTab === 'runs'">
-        <section class="panel">
-          <div class="panel-heading"><div><p class="eyebrow">RUN HISTORY</p><h2>最近 100 次运行</h2></div></div>
+        <div class="run-kpi-grid" role="group" aria-label="按运行状态筛选">
+          <button type="button" :class="{ active: runStatusFilter === 'all' }" @click="runStatusFilter = 'all'"><span>ALL RUNS</span><strong>{{ runs.length }}</strong><small>当前样本</small></button>
+          <button type="button" :class="{ active: runStatusFilter === 'succeeded' }" @click="runStatusFilter = 'succeeded'"><span>SUCCEEDED</span><strong>{{ runs.filter((run) => run.status === 'succeeded').length }}</strong><small>成功完成</small></button>
+          <button type="button" :class="{ active: runStatusFilter === 'active' }" @click="runStatusFilter = 'active'"><span>IN PROGRESS</span><strong>{{ activeRunCount }}</strong><small>等待或执行中</small></button>
+          <button type="button" class="attention" :class="{ active: runStatusFilter === 'attention' }" @click="runStatusFilter = 'attention'"><span>NEEDS ATTENTION</span><strong>{{ attentionRunCount }}</strong><small>部分成功、失败或超时</small></button>
+        </div>
+        <section class="panel run-history-panel">
+          <div class="panel-heading filter-heading">
+            <div><p class="eyebrow">RUN HISTORY</p><h2>最近 100 次运行</h2></div>
+            <div class="data-toolbar run-toolbar">
+              <label class="search-field"><span>搜索</span><input v-model.trim="runSearch" type="search" placeholder="项目、Agent、运行 ID 或错误" /></label>
+              <label><span>任务类型</span><select v-model="runOperationFilter"><option value="all">全部任务</option><option value="backup">备份与索引</option><option value="maintenance">维护与校验</option><option value="recovery">浏览与恢复</option></select></label>
+              <strong>{{ filteredRuns.length }} 条</strong>
+            </div>
+          </div>
           <div v-if="!runs.length" class="empty-state">尚无运行记录。</div>
-          <div v-else class="table-wrap"><table><thead><tr><th>项目</th><th>类型</th><th>状态</th><th>开始时间</th><th>快照 / 预览结果</th><th>错误</th></tr></thead><tbody>
-            <tr v-for="run in runs" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ run.id }}</small></td><td><span class="source-chip">{{ runOperationLabel(run) }}</span></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td>{{ formatDate(run.started_at) }}</td><td><code v-if="run.snapshot_id">{{ run.snapshot_id.slice(0, 16) }}</code><span v-else-if="run.stats?.operation === 'retention_preview'">保留 {{ Number(run.stats?.snapshots_kept || 0) }} · 删除 {{ Number(run.stats?.snapshots_removed || 0) }}</span><span v-else-if="run.stats?.operation === 'snapshot_restore'">{{ run.stats?.restore_target || run.stats?.path }}</span><span v-else-if="run.stats?.snapshot_id"><code>{{ String(run.stats.snapshot_id).slice(0, 16) }}</code></span><span v-else>—</span></td><td class="error-cell">{{ run.error_message || '—' }}</td></tr>
+          <div v-else-if="!filteredRuns.length" class="empty-state">没有匹配当前筛选条件的运行记录。</div>
+          <div v-else class="table-wrap run-table-wrap"><table><thead><tr><th>项目 / Agent</th><th>类型</th><th>状态</th><th>开始 / 耗时</th><th>快照 / 预览结果</th><th>错误</th></tr></thead><tbody>
+            <tr v-for="run in filteredRuns" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ serverName(run.server_id) }} · {{ run.id }}</small></td><td><span class="source-chip">{{ runOperationLabel(run) }}</span></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td><strong>{{ formatDate(run.started_at) }}</strong><small>{{ formatDuration(run) }}</small></td><td><code v-if="run.snapshot_id">{{ run.snapshot_id.slice(0, 16) }}</code><span v-else-if="run.stats?.operation === 'retention_preview'">保留 {{ Number(run.stats?.snapshots_kept || 0) }} · 删除 {{ Number(run.stats?.snapshots_removed || 0) }}</span><span v-else-if="run.stats?.operation === 'snapshot_restore'">{{ run.stats?.restore_target || run.stats?.path }}</span><span v-else-if="run.stats?.snapshot_id"><code>{{ String(run.stats.snapshot_id).slice(0, 16) }}</code></span><span v-else>—</span></td><td class="error-cell" :title="run.error_message">{{ run.error_message || '—' }}</td></tr>
+          </tbody></table></div>
+        </section>
+      </template>
+
+      <template v-else-if="activeTab === 'notifications'">
+        <div class="metric-grid notification-metrics">
+          <article class="metric"><header><span>CONTACT POINTS</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ notificationChannels.length }}</strong><em>{{ notificationChannels.filter((item) => item.enabled).length }} enabled</em></div><footer>用户自定义投递渠道 <span>Secret 加密</span></footer></article>
+          <article class="metric" :class="{ alert: firingAlertCount > 0 }"><header><span>FIRING INCIDENTS</span><i class="metric-signal" :class="firingAlertCount ? 'bad' : 'good'"></i></header><div class="metric-value"><strong>{{ firingAlertCount }}</strong><em>deduplicated</em></div><footer>稳定指纹聚合 <span>{{ firingAlertCount ? '需要处理' : '无活动告警' }}</span></footer></article>
+          <article class="metric"><header><span>RESOLVED</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ alertIncidents.filter((item) => item.status === 'resolved').length }}</strong><em>latest 200</em></div><footer>已恢复事件 <span>保留历史</span></footer></article>
+          <article class="metric" :class="{ alert: failedDeliveryCount > 0 }"><header><span>DELIVERY FAILURES</span><i class="metric-signal" :class="failedDeliveryCount ? 'bad' : 'good'"></i></header><div class="metric-value"><strong>{{ failedDeliveryCount }}</strong><em>after retries</em></div><footer>最多重试 5 次 <span>{{ failedDeliveryCount ? '检查渠道' : '投递正常' }}</span></footer></article>
+        </div>
+
+        <section class="panel notification-reference">
+          <div><p class="eyebrow">ALERTMANAGER-STYLE DELIVERY</p><h2>状态变化通知，不按轮询刷屏</h2></div>
+          <div class="notification-flow"><span>运行 / RPO 事实</span><i>→</i><span>稳定指纹 Incident</span><i>→</i><span>持久化 Outbox</span><i>→</i><span>用户 Contact Point</span></div>
+          <button type="button" class="primary compact-action" :disabled="loading" @click="evaluateAlertsNow">立即评估并投递</button>
+        </section>
+
+        <div class="content-grid notification-grid">
+          <section class="panel">
+            <div class="panel-heading"><div><p class="eyebrow">CONTACT POINTS</p><h2>通知渠道</h2></div><span class="sample-size">{{ notificationChannels.length }} CHANNELS</span></div>
+            <div v-if="!notificationChannels.length" class="empty-state">尚未添加通知渠道。告警事件仍会被记录，但不会向外投递。</div>
+            <div v-else class="notification-channel-list">
+              <article v-for="channel in notificationChannels" :key="channel.id" class="notification-channel-card" :class="{ disabled: !channel.enabled }">
+                <header><span class="channel-symbol">{{ channel.type === 'email' ? '@' : channel.type === 'telegram' ? '✈' : channel.type === 'webhook' ? '↗' : '◆' }}</span><div><strong>{{ channel.name }}</strong><small>{{ notificationTypeLabel(channel.type) }} · {{ channel.destination }}</small></div><span class="status-pill" :class="channel.enabled ? 'online' : 'neutral'">{{ channel.enabled ? '已启用' : '已停用' }}</span></header>
+                <div class="channel-policy"><span><small>EVENTS</small><strong>{{ channel.event_types.map(alertKindLabel).join(' · ') }}</strong></span><span><small>ROUTING</small><strong>{{ channel.project_ids?.length ? `${channel.project_ids.length} 个项目` : '所有项目' }}</strong></span><span><small>REPEAT</small><strong>{{ repeatIntervalLabel(channel.repeat_interval_seconds) }}</strong></span><span><small>RESOLVED</small><strong>{{ channel.send_resolved ? '发送' : '不发送' }}</strong></span></div>
+                <footer><button type="button" class="text-button" :disabled="loading" @click="editNotificationChannel(channel)">编辑</button><button type="button" class="text-button" :disabled="loading" @click="toggleNotificationChannel(channel)">{{ channel.enabled ? '停用' : '启用' }}</button><button type="button" class="ghost compact" :disabled="loading || testingChannelIDs.has(channel.id)" @click="testNotificationChannel(channel)">{{ testingChannelIDs.has(channel.id) ? '测试中…' : '发送测试' }}</button><button type="button" class="text-button danger-text" :disabled="loading" @click="archiveNotificationChannel(channel)">归档</button></footer>
+              </article>
+            </div>
+          </section>
+
+          <aside id="notification-builder" class="panel form-panel notification-builder" :class="{ editing: editingNotificationID }">
+            <div class="builder-heading"><div><p class="eyebrow">{{ editingNotificationID ? 'EDIT CONTACT POINT' : 'NEW CONTACT POINT' }}</p><h2>{{ editingNotificationID ? '编辑通知渠道' : '添加通知渠道' }}</h2></div><button v-if="editingNotificationID" type="button" class="ghost compact" @click="resetNotificationForm">取消编辑</button></div>
+            <p class="form-intro">渠道是全局 Contact Point；可以订阅全部项目，也可以只路由指定项目。敏感字段只写不读。</p>
+            <form @submit.prevent="saveNotificationChannel">
+              <div class="form-row"><label>渠道类型<select v-model="notificationForm.type" :disabled="Boolean(editingNotificationID)" @change="changeNotificationType"><optgroup v-for="group in notificationProviderGroups" :key="group" :label="group"><option v-for="provider in notificationProviders.filter((item) => item.group === group)" :key="provider.id" :value="provider.id">{{ provider.label }}</option></optgroup></select></label><label>渠道名称<input v-model.trim="notificationForm.name" required maxlength="100" placeholder="例如：运维 Telegram 群" /></label></div>
+              <div class="repository-kind notification-kind"><div><span class="engine-badge">CONTACT</span><strong>{{ activeNotificationProvider.label }}</strong></div><p>{{ activeNotificationProvider.summary }}</p></div>
+              <div class="dynamic-fields notification-fields">
+                <label v-for="field in activeNotificationProvider.fields" :key="field.key">{{ field.label }}
+                  <select v-if="field.type === 'select'" v-model="notificationForm.config[field.key]" :required="field.required"><option v-for="option in field.options" :key="option.value" :value="option.value">{{ option.label }}</option></select>
+                  <textarea v-else-if="field.type === 'textarea'" v-model="notificationForm.config[field.key]" rows="3" :required="field.required && !editingNotificationID" :placeholder="field.placeholder"></textarea>
+                  <input v-else v-model="notificationForm.config[field.key]" :type="field.type" :required="field.required && !editingNotificationID" :placeholder="editingNotificationID && field.type === 'password' ? '留空保持当前加密配置' : field.placeholder" :autocomplete="field.type === 'password' ? 'new-password' : 'off'" />
+                  <small v-if="field.help" class="field-help">{{ field.help }}</small>
+                </label>
+              </div>
+              <section class="form-section compact-section"><div class="section-title"><span>1</span><div><strong>事件与恢复</strong><small>选择这个渠道关注的状态变化</small></div></div>
+                <div class="policy-option-grid"><label class="check-row"><input v-model="notificationForm.backup_failure" type="checkbox" /><span><strong>备份失败</strong><small>部分成功、失败、超时、取消或状态未知。</small></span></label><label class="check-row"><input v-model="notificationForm.rpo_overdue" type="checkbox" /><span><strong>RPO 超时</strong><small>没有失败上报也能发现静默中断。</small></span></label></div>
+                <label class="check-row"><input v-model="notificationForm.send_resolved" type="checkbox" /><span><strong>发送恢复通知</strong><small>事件从 firing 变为 resolved 时发送一次，确认故障已经结束。</small></span></label>
+              </section>
+              <section class="form-section compact-section"><div class="section-title"><span>2</span><div><strong>去重与路由</strong><small>持续故障只按周期重复提醒</small></div></div>
+                <label>重复提醒间隔（分钟）<input v-model.number="notificationForm.repeat_minutes" type="number" min="5" max="10080" required /><small class="field-help">默认 240 分钟。相同 Incident 在此期间不会重复发送。</small></label>
+                <div class="project-routing"><strong>项目范围</strong><small>不勾选表示所有项目；新项目也会自动纳入。</small><div><label v-for="project in projects" :key="project.id"><input v-model="notificationForm.project_ids" type="checkbox" :value="project.id" /><span>{{ project.name }}<small>{{ serverName(project.server_id) }}</small></span></label></div></div>
+              </section>
+              <div class="form-actions"><button v-if="editingNotificationID" type="button" class="ghost" @click="resetNotificationForm">取消</button><button class="primary" :disabled="loading">{{ editingNotificationID ? '保存渠道' : '加密并创建渠道' }}</button></div>
+            </form>
+          </aside>
+        </div>
+
+        <section class="panel alert-history-panel">
+          <div class="panel-heading"><div><p class="eyebrow">INCIDENT TIMELINE</p><h2>告警事件</h2></div><span class="sample-size">{{ alertIncidents.length }} INCIDENTS</span></div>
+          <div v-if="!alertIncidents.length" class="empty-state">暂无告警事件。后台每 30 秒评估一次，也可以手动立即评估。</div>
+          <div v-else class="table-wrap"><table><thead><tr><th>状态</th><th>事件 / 项目</th><th>首次发生</th><th>最近变化</th><th>次数</th><th>说明</th></tr></thead><tbody><tr v-for="incident in alertIncidents" :key="incident.id"><td><span class="status-pill" :class="incident.status === 'firing' ? 'overdue' : 'succeeded'">{{ incident.status === 'firing' ? '告警中' : '已恢复' }}</span></td><td><strong>{{ alertKindLabel(incident.kind) }}</strong><small>{{ incident.project_name }}</small></td><td>{{ formatDate(incident.started_at) }}</td><td>{{ formatDate(incident.resolved_at || incident.updated_at) }}</td><td><strong>{{ incident.occurrence_count }}</strong></td><td class="notification-description">{{ incident.description }}</td></tr></tbody></table></div>
+        </section>
+
+        <section class="panel delivery-history-panel">
+          <div class="panel-heading"><div><p class="eyebrow">DELIVERY OUTBOX</p><h2>最近投递</h2></div><span class="sample-size">{{ notificationDeliveries.length }} DELIVERIES</span></div>
+          <div v-if="!notificationDeliveries.length" class="empty-state">尚无通知投递记录。</div>
+          <div v-else class="table-wrap"><table><thead><tr><th>创建时间</th><th>渠道</th><th>类型</th><th>状态</th><th>尝试</th><th>错误</th></tr></thead><tbody><tr v-for="delivery in notificationDeliveries" :key="delivery.id"><td>{{ formatDate(delivery.created_at) }}</td><td><strong>{{ delivery.channel_name || delivery.channel_id }}</strong></td><td>{{ notificationTransitionLabel(delivery.transition) }}</td><td><span class="status-pill" :class="delivery.status === 'sent' ? 'succeeded' : delivery.status === 'failed' ? 'failed' : 'pending'">{{ delivery.status === 'sent' ? '已发送' : delivery.status === 'failed' ? '最终失败' : delivery.status === 'delivering' ? '发送中' : '等待重试' }}</span></td><td>{{ delivery.attempt_count }}/5</td><td class="error-cell">{{ delivery.last_error || '—' }}</td></tr></tbody></table></div>
+        </section>
+      </template>
+
+      <template v-else-if="activeTab === 'audit'">
+        <div class="metric-grid audit-metrics">
+          <article class="metric"><header><span>LOADED EVENTS</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ auditEvents.length }}</strong><em>latest 200</em></div><footer>已加载审计事件 <span>追加写入</span></footer></article>
+          <article class="metric"><header><span>LAST 24 HOURS</span><i class="metric-signal"></i></header><div class="metric-value"><strong>{{ auditEventsLast24Hours }}</strong><em>events</em></div><footer>最近 24 小时 <span>所有类别</span></footer></article>
+          <article class="metric" :class="{ alert: failedAuditEvents > 0 }"><header><span>FAILED ACTIONS</span><i class="metric-signal" :class="failedAuditEvents ? 'bad' : 'good'"></i></header><div class="metric-value"><strong>{{ failedAuditEvents }}</strong><em>HTTP ≥ 400</em></div><footer>失败或被拒绝 <span>{{ failedAuditEvents ? '需要复核' : '状态正常' }}</span></footer></article>
+          <article class="metric"><header><span>SECURITY EVENTS</span><i class="metric-signal warn"></i></header><div class="metric-value"><strong>{{ securityAuditEvents }}</strong><em>auth + security</em></div><footer>认证与账号安全 <span>不记录凭据</span></footer></article>
+        </div>
+
+        <section class="panel audit-panel">
+          <div class="panel-heading audit-heading">
+            <div><p class="eyebrow">APPEND-ONLY AUDIT TRAIL</p><h2>最近操作证据</h2><p>记录操作类型、结果、资源、来源地址和 HTTP 状态；请求正文与 Secret 永不进入审计表。</p></div>
+            <div class="audit-filters">
+              <label>类别<select v-model="auditCategoryFilter"><option value="all">全部类别</option><option value="authentication">认证</option><option value="security">安全</option><option value="configuration">配置</option><option value="backup">备份与恢复</option></select></label>
+              <label>结果<select v-model="auditOutcomeFilter"><option value="all">全部结果</option><option value="succeeded">成功</option><option value="failed">失败</option></select></label>
+            </div>
+          </div>
+          <div v-if="!filteredAuditEvents.length" class="empty-state">当前筛选条件下没有审计事件。</div>
+          <div v-else class="table-wrap"><table class="audit-table"><thead><tr><th>时间</th><th>类别</th><th>操作</th><th>结果</th><th>目标资源</th><th>操作者 / 来源</th><th>HTTP</th></tr></thead><tbody>
+            <tr v-for="event in filteredAuditEvents" :key="event.id">
+              <td><strong>{{ formatDate(event.created_at) }}</strong><small>{{ event.id }}</small></td>
+              <td><span class="source-chip">{{ auditCategoryLabel(auditActionCategory(event.action)) }}</span></td>
+              <td><strong>{{ auditActionLabel(event.action) }}</strong><small>{{ event.action }}</small></td>
+              <td><span class="status-pill" :class="event.outcome === 'succeeded' ? 'succeeded' : 'failed'">{{ event.outcome === 'succeeded' ? '成功' : '失败' }}</span></td>
+              <td class="audit-resource">{{ auditResourceLabel(event) }}</td>
+              <td><strong>{{ event.actor }}</strong><small>{{ event.client_ip || 'unknown' }}</small></td>
+              <td><code>{{ event.status_code }}</code></td>
+            </tr>
           </tbody></table></div>
         </section>
       </template>
