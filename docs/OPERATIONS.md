@@ -13,6 +13,8 @@
 
 Agent 的 `/var/lib/vaultmesh-agent/state.json` 包含设备身份、最后有效配置、待上报事件和被控制面永久拒绝的隔离报告。可加密备份，但不得复制到另一台同时在线的主机，否则会克隆设备身份。恢复文件位于 `/var/lib/vaultmesh-agent/restores`，应按工单验收后清理。
 
+Restic 缓存由 systemd 单元固定在 `/var/lib/vaultmesh-agent/cache`（单元以 `ProtectHome=read-only` 运行，Restic 默认的 `$HOME/.cache/restic` 不可写）。该缓存可以随时删除重建，但请保留在 StateDirectory 内；如需迁移到更大的磁盘，在 `/etc/vaultmesh-agent.env` 设置 `RESTIC_CACHE_DIR` 覆盖单元默认值。若缓存目录不可写，Restic 每次操作都要重新下载仓库元数据，会显著拖慢备份并放大网络流量。
+
 ## 控制面备份
 
 以下示例在控制面主机上执行，并把结果写入仅 root 可读的目录：

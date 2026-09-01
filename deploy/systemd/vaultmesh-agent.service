@@ -9,6 +9,10 @@ Type=simple
 User=root
 Group=root
 EnvironmentFile=-/etc/vaultmesh-agent.env
+# Restic's default cache location ($HOME/.cache/restic) is not writable under
+# ProtectHome=read-only, so the cache is pinned inside the state directory.
+Environment=RESTIC_CACHE_DIR=/var/lib/vaultmesh-agent/cache
+ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/vaultmesh-agent/cache
 ExecStart=/usr/local/bin/vaultmesh-agent \
   --server ${VAULTMESH_SERVER_URL} \
   --state /var/lib/vaultmesh-agent/state.json \

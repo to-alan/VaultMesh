@@ -171,6 +171,8 @@ sudo install -m 0644 deploy/systemd/vaultmesh-agent.service /etc/systemd/system/
 sudo install -m 0600 deploy/systemd/vaultmesh-agent.env.example /etc/vaultmesh-agent.env
 ```
 
+也可以直接使用 [Releases](https://github.com/to-alan/VaultMesh/releases) 页面的预编译 Agent 二进制（linux/amd64、linux/arm64、linux/armv7、darwin/amd64、darwin/arm64，附 SHA256SUMS），以及 GHCR 上与版本 tag 对应的 `vaultmesh-control`、`vaultmesh-web`、`vaultmesh-agent` 容器镜像；容器部署请固定版本 tag，不要使用 `latest`。
+
 在 Web 控制台创建“服务器”，把一次性注册令牌和 Control Plane HTTPS 地址写入 `/etc/vaultmesh-agent.env`，然后启动：
 
 ```bash
@@ -266,7 +268,7 @@ S3 是对象存储兼容协议，不等于某一家云厂商。Cloudflare R2、M
 
 | 领域 | 当前限制 | 建议 |
 |---|---|---|
-| 发布状态 | 尚未发布稳定版本和自动升级通道 | 固定经过验证的提交，升级前备份控制面 |
+| 发布状态 | 尚未发布稳定版本；版本 tag 会自动产出 Agent 二进制、SHA256SUMS 和 GHCR 容器镜像，暂无自动升级通道 | 固定经过验证的版本 tag（容器镜像同样固定 tag，不用 `latest`），升级前备份控制面 |
 | 管理员 | 单管理员、无 RBAC 和密码找回 | 保护恢复码，并限制管理端访问来源 |
 | 登录防护 | 已有进程内登录/TOTP 渐进限速，但重启会清空且多副本不共享 | 仍在反向代理/WAF 配置持久或分布式限速 |
 | 审计 | 事件追加保存在控制面 PostgreSQL，暂无请求关联 ID、字段差异和外部防篡改归档 | 同步到独立日志系统，并为控制面数据库设置保留与访问策略 |
