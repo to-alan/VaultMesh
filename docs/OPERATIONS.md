@@ -76,10 +76,13 @@ sudo systemctl restart vaultmesh-agent
 cd /opt/vaultmesh
 git status --short
 git pull --ff-only
-sudo docker compose up -d --build
+# 默认使用 GHCR 预构建镜像；先在 .env 中把 VAULTMESH_IMAGE_TAG 改为目标版本 tag
+sudo docker compose up -d --pull missing
 sudo docker compose ps
 curl --fail http://127.0.0.1:8080/healthz
 ```
+
+`VAULTMESH_IMAGE_TAG` 为 `latest` 时每次 `pull` 都可能拿到新镜像，生产环境应固定到明确的版本 tag。`up -d --build` 会在本机从源码重建镜像，用于Registry 不可达或需要运行未发布修改的场景；重建后把 `VAULTMESH_IMAGE_TAG` 指向的镜像与本机镜像区分清楚，避免下次 `pull` 又切回去。
 
 `git status --short` 必须为空；不要让一键更新覆盖本地修改。当前数据库迁移由 Control Plane 启动时自动执行。出现问题时先保存日志和数据库备份，再决定回滚。
 

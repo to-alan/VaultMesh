@@ -4,6 +4,9 @@ set -eu
 REPOSITORY_URL=${VAULTMESH_REPOSITORY_URL:-https://github.com/to-alan/VaultMesh.git}
 INSTALL_DIR=${VAULTMESH_INSTALL_DIR:-/opt/vaultmesh}
 ADMIN_USERNAME=${VAULTMESH_ADMIN_USERNAME:-admin}
+# Version of the prebuilt GHCR images to deploy. Pin a release tag such as
+# v0.1.0 in production; "latest" follows the most recent release.
+VAULTMESH_IMAGE_TAG=${VAULTMESH_IMAGE_TAG:-latest}
 
 fail() {
 	printf 'VaultMesh 安装失败：%s\n' "$1" >&2
@@ -54,6 +57,7 @@ VAULTMESH_API_PORT=8080
 VAULTMESH_WEB_PORT=3000
 VAULTMESH_PUBLIC_API_URL=http://localhost:8080
 VAULTMESH_ALLOWED_ORIGINS=http://localhost:3000
+VAULTMESH_IMAGE_TAG=$VAULTMESH_IMAGE_TAG
 EOF
 	chmod 600 "$INSTALL_DIR/.env"
 	generated_credentials=true
@@ -70,6 +74,11 @@ else
 	if ! grep -q '^VAULTMESH_COOKIE_SECURE=.' "$INSTALL_DIR/.env"; then
 		printf 'VAULTMESH_COOKIE_SECURE=false\n' >>"$INSTALL_DIR/.env"
 	fi
+	# Releases before v0.1.0 built images locally; point existing deployments
+	# at the prebuilt GHCR images while preserving everything else.
+	if ! grep -q '^VAULTMESH_IMAGE_TAG=' "$INSTALL_DIR/.env"; then
+		printf 'VAULTMESH_IMAGE_TAG=%s\n' "$VAULTMESH_IMAGE_TAG" >>"$INSTALL_DIR/.env"
+	fi
 	# WebAuthn RP IDs must be domain strings. Migrate the former loopback-IP
 	# defaults while preserving any custom deployment values.
 	sed -i 's|^VAULTMESH_PUBLIC_API_URL=http://127\.0\.0\.1:8080$|VAULTMESH_PUBLIC_API_URL=http://localhost:8080|' "$INSTALL_DIR/.env"
@@ -79,8 +88,17 @@ else
 	chmod 600 "$INSTALL_DIR/.env"
 fi
 
-printf '构建并启动 VaultMesh…\n'
-docker compose --file "$INSTALL_DIR/compose.yaml" --project-directory "$INSTALL_DIR" up -d --build
+# Prebuilt GHCR images avoid a full Go and Node build on the target host.
+# `--pull missing` fetches them on first use; when the registry is
+# unreachable (private network, rate limit), fall back to building from the
+# cloned source so the one-liner keeps working everywhere.
+if docker compose --file "$INSTALL_DIR/compose.yaml" --project-directory "$INSTALL_DIR" pull control web >/dev/null 2>&1; then
+	printf '拉取预构建镜像（tag %s）…\n' "$(grep '^VAULTMESH_IMAGE_TAG=' "$INSTALL_DIR/.env" | cut -d= -f2)"
+	docker compose --file "$INSTALL_DIR/compose.yaml" --project-directory "$INSTALL_DIR" up -d
+else
+	printf '预构建镜像不可用，回退为本地构建（需要几分钟）…\n'
+	docker compose --file "$INSTALL_DIR/compose.yaml" --project-directory "$INSTALL_DIR" up -d --build
+fi
 
 printf '\nVaultMesh 已启动。\n'
 printf 'Web：http://localhost:3000\n'

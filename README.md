@@ -25,7 +25,7 @@ VaultMesh 使用独立 Control Plane 集中管理服务器、备份项目、执�
 curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh
 ```
 
-安装脚本会安装到 `/opt/vaultmesh`，生成管理员密码与 `VAULTMESH_MASTER_KEY`，构建并启动 Control Plane、Web 和 PostgreSQL；重复运行保留 `.env` 与数据库卷并快进更新。
+安装脚本会安装到 `/opt/vaultmesh`，生成管理员密码与 `VAULTMESH_MASTER_KEY`，**拉取 GHCR 预构建镜像**并启动 Control Plane、Web 和 PostgreSQL（镜像不可用时自动回退为本地构建，需要几分钟）；重复运行保留 `.env` 与数据库卷并快进更新。生产环境建议在 `.env` 中把 `VAULTMESH_IMAGE_TAG` 固定到明确的版本 tag。
 
 不希望直接执行远程脚本时，先审阅：
 

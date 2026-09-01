@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### 变更
+
+- 一键安装与 Compose 默认使用 GHCR 预构建镜像（`VAULTMESH_IMAGE_TAG`，默认 `latest`），镜像不可用时自动回退本地构建；升级不再必须在本机编译 Go/Node
+
 ## [0.1.0] - 2026-09-02
 
 首个带发布产物的版本：GitHub Release 提供 5 个平台的 Agent 预编译二进制，GHCR 提供与版本 tag 对应的容器镜像。
