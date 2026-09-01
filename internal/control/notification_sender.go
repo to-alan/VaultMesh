@@ -92,31 +92,31 @@ func sendTelegramProvider(ctx context.Context, config map[string]string, _ domai
 	if threadID := config["message_thread_id"]; threadID != "" {
 		payload["message_thread_id"], _ = strconv.ParseInt(threadID, 10, 64)
 	}
-	return postNotificationJSON(ctx, endpoint, nil, payload, false)
+	return postNotificationJSON(ctx, endpoint, payload, false)
 }
 
 func sendSlackProvider(ctx context.Context, config map[string]string, _ domain.AlertIncident, _, title, message string, allowPrivate bool) error {
-	return postNotificationJSON(ctx, config["webhook_url"], nil, map[string]any{"text": "*" + title + "*\n" + message}, allowPrivate)
+	return postNotificationJSON(ctx, config["webhook_url"], map[string]any{"text": "*" + title + "*\n" + message}, allowPrivate)
 }
 
 func sendDiscordProvider(ctx context.Context, config map[string]string, _ domain.AlertIncident, _, title, message string, allowPrivate bool) error {
-	return postNotificationJSON(ctx, config["webhook_url"], nil, map[string]any{"content": "**" + title + "**\n" + message}, allowPrivate)
+	return postNotificationJSON(ctx, config["webhook_url"], map[string]any{"content": "**" + title + "**\n" + message}, allowPrivate)
 }
 
 func sendWeComProvider(ctx context.Context, config map[string]string, _ domain.AlertIncident, _, title, message string, allowPrivate bool) error {
 	payload := map[string]any{"msgtype": "markdown", "markdown": map[string]string{"content": "**" + title + "**\n> " + strings.ReplaceAll(message, "\n", "\n> ")}}
-	return postNotificationJSON(ctx, config["webhook_url"], nil, payload, allowPrivate)
+	return postNotificationJSON(ctx, config["webhook_url"], payload, allowPrivate)
 }
 
 func sendDingTalkProvider(ctx context.Context, config map[string]string, _ domain.AlertIncident, _, title, message string, allowPrivate bool) error {
 	payload := map[string]any{"msgtype": "markdown", "markdown": map[string]string{"title": title, "text": "### " + title + "\n\n" + message}}
-	return postNotificationJSON(ctx, config["webhook_url"], nil, payload, allowPrivate)
+	return postNotificationJSON(ctx, config["webhook_url"], payload, allowPrivate)
 }
 
 func sendGotifyProvider(ctx context.Context, config map[string]string, _ domain.AlertIncident, _, title, message string, allowPrivate bool) error {
 	endpoint := strings.TrimRight(config["server_url"], "/") + "/message?token=" + url.QueryEscape(config["token"])
 	priority, _ := strconv.Atoi(config["priority"])
-	return postNotificationJSON(ctx, endpoint, nil, map[string]any{"title": title, "message": message, "priority": priority}, allowPrivate)
+	return postNotificationJSON(ctx, endpoint, map[string]any{"title": title, "message": message, "priority": priority}, allowPrivate)
 }
 
 func sendNtfyProvider(ctx context.Context, config map[string]string, alert domain.AlertIncident, _, title, message string, allowPrivate bool) error {
@@ -216,12 +216,12 @@ func sendGenericWebhook(ctx context.Context, config map[string]string, alert dom
 	return sendNotificationHTTP(ctx, config["method"], config["url"], headers, body, "application/json", config["allow_private_address"] == "true")
 }
 
-func postNotificationJSON(ctx context.Context, endpoint string, headers map[string]string, payload any, allowPrivate bool) error {
+func postNotificationJSON(ctx context.Context, endpoint string, payload any, allowPrivate bool) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	return sendNotificationHTTP(ctx, http.MethodPost, endpoint, headers, body, "application/json", allowPrivate)
+	return sendNotificationHTTP(ctx, http.MethodPost, endpoint, nil, body, "application/json", allowPrivate)
 }
 
 func sendNotificationHTTP(ctx context.Context, method, endpoint string, headers map[string]string, body []byte, contentType string, allowPrivate bool) error {
@@ -266,7 +266,7 @@ func sendEmailNotification(ctx context.Context, config map[string]string, title,
 	if err != nil {
 		return errors.New("initialize SMTP session")
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	if config["security"] == "starttls" {
 		if err := client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
 			return errors.New("start SMTP TLS")

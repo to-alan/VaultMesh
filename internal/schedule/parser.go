@@ -1,3 +1,5 @@
+// Package schedule parses the five-field cron expressions and IANA time
+// zones used by backup projects.
 package schedule
 
 import (

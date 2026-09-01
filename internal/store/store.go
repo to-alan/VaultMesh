@@ -1,3 +1,5 @@
+// Package store defines the metadata storage interface implemented by the
+// memory and PostgreSQL backends.
 package store
 
 import (

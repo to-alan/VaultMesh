@@ -33,6 +33,9 @@ jobs:
         with:
           go-version: "1.26.6"
           cache: true
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13
       - run: go test -race ./...
       - run: go vet ./...
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...

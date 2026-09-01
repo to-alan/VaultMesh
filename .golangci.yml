@@ -1,0 +1,43 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+formatters:
+  gofmt:
+    simplify: true
+
+linters:
+  default: standard
+  enable:
+    - bodyclose        # unclosed HTTP response bodies leak connections
+    - errorlint        # errors.Is/As instead of ==/type assertions
+    - misspell
+    - nilnil           # return explicit nils, not mixed nil/zero values
+    - predeclared      # shadowing built-ins invites subtle bugs
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    staticcheck:
+      # QF1xxx are opinionated quickfix suggestions, not defects.
+      checks: ["all", "-QF1*"]
+    errcheck:
+      # Best-effort cleanup: deferred Close on files/connections/transactions
+      # and explicit drains must not drown out real error handling. Real
+      # error paths still return and check errors.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*os.File).Remove
+        - (net.Conn).Close
+        - (*pgx.Tx).Rollback
+        - (net/http.ResponseWriter).Flush
+  exclusions:
+    rules:
+      # Test code intentionally writes awkward cases.
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errorlint
+          - nilnil

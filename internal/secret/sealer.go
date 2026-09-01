@@ -1,3 +1,5 @@
+// Package secret seals and opens small payloads with an AEAD cipher
+// keyed by the deployment master key.
 package secret
 
 import (

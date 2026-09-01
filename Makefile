@@ -1,4 +1,4 @@
-.PHONY: all build test check fmt web-build web-test web-install clean
+.PHONY: all build test check lint fmt web-build web-test web-install clean
 
 GOCACHE ?= /tmp/vaultmesh-go-cache
 VERSION ?= dev
@@ -16,8 +16,11 @@ build: web-build
 test: web-test
 	GOCACHE=$(GOCACHE) go test ./...
 
-check: test web-build
+check: lint test web-build
 	GOCACHE=$(GOCACHE) go vet ./...
+
+lint:
+	GOCACHE=$(GOCACHE) golangci-lint run ./...
 
 fmt:
 	gofmt -w cmd internal

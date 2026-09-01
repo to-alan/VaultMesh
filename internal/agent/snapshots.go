@@ -319,7 +319,7 @@ func runRestore(ctx context.Context, environment []string, executable string, ar
 	}
 	runErr := command.Wait()
 	if parseErr == nil && summary.MessageType != "summary" {
-		parseErr = errors.New("Restic restore output did not contain a summary")
+		parseErr = errors.New("restic restore output did not contain a summary")
 	}
 	return summary, processExitCode(runErr), strings.TrimSpace(stderr.String()), runErr, parseErr
 }

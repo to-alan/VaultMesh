@@ -1,3 +1,5 @@
+// Package memory implements the metadata store in process memory for
+// development and tests.
 package memory
 
 import (

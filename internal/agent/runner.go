@@ -517,7 +517,7 @@ func (r *Runner) prepareSource(ctx context.Context, source domain.Source, ensure
 		return []string{output}, nil, nil
 	case "docker":
 		if source.Docker == nil {
-			return nil, nil, errors.New("Docker configuration is missing")
+			return nil, nil, errors.New("docker configuration is missing")
 		}
 		directory, err := ensureStaging()
 		if err != nil {

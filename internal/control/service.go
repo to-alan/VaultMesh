@@ -528,7 +528,7 @@ func (s *Service) RefreshSnapshots(ctx context.Context, projectID string) (domai
 }
 
 func (s *Service) SetSnapshotProtected(ctx context.Context, projectID, snapshotID string, protected bool) (domain.Command, error) {
-	if _, err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
+	if err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
 		return domain.Command{}, err
 	}
 	return s.createProjectCommand(ctx, projectID, "snapshot_protect", map[string]any{
@@ -538,7 +538,7 @@ func (s *Service) SetSnapshotProtected(ctx context.Context, projectID, snapshotI
 }
 
 func (s *Service) BrowseSnapshot(ctx context.Context, projectID, snapshotID, snapshotPath string) (domain.Command, error) {
-	if _, err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
+	if err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
 		return domain.Command{}, err
 	}
 	cleaned, err := normalizeSnapshotPath(snapshotPath)
@@ -552,7 +552,7 @@ func (s *Service) BrowseSnapshot(ctx context.Context, projectID, snapshotID, sna
 }
 
 func (s *Service) RestoreSnapshot(ctx context.Context, projectID, snapshotID, snapshotPath string) (domain.Command, error) {
-	if _, err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
+	if err := s.snapshotForCommand(ctx, projectID, snapshotID); err != nil {
 		return domain.Command{}, err
 	}
 	cleaned, err := normalizeSnapshotPath(snapshotPath)
@@ -565,11 +565,12 @@ func (s *Service) RestoreSnapshot(ctx context.Context, projectID, snapshotID, sn
 	})
 }
 
-func (s *Service) snapshotForCommand(ctx context.Context, projectID, snapshotID string) (domain.Snapshot, error) {
+func (s *Service) snapshotForCommand(ctx context.Context, projectID, snapshotID string) error {
 	if !fullResticSnapshotID.MatchString(snapshotID) {
-		return domain.Snapshot{}, validationError("snapshot_id", "must be a full 64-character Restic snapshot ID")
+		return validationError("snapshot_id", "must be a full 64-character Restic snapshot ID")
 	}
-	return s.store.GetSnapshot(ctx, projectID, snapshotID)
+	_, err := s.store.GetSnapshot(ctx, projectID, snapshotID)
+	return err
 }
 
 func normalizeSnapshotPath(value string) (string, error) {

@@ -1,3 +1,7 @@
+// Package postgres implements the VaultMesh metadata store on PostgreSQL
+// with schema migrations embedded at build time.
+// PostgreSQL storage implementation, connection handling, schema
+// migrations, and the administrator account.
 package postgres
 
 import (

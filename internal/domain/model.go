@@ -1,3 +1,5 @@
+// Package domain defines the shared data structures and state constants
+// used across the control plane, agent, and storage layers.
 package domain
 
 import "time"

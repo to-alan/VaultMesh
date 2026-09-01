@@ -24,7 +24,7 @@ func (s *Store) UpsertRun(ctx context.Context, report domain.RunReport) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(ctx) //nolint:errcheck
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO runs
 		(id, idempotency_key, project_id, server_id, scheduled_at, started_at,

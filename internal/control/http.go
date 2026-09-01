@@ -1,3 +1,6 @@
+// Package control implements the VaultMesh control plane: business
+// services, the management/agent HTTP API, administrator security, and
+// notification delivery.
 package control
 
 import (

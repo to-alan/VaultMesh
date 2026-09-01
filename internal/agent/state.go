@@ -110,8 +110,8 @@ func (s *StateStore) SetIdentity(identity domain.AgentIdentity) error {
 		return errors.New("agent is already enrolled to another identity")
 	}
 	previous := s.state.Identity
-	copy := identity
-	s.state.Identity = &copy
+	identityCopy := identity
+	s.state.Identity = &identityCopy
 	if err := s.saveLocked(); err != nil {
 		s.state.Identity = previous
 		return err
@@ -384,7 +384,7 @@ func (s *StateStore) saveLocked() error {
 		return fmt.Errorf("create temporary agent state: %w", err)
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	defer func() { _ = os.Remove(temporaryPath) }()
 	if err := temporary.Chmod(0o600); err != nil {
 		temporary.Close()
 		return fmt.Errorf("secure temporary agent state: %w", err)

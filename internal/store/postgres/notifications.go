@@ -1,3 +1,5 @@
+// Package postgres: notification channels, alert incidents, delivery
+// queue, and audit event persistence.
 package postgres
 
 import (

@@ -218,7 +218,7 @@ func validSwiftEnvironment(environment map[string]string) bool {
 func validateRepositoryURL(provider, value string) error {
 	if _, ok := s3RepositoryProviders[provider]; ok {
 		if !strings.HasPrefix(value, "s3:") {
-			return errors.New("must be a Restic S3 URL beginning with s3:")
+			return errors.New("must be a Restic S3 URL beginning with s3")
 		}
 		parsed, err := url.Parse(strings.TrimPrefix(value, "s3:"))
 		if err != nil || parsed.Host == "" {

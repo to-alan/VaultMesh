@@ -1,3 +1,5 @@
+// Package agent implements the on-host backup agent: control-plane
+// client, durable state, scheduler, and typed command execution.
 package agent
 
 import (
