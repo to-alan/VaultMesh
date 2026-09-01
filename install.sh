@@ -4,6 +4,10 @@ set -eu
 REPOSITORY_URL=${VAULTMESH_REPOSITORY_URL:-https://github.com/to-alan/VaultMesh.git}
 INSTALL_DIR=${VAULTMESH_INSTALL_DIR:-/opt/vaultmesh}
 ADMIN_USERNAME=${VAULTMESH_ADMIN_USERNAME:-admin}
+# Public host used by browsers to reach this control plane. Priority:
+# explicit VAULTMESH_PUBLIC_HOST, then the detected public IP, then the
+# first non-loopback interface address, then localhost.
+VAULTMESH_PUBLIC_HOST=${VAULTMESH_PUBLIC_HOST:-}
 # Version of the prebuilt GHCR images to deploy. Pin a release tag such as
 # v0.1.0 in production; "latest" follows the most recent release.
 VAULTMESH_IMAGE_TAG=${VAULTMESH_IMAGE_TAG:-latest}
@@ -30,6 +34,38 @@ require_command openssl
 require_command docker
 docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2（docker compose）"
 
+detect_public_host() {
+	if [ -n "$VAULTMESH_PUBLIC_HOST" ]; then
+		printf '%s\n' "$VAULTMESH_PUBLIC_HOST"
+		return
+	fi
+	# Best-effort public IP discovery; a NAT or firewalled host may block it.
+	for service in https://api.ipify.org https://ifconfig.me/ip; do
+		if command -v curl >/dev/null 2>&1; then
+			candidate=$(curl -fsS --max-time 4 "$service" 2>/dev/null | tr -d '[:space:]')
+		elif command -v wget >/dev/null 2>&1; then
+			candidate=$(wget -qO- --timeout=4 "$service" 2>/dev/null | tr -d '[:space:]')
+		else
+			break
+		fi
+		case "$candidate" in
+			[0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$candidate"; return ;;
+		esac
+	done
+	# Fall back to the first non-loopback IPv4 address.
+	if [ -r /proc/net/fib_trie ] && command -v awk >/dev/null 2>&1; then
+		candidate=$(hostname -I 2>/dev/null | awk '{print $1}')
+	fi
+	case "$candidate" in
+		""|127.*|0.0.0.0) printf 'localhost\n' ;;
+		*) printf '%s\n' "$candidate" ;;
+	esac
+}
+
+PUBLIC_HOST=$(detect_public_host)
+PUBLIC_API_URL="http://${PUBLIC_HOST}:8080"
+ALLOWED_ORIGIN="http://${PUBLIC_HOST}:3000"
+
 if [ -d "$INSTALL_DIR/.git" ]; then
 	printf '更新 VaultMesh：%s\n' "$INSTALL_DIR"
 	git -C "$INSTALL_DIR" pull --ff-only
@@ -55,8 +91,8 @@ VAULTMESH_COOKIE_SECURE=false
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 VAULTMESH_API_PORT=8080
 VAULTMESH_WEB_PORT=3000
-VAULTMESH_PUBLIC_API_URL=http://localhost:8080
-VAULTMESH_ALLOWED_ORIGINS=http://localhost:3000
+VAULTMESH_PUBLIC_API_URL=$PUBLIC_API_URL
+VAULTMESH_ALLOWED_ORIGINS=$ALLOWED_ORIGIN
 VAULTMESH_IMAGE_TAG=$VAULTMESH_IMAGE_TAG
 VAULTMESH_BIND=${VAULTMESH_BIND:-0.0.0.0}
 EOF
@@ -86,6 +122,13 @@ else
 	sed -i 's|^VAULTMESH_ALLOWED_ORIGINS=http://127\.0\.0\.1:3000$|VAULTMESH_ALLOWED_ORIGINS=http://localhost:3000|' "$INSTALL_DIR/.env"
 	sed -i 's|^VAULTMESH_WEBAUTHN_RP_ID=127\.0\.0\.1$|VAULTMESH_WEBAUTHN_RP_ID=localhost|' "$INSTALL_DIR/.env"
 	sed -i 's|^VAULTMESH_WEBAUTHN_RP_ORIGINS=http://127\.0\.0\.1:3000$|VAULTMESH_WEBAUTHN_RP_ORIGINS=http://localhost:3000|' "$INSTALL_DIR/.env"
+	# Migrate loopback browser/API URLs to the detected public host so a
+	# public deployment is reachable without hand-editing .env. Explicit
+	# https:// or domain values are left untouched.
+	if [ "$PUBLIC_HOST" != "localhost" ]; then
+		sed -i "s|^VAULTMESH_PUBLIC_API_URL=http://localhost:8080$|VAULTMESH_PUBLIC_API_URL=$PUBLIC_API_URL|" "$INSTALL_DIR/.env"
+		sed -i "s|^VAULTMESH_ALLOWED_ORIGINS=http://localhost:3000$|VAULTMESH_ALLOWED_ORIGINS=$ALLOWED_ORIGIN|" "$INSTALL_DIR/.env"
+	fi
 	chmod 600 "$INSTALL_DIR/.env"
 fi
 
@@ -102,7 +145,6 @@ else
 fi
 
 printf '\nVaultMesh 已启动。\n'
-server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 bind=$(grep '^VAULTMESH_BIND=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 || true)
 bind=${bind:-0.0.0.0}
 if [ "$bind" = "127.0.0.1" ] || [ "$bind" = "localhost" ]; then
@@ -111,10 +153,12 @@ if [ "$bind" = "127.0.0.1" ] || [ "$bind" = "localhost" ]; then
 else
 	printf 'Web：http://localhost:3000\n'
 	printf 'API：http://localhost:8080\n'
-	if [ -n "$server_ip" ]; then
-		printf '公网访问：http://%s:3000\n' "$server_ip"
+	if [ "$PUBLIC_HOST" != "localhost" ]; then
+		printf '公网访问：http://%s:3000\n' "$PUBLIC_HOST"
 	fi
 	printf '请确认防火墙/安全组已放行 %s 与 %s 端口。\n' "${VAULTMESH_WEB_PORT:-3000}" "${VAULTMESH_API_PORT:-8080}"
+	printf '浏览器/API 地址已写入 .env（VAULTMESH_PUBLIC_API_URL、VAULTMESH_ALLOWED_ORIGINS）；\n'
+	printf '更换域名或 IP 后请同步修改这两个值并重启。\n'
 fi
 if [ "$generated_credentials" = true ]; then
 	printf '用户名：%s\n' "$ADMIN_USERNAME"

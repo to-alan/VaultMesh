@@ -9,6 +9,7 @@
 
 - HTTPS 门控：`VAULTMESH_PUBLIC_API_URL` 非 https 且未设置 `VAULTMESH_HTTPS_ENABLED=true` 时，控制台可浏览但备份/同步类操作返回 403 `https_required`，控制台显示解锁指引横幅
 - 一键安装默认绑定 `0.0.0.0` 并输出服务器实际访问地址；`VAULTMESH_BIND=127.0.0.1` 可恢复回环绑定
+- 一键安装自动探测公网 IP 并写入 `VAULTMESH_PUBLIC_API_URL` / `VAULTMESH_ALLOWED_ORIGINS`（可用 `VAULTMESH_PUBLIC_HOST` 显式指定），升级时自动把 localhost 默认值迁移到探测地址，修复公网部署浏览器 `Failed to fetch`
 
 ### 变更
 
