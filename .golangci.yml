@@ -4,8 +4,11 @@ run:
   timeout: 5m
 
 formatters:
-  gofmt:
-    simplify: true
+  enable:
+    - gofmt
+  settings:
+    gofmt:
+      simplify: true
 
 linters:
   default: standard
