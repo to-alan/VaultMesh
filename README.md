@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/to-alan/VaultMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/to-alan/VaultMesh/actions/workflows/ci.yml)
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-5ee9b5)](./LICENSE)
-[![Go](https://img.shields.io/badge/Go-1.26.5-00ADD8?logo=go&logoColor=white)](./go.mod)
+[![Go](https://img.shields.io/badge/Go-1.26.6-00ADD8?logo=go&logoColor=white)](./go.mod)
 [![Vue](https://img.shields.io/badge/Vue-3-42b883?logo=vuedotjs&logoColor=white)](./web/package.json)
 
 面向 Linux VPS、Homelab 和小型技术团队的自托管多服务器备份控制平台。
@@ -283,7 +283,7 @@ S3 是对象存储兼容协议，不等于某一家云厂商。Cloudflare R2、M
 
 ## 本地开发
 
-要求 Go 1.26.5、Node.js 24 和 npm。省略 `VAULTMESH_DATABASE_URL` 时会使用内存存储，进程重启后开发数据丢失。
+要求 Go 1.26.6、Node.js 24 和 npm。省略 `VAULTMESH_DATABASE_URL` 时会使用内存存储，进程重启后开发数据丢失。
 
 ```bash
 npm --prefix web ci
