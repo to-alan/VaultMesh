@@ -58,6 +58,7 @@ VAULTMESH_WEB_PORT=3000
 VAULTMESH_PUBLIC_API_URL=http://localhost:8080
 VAULTMESH_ALLOWED_ORIGINS=http://localhost:3000
 VAULTMESH_IMAGE_TAG=$VAULTMESH_IMAGE_TAG
+VAULTMESH_BIND=${VAULTMESH_BIND:-0.0.0.0}
 EOF
 	chmod 600 "$INSTALL_DIR/.env"
 	generated_credentials=true
@@ -101,8 +102,20 @@ else
 fi
 
 printf '\nVaultMesh 已启动。\n'
-printf 'Web：http://localhost:3000\n'
-printf 'API：http://localhost:8080\n'
+server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+bind=$(grep '^VAULTMESH_BIND=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2 || true)
+bind=${bind:-0.0.0.0}
+if [ "$bind" = "127.0.0.1" ] || [ "$bind" = "localhost" ]; then
+	printf 'Web：http://localhost:3000（仅回环，可用 SSH 隧道访问）\n'
+	printf 'API：http://localhost:8080\n'
+else
+	printf 'Web：http://localhost:3000\n'
+	printf 'API：http://localhost:8080\n'
+	if [ -n "$server_ip" ]; then
+		printf '公网访问：http://%s:3000\n' "$server_ip"
+	fi
+	printf '请确认防火墙/安全组已放行 %s 与 %s 端口。\n' "${VAULTMESH_WEB_PORT:-3000}" "${VAULTMESH_API_PORT:-8080}"
+fi
 if [ "$generated_credentials" = true ]; then
 	printf '用户名：%s\n' "$ADMIN_USERNAME"
 	printf '密码：%s\n' "$ADMIN_PASSWORD"
@@ -110,4 +123,6 @@ if [ "$generated_credentials" = true ]; then
 else
 	printf '继续使用 %s/.env 中已有的管理员账号和密码。\n' "$INSTALL_DIR"
 fi
-printf '远程服务器请使用 SSH 端口转发访问，生产环境启用 HTTPS 后再对公网开放。\n'
+printf '\n当前未配置 HTTPS：控制台可正常访问，但备份与同步操作已被禁用。\n'
+printf '配置域名与 HTTPS 反向代理后，在 .env 中将 VAULTMESH_PUBLIC_API_URL 改为 https:// 地址\n'
+printf '（并同步更新 VAULTMESH_ALLOWED_ORIGINS、VAULTMESH_COOKIE_SECURE=true），重启即解锁。\n'

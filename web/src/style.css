@@ -254,6 +254,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .page-load-state i { width: 7px; height: 7px; border-radius: 50%; background: var(--blue); box-shadow: 0 0 9px rgba(101,184,255,.7); animation: operation-pulse 1.1s infinite alternate; }
 .page-load-state.failed { justify-content: space-between; color: #ffb2b7; border-color: #61343a; background: #271419; }
 .page-load-state.failed .text-button { color: #ffc0c4; white-space: nowrap; }
+.page-load-state.warning-banner { justify-content: flex-start; color: #f6c85f; border-color: #665327; background: #261f0c; text-align: left; }
 .empty-state { padding: 44px 20px; color: var(--muted-light); border: 1px dashed #30434e; border-radius: 9px; font-size: 13px; text-align: center; }
 .compact-empty { padding: 25px 14px; }
 

@@ -17,9 +17,11 @@ type HTTPServer struct {
 	secondFactors  *authAttemptLimiter
 	auditFailures  *auditFailureSampler
 	allowedOrigins map[string]struct{}
+	// httpsReady gates backup and sync actions until TLS is configured.
+	httpsReady bool
 }
 
-func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthConfig, allowedOrigins []string) (*HTTPServer, error) {
+func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthConfig, allowedOrigins []string, httpsReady bool) (*HTTPServer, error) {
 	adminAuth, err := newAdminAuthenticator(context.Background(), service, adminConfig)
 	if err != nil {
 		return nil, err
@@ -36,6 +38,7 @@ func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthC
 		secondFactors:  newAuthAttemptLimiter(),
 		auditFailures:  newAuditFailureSampler(),
 		allowedOrigins: origins,
+		httpsReady:     httpsReady,
 	}, nil
 }
 
@@ -74,12 +77,12 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("PATCH /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.updateProject)))
 	mux.Handle("DELETE /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.archiveProject)))
 	mux.Handle("GET /api/v1/project-health", s.admin(http.HandlerFunc(s.listProjectHealth)))
-	mux.Handle("POST /api/v1/projects/{projectID}/run", s.admin(http.HandlerFunc(s.createManualRun)))
-	mux.Handle("POST /api/v1/projects/{projectID}/retention-preview", s.admin(http.HandlerFunc(s.createRetentionPreview)))
-	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/refresh", s.admin(http.HandlerFunc(s.refreshSnapshots)))
-	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/protect", s.admin(http.HandlerFunc(s.protectSnapshot)))
-	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/browse", s.admin(http.HandlerFunc(s.browseSnapshot)))
-	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/restore", s.admin(http.HandlerFunc(s.restoreSnapshot)))
+	mux.Handle("POST /api/v1/projects/{projectID}/run", s.admin(s.backupGate(http.HandlerFunc(s.createManualRun))))
+	mux.Handle("POST /api/v1/projects/{projectID}/retention-preview", s.admin(s.backupGate(http.HandlerFunc(s.createRetentionPreview))))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/refresh", s.admin(s.backupGate(http.HandlerFunc(s.refreshSnapshots))))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/protect", s.admin(s.backupGate(http.HandlerFunc(s.protectSnapshot))))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/browse", s.admin(s.backupGate(http.HandlerFunc(s.browseSnapshot))))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/restore", s.admin(s.backupGate(http.HandlerFunc(s.restoreSnapshot))))
 	mux.Handle("GET /api/v1/snapshots", s.admin(http.HandlerFunc(s.listSnapshots)))
 	mux.Handle("GET /api/v1/runs", s.admin(http.HandlerFunc(s.listRuns)))
 	mux.Handle("GET /api/v1/audit-events", s.admin(http.HandlerFunc(s.listAuditEvents)))
@@ -114,10 +117,27 @@ func (s *HTTPServer) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) meta(w http.ResponseWriter, _ *http.Request) {
-	s.writeJSON(w, http.StatusOK, map[string]string{
-		"name":    "VaultMesh",
-		"version": version.Version,
-		"commit":  version.Commit,
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"name":        "VaultMesh",
+		"version":     version.Version,
+		"commit":      version.Commit,
+		"https_ready": s.httpsReady,
+	})
+}
+
+// backupGate blocks backup and sync actions until TLS is configured. Read
+// access stays available so the console can be inspected over plain HTTP,
+// but no command that would queue agent work or read repository contents is
+// accepted until the deployment declares HTTPS via VAULTMESH_PUBLIC_API_URL
+// (or an explicit VAULTMESH_HTTPS_ENABLED=true).
+func (s *HTTPServer) backupGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.httpsReady {
+			s.writeError(w, http.StatusForbidden, "https_required",
+				"HTTPS is not configured; backup and sync actions are disabled. Set VAULTMESH_PUBLIC_API_URL to an https:// URL (or VAULTMESH_HTTPS_ENABLED=true) and restart.", nil)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 

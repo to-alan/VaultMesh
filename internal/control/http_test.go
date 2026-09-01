@@ -364,7 +364,7 @@ func TestAdminLoginSupportsSecureCrossSiteFrontendCookie(t *testing.T) {
 	server, err := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), AdminAuthConfig{
 		Username: testAdminUsername, Password: testAdminPassword,
 		CookieSecure: true, CookieSameSite: "none",
-	}, []string{"https://console.other-site.example"})
+	}, []string{"https://console.other-site.example"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -613,7 +613,7 @@ func TestRecentAuthenticationRequiresSecondFactorWhenTOTPEnabled(t *testing.T) {
 	}
 	server, err := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), AdminAuthConfig{
 		Username: testAdminUsername, Password: testAdminPassword,
-	}, nil)
+	}, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +698,7 @@ func TestSecondFactorStateRollsBackWhenPersistenceFails(t *testing.T) {
 	service := NewService(dataStore, sealer)
 	server, err := NewHTTPServer(service, slog.Default(), AdminAuthConfig{
 		Username: testAdminUsername, Password: testAdminPassword,
-	}, nil)
+	}, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -741,7 +741,7 @@ func TestPasskeyRegistrationBeginsWithDiscoverableCredentialPolicy(t *testing.T)
 	server, err := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), AdminAuthConfig{
 		Username: testAdminUsername, Password: testAdminPassword,
 		WebAuthnRPID: "localhost", WebAuthnRPOrigins: []string{"http://localhost:3000"},
-	}, []string{"http://localhost:3000"})
+	}, []string{"http://localhost:3000"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1342,6 +1342,80 @@ func TestPruneExpiredRemovesOnlyFinishedFacts(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Fatalf("old audit event was not pruned: %#v", events)
+	}
+}
+
+// TestPlainHTTPBlocksBackupActions verifies the TLS gate: without HTTPS the
+// console stays fully readable, but every action that queues agent work or
+// touches repository contents is rejected until TLS is configured.
+func TestPlainHTTPBlocksBackupActions(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{25}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	enrollment, err := service.CreateServer(ctx, "Plain HTTP host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "plain-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Plain repository", URL: "/tmp/plain-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Plain project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := newTestHTTPHandlerHTTPS(t, service, logger, false, nil, false)
+	adminCookie := loginAdmin(t, handler)
+
+	// Reads stay available over plain HTTP.
+	var dashboard map[string]any
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/dashboard", adminCookie, nil, http.StatusOK, &dashboard)
+	var items struct {
+		Items []domain.Project `json:"items"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/projects", adminCookie, nil, http.StatusOK, &items)
+
+	// Every backup/sync action is refused.
+	for _, path := range []string{
+		"/api/v1/projects/" + project.ID + "/run",
+		"/api/v1/projects/" + project.ID + "/retention-preview",
+		"/api/v1/projects/" + project.ID + "/snapshots/refresh",
+	} {
+		requestJSONWithCookie(t, handler, http.MethodPost, path, adminCookie, nil, http.StatusForbidden, &struct{}{})
+	}
+
+	// The meta endpoint advertises the gate so the console can explain it.
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/meta", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	var payload struct {
+		HTTPSReady bool `json:"https_ready"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.HTTPSReady {
+		t.Fatal("meta must advertise https_ready=false without TLS")
+	}
+
+	// The agent-facing config endpoint keeps working so enrolled agents are
+	// not blocked from syncing their schedules while TLS is being set up.
+	_, err = service.DesiredConfig(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatalf("agent config delivery must not be gated: %v", err)
 	}
 }
 
@@ -2143,12 +2217,16 @@ func requestJSONWithAuth(t *testing.T, handler http.Handler, method, path, token
 }
 
 func newTestHTTPHandler(t *testing.T, service *Service, logger *slog.Logger, cookieSecure bool, origins []string) http.Handler {
+	return newTestHTTPHandlerHTTPS(t, service, logger, cookieSecure, origins, true)
+}
+
+func newTestHTTPHandlerHTTPS(t *testing.T, service *Service, logger *slog.Logger, cookieSecure bool, origins []string, httpsReady bool) http.Handler {
 	t.Helper()
 	server, err := NewHTTPServer(service, logger, AdminAuthConfig{
 		Username:     testAdminUsername,
 		Password:     testAdminPassword,
 		CookieSecure: cookieSecure,
-	}, origins)
+	}, origins, httpsReady)
 	if err != nil {
 		t.Fatal(err)
 	}

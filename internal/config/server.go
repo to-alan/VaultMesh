@@ -25,6 +25,13 @@ type Server struct {
 	WebAuthnRPOrigins []string
 	AutoMigrate       bool
 	Retention         domain.DataRetention
+	// PublicAPIURL mirrors VAULTMESH_PUBLIC_API_URL so the server can advise
+	// the web console and validate its own TLS posture.
+	PublicAPIURL string
+	// HTTPSReady reports whether TLS is considered configured. It derives
+	// from the public API URL scheme and can be forced with
+	// VAULTMESH_HTTPS_ENABLED for deployments that terminate TLS elsewhere.
+	HTTPSReady bool
 }
 
 func LoadServer() (Server, error) {
@@ -80,6 +87,12 @@ func LoadServer() (Server, error) {
 	if len(config.WebAuthnRPOrigins) == 0 {
 		config.WebAuthnRPOrigins = append([]string(nil), config.AllowedOrigins...)
 	}
+	config.PublicAPIURL = strings.TrimSpace(os.Getenv("VAULTMESH_PUBLIC_API_URL"))
+	httpsEnabled, err := envBool("VAULTMESH_HTTPS_ENABLED", false)
+	if err != nil {
+		return Server{}, err
+	}
+	config.HTTPSReady = httpsEnabled || strings.HasPrefix(config.PublicAPIURL, "https://")
 	if config.WebAuthnRPID == "" && len(config.WebAuthnRPOrigins) > 0 {
 		parsed, _ := url.Parse(config.WebAuthnRPOrigins[0])
 		if parsed != nil {

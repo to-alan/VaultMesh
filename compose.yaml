@@ -45,7 +45,10 @@ services:
       VAULTMESH_RETENTION_AUDIT_EVENTS_DAYS: ${VAULTMESH_RETENTION_AUDIT_EVENTS_DAYS:-365}
       VAULTMESH_AUTO_MIGRATE: "true"
     ports:
-      - "127.0.0.1:${VAULTMESH_API_PORT:-8080}:8080"
+      # Bind to all interfaces so a public VPS is reachable without SSH
+      # tunnels. Set VAULTMESH_BIND=127.0.0.1 to restore loopback-only
+      # binding behind a reverse proxy or SSH tunnel.
+      - "${VAULTMESH_BIND:-0.0.0.0}:${VAULTMESH_API_PORT:-8080}:8080"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -69,7 +72,7 @@ services:
     environment:
       VAULTMESH_API_BASE_URL: ${VAULTMESH_PUBLIC_API_URL:-http://localhost:8080}
     ports:
-      - "127.0.0.1:${VAULTMESH_WEB_PORT:-3000}:80"
+      - "${VAULTMESH_BIND:-0.0.0.0}:${VAULTMESH_WEB_PORT:-3000}:80"
 
 volumes:
   vaultmesh-postgres:
