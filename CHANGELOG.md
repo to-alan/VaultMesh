@@ -3,6 +3,22 @@
 本文件记录用户可见的变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。项目处于 1.0 之前，次版本号变更可能包含破坏性调整。
 
+## [0.1.1] - 2026-09-02
+
+### 修复
+
+- 无效的 `VAULTMESH_WEBAUTHN_RP_ID`（如误填服务器 IP）不再导致控制面拒绝启动，而是降级禁用通行密钥，其余功能照常
+- 一键安装自动探测公网 IP 并写入 `VAULTMESH_PUBLIC_API_URL` / `VAULTMESH_ALLOWED_ORIGINS`（可用 `VAULTMESH_PUBLIC_HOST` 显式指定），升级时自动迁移 localhost 默认值，修复公网部署浏览器 `Failed to fetch`
+
+### 新增
+
+- HTTPS 门控：`VAULTMESH_PUBLIC_API_URL` 非 https 且未设置 `VAULTMESH_HTTPS_ENABLED=true` 时，控制台可浏览但备份/同步类操作返回 403 `https_required`，控制台显示解锁指引横幅
+- 一键安装默认绑定 `0.0.0.0` 并输出服务器实际访问地址；`VAULTMESH_BIND=127.0.0.1` 可恢复回环绑定
+
+### 变更
+
+- 一键安装与 Compose 默认使用 GHCR 预构建镜像（`VAULTMESH_IMAGE_TAG`，默认 `latest`），镜像不可用时自动回退本地构建；升级不再必须在本机编译 Go/Node
+
 ## [Unreleased]
 
 ### 新增
@@ -43,5 +59,6 @@
 - 只支持 `missed_run_policy=skip`；恢复仅限同 Agent 隔离目录
 - 保护标签不等于 Object Lock；仓库连通性在首次 Restic 操作时才验证
 
-[Unreleased]: https://github.com/to-alan/VaultMesh/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/to-alan/VaultMesh/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/to-alan/VaultMesh/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/to-alan/VaultMesh/releases/tag/v0.1.0
