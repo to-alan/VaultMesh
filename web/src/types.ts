@@ -21,6 +21,7 @@ export interface Server {
   desired_revision: number
   applied_revision: number
   created_at: string
+  archived_at?: string
 }
 
 export interface Repository {
@@ -29,6 +30,7 @@ export interface Repository {
   name: string
   url: string
   created_at: string
+  archived_at?: string
 }
 
 export interface Source {
@@ -104,11 +106,12 @@ export interface Project {
   next_run_at?: string
   created_at: string
   updated_at: string
+  archived_at?: string
 }
 
 export interface ProjectHealth {
   project_id: string
-  status: 'healthy' | 'pending' | 'late' | 'overdue' | 'paused' | 'invalid'
+  status: 'healthy' | 'pending' | 'running' | 'late' | 'overdue' | 'paused' | 'invalid'
   latest_run_status?: string
   latest_run_at?: string
   last_successful_at?: string
@@ -150,8 +153,9 @@ export interface NotificationChannel {
   enabled: boolean
   send_resolved: boolean
   repeat_interval_seconds: number
-  event_types: ('backup_failure' | 'rpo_overdue')[]
+  event_types: ('backup_failure' | 'rpo_overdue' | 'agent_offline' | 'config_error')[]
   project_ids?: string[]
+  server_ids?: string[]
   config?: Record<string, string>
   destination?: string
   configured: boolean
@@ -162,9 +166,12 @@ export interface NotificationChannel {
 export interface AlertIncident {
   id: string
   fingerprint: string
-  kind: 'backup_failure' | 'rpo_overdue'
-  project_id: string
-  project_name: string
+  kind: 'backup_failure' | 'rpo_overdue' | 'agent_offline' | 'config_error'
+  resource_type: 'project' | 'server'
+  resource_id: string
+  resource_name: string
+  project_id?: string
+  project_name?: string
   status: 'firing' | 'resolved'
   severity: 'warning' | 'critical' | string
   summary: string

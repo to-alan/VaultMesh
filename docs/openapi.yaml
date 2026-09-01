@@ -375,9 +375,54 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Project' }
         '422': { $ref: '#/components/responses/Error' }
+  /api/v1/servers/{serverID}:
+    delete:
+      tags: [Servers]
+      operationId: archiveServer
+      description: |
+        Archives a server that has no active backup projects. The server
+        disappears from the console, its agent credentials are revoked, and
+        historical runs and audit events keep referencing it.
+      parameters:
+        - name: serverID
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/v1/repositories/{repositoryID}:
+    delete:
+      tags: [Repositories]
+      operationId: archiveRepository
+      description: |
+        Archives a storage channel that is no longer referenced by any active
+        project. Repositories still used by active projects are rejected to
+        protect the recovery chain.
+      parameters:
+        - name: repositoryID
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
   /api/v1/projects/{projectID}:
     parameters:
       - $ref: '#/components/parameters/ProjectID'
+    delete:
+      tags: [Projects]
+      operationId: archiveProject
+      description: |
+        Archives a project. Scheduling stops and the agent configuration no
+        longer includes it, while run history and the snapshot index keep
+        their references for evidence.
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
     put:
       tags: [Projects]
       operationId: replaceProject
@@ -707,12 +752,28 @@ paths:
       tags: [Agent]
       operationId: agentHeartbeat
       security: [{ agentBearer: [] }]
+      description: |
+        Merged sync request: records the heartbeat and returns the full
+        desired configuration in the same response whenever the agent's
+        applied revision lags behind the control plane.
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/Heartbeat' }
       responses:
+        '200':
+          description: The agent lags behind; the response carries the desired configuration, including `degraded_projects` when secret decryption failed for some projects
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [config]
+                properties:
+                  config:
+                    oneOf:
+                      - type: 'null'
+                      - type: object
         '204': { $ref: '#/components/responses/NoContent' }
         '401': { $ref: '#/components/responses/Error' }
   /api/v1/agent/config:
@@ -762,8 +823,46 @@ paths:
             schema: { $ref: '#/components/schemas/Run' }
       responses:
         '204': { $ref: '#/components/responses/NoContent' }
+        '400':
+          description: Invalid immutable report, or retryable Agent clock skew (`agent_clock_ahead`)
+          headers:
+            Retry-After:
+              description: Seconds until an ahead-of-time report may be retried; present only for `agent_clock_ahead`
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /api/v1/agent/snapshots:
+    put:
+      tags: [Agent]
+      operationId: reportAgentSnapshots
+      security: [{ agentBearer: [] }]
+      description: |
+        Replaces the cached snapshot index for one project. Inventories are
+        delivered through this dedicated idempotent channel so an oversized
+        index can never reject or bloat an immutable run report.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project_id, snapshots]
+              properties:
+                project_id: { type: string }
+                snapshots:
+                  type: array
+                  maxItems: 10000
+                  items: { $ref: '#/components/schemas/Snapshot' }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
 components:
   securitySchemes:
     cookieAuth:
@@ -1061,7 +1160,9 @@ components:
           items: { type: string }
         database: { $ref: '#/components/schemas/DatabaseSource' }
         docker: { $ref: '#/components/schemas/DockerSource' }
-        required: { type: boolean }
+        required:
+          type: boolean
+          description: Abort before backup when this source cannot be prepared; false skips it and produces a partial run if other sources succeed.
     Schedule:
       type: object
       additionalProperties: false
@@ -1163,7 +1264,7 @@ components:
       required: [project_id, status]
       properties:
         project_id: { type: string }
-        status: { type: string, enum: [healthy, pending, late, overdue, paused, invalid] }
+        status: { type: string, enum: [healthy, pending, running, late, overdue, paused, invalid] }
         latest_run_status: { type: string }
         latest_run_at: { type: string, format: date-time }
         last_successful_at: { type: string, format: date-time }
@@ -1192,7 +1293,7 @@ components:
         scheduled_at: { type: string, format: date-time }
         started_at: { type: string, format: date-time }
         finished_at: { type: string, format: date-time }
-        status: { type: string, enum: [running, succeeded, partial, failed, canceled, timed_out, unknown] }
+        status: { type: string, enum: [running, succeeded, partial, failed, canceled, timed_out, unknown, skipped] }
         snapshot_id: { type: string }
         error_code: { type: string }
         error_message: { type: string }
@@ -1237,8 +1338,13 @@ components:
           type: array
           minItems: 1
           uniqueItems: true
-          items: { type: string, enum: [backup_failure, rpo_overdue] }
+          items: { type: string, enum: [backup_failure, rpo_overdue, agent_offline] }
         project_ids:
+          type: array
+          uniqueItems: true
+          items: { type: string }
+        server_ids:
+          description: Allowlist for server-scoped events; an empty or omitted array means every server.
           type: array
           uniqueItems: true
           items: { type: string }
@@ -1258,8 +1364,11 @@ components:
         repeat_interval_seconds: { type: integer }
         event_types:
           type: array
-          items: { type: string, enum: [backup_failure, rpo_overdue] }
+          items: { type: string, enum: [backup_failure, rpo_overdue, agent_offline] }
         project_ids:
+          type: array
+          items: { type: string }
+        server_ids:
           type: array
           items: { type: string }
         config:
@@ -1272,11 +1381,14 @@ components:
         updated_at: { type: string, format: date-time }
     AlertIncident:
       type: object
-      required: [id, fingerprint, kind, project_id, project_name, status, severity, summary, description, source_event_id, occurrence_count, started_at, updated_at]
+      required: [id, fingerprint, kind, resource_type, resource_id, resource_name, status, severity, summary, description, source_event_id, occurrence_count, started_at, updated_at]
       properties:
         id: { type: string }
         fingerprint: { type: string }
-        kind: { type: string, enum: [backup_failure, rpo_overdue] }
+        kind: { type: string, enum: [backup_failure, rpo_overdue, agent_offline] }
+        resource_type: { type: string, enum: [project, server] }
+        resource_id: { type: string }
+        resource_name: { type: string }
         project_id: { type: string }
         project_name: { type: string }
         status: { type: string, enum: [firing, resolved] }

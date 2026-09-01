@@ -190,4 +190,28 @@ func TestPostgresVerticalSlice(t *testing.T) {
 	if runs[0].ID == report.ID && runs[0].Status != domain.RunSucceeded {
 		t.Fatalf("delayed report regressed terminal run: %#v", runs[0])
 	}
+	channel, err := dataStore.CreateNotificationChannel(ctx, domain.NotificationChannel{
+		ID: "chn_pg_" + suffix, Name: "Postgres channel " + suffix, Type: "webhook", Enabled: true,
+		SendResolved: true, RepeatIntervalSeconds: 3600, EventTypes: []string{"agent_offline"},
+		ProjectIDs: []string{projectID}, ServerIDs: []string{serverID}, SecretCiphertext: []byte("v1:test"),
+		CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(channel.ServerIDs) != 1 || channel.ServerIDs[0] != serverID {
+		t.Fatalf("server notification route was not persisted: %#v", channel)
+	}
+	incident, err := dataStore.CreateAlertIncident(ctx, domain.AlertIncident{
+		ID: "alt_pg_" + suffix, Fingerprint: "agent:" + serverID, Kind: "agent_offline",
+		ResourceType: "server", ResourceID: serverID, ResourceName: server.Name,
+		Status: "firing", Severity: "warning", Summary: "Agent offline", Description: "Heartbeat missing",
+		SourceEventID: suffix, OccurrenceCount: 1, StartedAt: now, UpdatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incident.ResourceType != "server" || incident.ResourceID != serverID || incident.ProjectID != "" {
+		t.Fatalf("server-scoped incident was not persisted: %#v", incident)
+	}
 }

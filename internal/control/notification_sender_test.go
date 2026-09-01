@@ -52,6 +52,17 @@ func TestSendGenericWebhookUsesStablePayloadAndConfiguredHeaders(t *testing.T) {
 	}
 }
 
+func TestNotificationMessageLabelsServerIncidents(t *testing.T) {
+	_, message := notificationMessage(domain.AlertIncident{
+		Kind: "agent_offline", ResourceType: "server", ResourceID: "srv_test", ResourceName: "Edge VPS",
+		Severity: "warning", Summary: "Agent 已离线", Description: "心跳已中断。", OccurrenceCount: 1,
+		UpdatedAt: time.Now().UTC(),
+	}, "firing")
+	if !strings.Contains(message, "服务器：Edge VPS") || strings.Contains(message, "项目：Edge VPS") {
+		t.Fatalf("server incident used the wrong resource label: %s", message)
+	}
+}
+
 func TestNotificationHTTPErrorDoesNotLeakEndpoint(t *testing.T) {
 	withNotificationTransport(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return response(http.StatusUnauthorized), nil

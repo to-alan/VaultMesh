@@ -139,10 +139,15 @@ func notificationMessage(alert domain.AlertIncident, transition string) (string,
 	} else if transition == "resolved" {
 		state = "已恢复"
 	}
-	title := fmt.Sprintf("[VaultMesh] %s · %s", state, alert.ProjectName)
+	resourceType, resourceName := alertResource(alert)
+	resourceLabel := "项目"
+	if resourceType == "server" {
+		resourceLabel = "服务器"
+	}
+	title := fmt.Sprintf("[VaultMesh] %s · %s", state, resourceName)
 	message := strings.Join([]string{
 		"事件：" + alert.Summary,
-		"项目：" + alert.ProjectName,
+		resourceLabel + "：" + resourceName,
 		"级别：" + alert.Severity,
 		"状态：" + transition,
 		"说明：" + alert.Description,
@@ -150,6 +155,20 @@ func notificationMessage(alert domain.AlertIncident, transition string) (string,
 		"时间：" + alert.UpdatedAt.Format(time.RFC3339),
 	}, "\n")
 	return title, message
+}
+
+func alertResource(alert domain.AlertIncident) (string, string) {
+	resourceType, resourceName := alert.ResourceType, alert.ResourceName
+	if resourceType == "" {
+		resourceType = "project"
+	}
+	if resourceName == "" {
+		resourceName = alert.ProjectName
+	}
+	if resourceName == "" {
+		resourceName = alert.ResourceID
+	}
+	return resourceType, resourceName
 }
 
 func severityPriority(severity string) string {
@@ -172,10 +191,13 @@ func sendGenericWebhook(ctx context.Context, config map[string]string, alert dom
 		return err
 	}
 	if template := config["body_template"]; template != "" {
+		resourceType, resourceName := alertResource(alert)
 		replacements := map[string]string{
 			"{{transition}}": transition, "{{title}}": title, "{{message}}": message,
 			"{{project_name}}": alert.ProjectName, "{{severity}}": alert.Severity,
 			"{{summary}}": alert.Summary, "{{description}}": alert.Description,
+			"{{resource_type}}": resourceType, "{{resource_id}}": alert.ResourceID,
+			"{{resource_name}}": resourceName,
 		}
 		for placeholder, value := range replacements {
 			template = strings.ReplaceAll(template, placeholder, value)

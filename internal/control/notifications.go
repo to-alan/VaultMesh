@@ -20,6 +20,9 @@ const (
 	notificationWorkerInterval = 30 * time.Second
 	notificationLease          = time.Minute
 	maxNotificationAttempts    = 5
+	// Retention pruning sweeps at most once per hour; the worker cycle itself
+	// stays at 30 seconds for alert evaluation and delivery.
+	retentionInterval = time.Hour
 )
 
 type notificationProviderDefinition struct {
@@ -77,6 +80,8 @@ var notificationProviderDefinitions = map[string]notificationProviderDefinition{
 var notificationEventTypes = map[string]struct{}{
 	"backup_failure": {},
 	"rpo_overdue":    {},
+	"agent_offline":  {},
+	"config_error":   {},
 }
 
 type notificationSender func(context.Context, domain.NotificationChannel, map[string]string, domain.AlertIncident, string) error
@@ -181,7 +186,7 @@ func (s *Service) prepareNotificationChannel(ctx context.Context, input *domain.
 		return validationError("repeat_interval_seconds", "must be between 5 minutes and 7 days")
 	}
 	if len(input.EventTypes) == 0 {
-		input.EventTypes = []string{"backup_failure", "rpo_overdue"}
+		input.EventTypes = []string{"backup_failure", "rpo_overdue", "agent_offline", "config_error"}
 	}
 	input.EventTypes = uniqueStrings(input.EventTypes)
 	for _, eventType := range input.EventTypes {
@@ -202,6 +207,22 @@ func (s *Service) prepareNotificationChannel(ctx context.Context, input *domain.
 		for _, id := range input.ProjectIDs {
 			if _, ok := known[id]; !ok {
 				return validationError("project_ids", fmt.Sprintf("project %q does not exist", id))
+			}
+		}
+	}
+	input.ServerIDs = uniqueStrings(input.ServerIDs)
+	if len(input.ServerIDs) > 0 {
+		servers, err := s.store.ListServers(ctx)
+		if err != nil {
+			return err
+		}
+		known := make(map[string]struct{}, len(servers))
+		for _, server := range servers {
+			known[server.ID] = struct{}{}
+		}
+		for _, id := range input.ServerIDs {
+			if _, ok := known[id]; !ok {
+				return validationError("server_ids", fmt.Sprintf("server %q does not exist", id))
 			}
 		}
 	}

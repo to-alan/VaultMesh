@@ -7,6 +7,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/to-alan/vaultmesh/internal/domain"
 )
 
 type Server struct {
@@ -22,6 +24,7 @@ type Server struct {
 	WebAuthnRPName    string
 	WebAuthnRPOrigins []string
 	AutoMigrate       bool
+	Retention         domain.DataRetention
 }
 
 func LoadServer() (Server, error) {
@@ -30,6 +33,26 @@ func LoadServer() (Server, error) {
 		return Server{}, err
 	}
 	autoMigrate, err := envBool("VAULTMESH_AUTO_MIGRATE", true)
+	if err != nil {
+		return Server{}, err
+	}
+	runsDays, err := envInt("VAULTMESH_RETENTION_RUNS_DAYS", 90)
+	if err != nil {
+		return Server{}, err
+	}
+	commandsDays, err := envInt("VAULTMESH_RETENTION_COMMANDS_DAYS", 30)
+	if err != nil {
+		return Server{}, err
+	}
+	deliveriesDays, err := envInt("VAULTMESH_RETENTION_DELIVERIES_DAYS", 90)
+	if err != nil {
+		return Server{}, err
+	}
+	incidentsDays, err := envInt("VAULTMESH_RETENTION_INCIDENTS_DAYS", 180)
+	if err != nil {
+		return Server{}, err
+	}
+	auditDays, err := envInt("VAULTMESH_RETENTION_AUDIT_EVENTS_DAYS", 365)
 	if err != nil {
 		return Server{}, err
 	}
@@ -46,6 +69,13 @@ func LoadServer() (Server, error) {
 		WebAuthnRPID:      strings.TrimSpace(os.Getenv("VAULTMESH_WEBAUTHN_RP_ID")),
 		WebAuthnRPName:    envOr("VAULTMESH_WEBAUTHN_RP_NAME", "VaultMesh"),
 		WebAuthnRPOrigins: splitList(os.Getenv("VAULTMESH_WEBAUTHN_RP_ORIGINS")),
+		Retention: domain.DataRetention{
+			RunsDays:        runsDays,
+			CommandsDays:    commandsDays,
+			DeliveriesDays:  deliveriesDays,
+			IncidentsDays:   incidentsDays,
+			AuditEventsDays: auditDays,
+		},
 	}
 	if len(config.WebAuthnRPOrigins) == 0 {
 		config.WebAuthnRPOrigins = append([]string(nil), config.AllowedOrigins...)
@@ -130,6 +160,21 @@ func envBool(key string, fallback bool) (bool, error) {
 	parsed, err := strconv.ParseBool(value)
 	if err != nil {
 		return false, fmt.Errorf("%s must be true or false", key)
+	}
+	return parsed, nil
+}
+
+// envInt reads a non-negative day count. Zero disables pruning for the scope;
+// negative values are rejected so typos cannot silently disable or invert
+// retention semantics.
+func envInt(key string, fallback int) (int, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer number of days", key)
 	}
 	return parsed, nil
 }

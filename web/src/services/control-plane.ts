@@ -86,6 +86,7 @@ export interface NotificationChannelWriteInput {
   repeat_interval_seconds: number
   event_types: NotificationChannel['event_types']
   project_ids: string[]
+  server_ids: string[]
   config: Record<string, string>
 }
 
@@ -166,11 +167,13 @@ export const controlPlane = {
   servers: {
     list: () => list<Server>('/api/v1/servers'),
     create: (name: string) => requestJSON<EnrollmentResult>('/api/v1/servers', { method: 'POST', body: { name } }),
+    archive: (serverID: string) => requestJSON<void>(`/api/v1/servers/${resourceID(serverID)}`, { method: 'DELETE' }),
   },
 
   repositories: {
     list: () => list<Repository>('/api/v1/repositories'),
     create: (input: RepositoryCreateInput) => requestJSON<Repository>('/api/v1/repositories', { method: 'POST', body: input }),
+    archive: (repositoryID: string) => requestJSON<void>(`/api/v1/repositories/${resourceID(repositoryID)}`, { method: 'DELETE' }),
   },
 
   projects: {
@@ -183,6 +186,7 @@ export const controlPlane = {
     setEnabled: (projectID: string, enabled: boolean) => requestJSON<Project>(`/api/v1/projects/${resourceID(projectID)}`, {
       method: 'PATCH', body: { enabled },
     }),
+    archive: (projectID: string) => requestJSON<void>(`/api/v1/projects/${resourceID(projectID)}`, { method: 'DELETE' }),
     run: (projectID: string) => requestJSON<CommandAccepted>(`/api/v1/projects/${resourceID(projectID)}/run`, { method: 'POST' }),
     previewRetention: (projectID: string) => requestJSON<CommandAccepted>(`/api/v1/projects/${resourceID(projectID)}/retention-preview`, { method: 'POST' }),
     refreshSnapshots: (projectID: string) => requestJSON<CommandAccepted>(`/api/v1/projects/${resourceID(projectID)}/snapshots/refresh`, { method: 'POST' }),

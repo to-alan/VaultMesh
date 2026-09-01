@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -15,23 +16,37 @@ import (
 	"github.com/to-alan/vaultmesh/internal/schedule"
 )
 
+// maxSnapshotInventoryEntries mirrors the control-plane delivery limit so an
+// inventory that can never be accepted is dropped at the source instead of
+// blocking the inventory outbox forever.
+const maxSnapshotInventoryEntries = 10000
+
 type Manager struct {
 	mu        sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	stopped   bool
 	state     *StateStore
 	runner    *Runner
 	identity  domain.AgentIdentity
 	logger    *slog.Logger
 	crons     []*cron.Cron
 	repoLocks map[string]chan struct{}
+	inflight  map[string]int
 }
 
 func NewManager(state *StateStore, runner *Runner, identity domain.AgentIdentity, logger *slog.Logger) *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
+		ctx:       ctx,
+		cancel:    cancel,
 		state:     state,
 		runner:    runner,
 		identity:  identity,
 		logger:    logger,
 		repoLocks: make(map[string]chan struct{}),
+		inflight:  make(map[string]int),
 	}
 }
 
@@ -72,14 +87,18 @@ func (m *Manager) Apply(config domain.AgentConfig) error {
 	}
 
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return errors.New("agent manager is stopped")
+	}
 	old := m.crons
 	m.crons = append([]*cron.Cron(nil), prepared...)
+	for _, runner := range prepared {
+		runner.Start()
+	}
 	m.mu.Unlock()
 	for _, runner := range old {
 		runner.Stop()
-	}
-	for _, runner := range prepared {
-		runner.Start()
 	}
 	m.logger.Info("applied agent configuration", "revision", config.Revision, "projects", len(config.Projects))
 	return nil
@@ -97,7 +116,10 @@ func (m *Manager) operationCron(project domain.AgentProject, expression, timezon
 	cronRunner := cron.New(cron.WithLocation(location), cron.WithParser(schedule.Parser))
 	if _, err := cronRunner.AddFunc(expression, func() {
 		scheduledAt := time.Now().UTC().Truncate(time.Minute)
-		go m.executeOperation(projectCopy, scheduledAt, operation)
+		idempotencyKey := projectCopy.ID + ":" + operation + ":" + scheduledAt.Format(time.RFC3339)
+		if err := m.startOperation(projectCopy, scheduledAt, idempotencyKey, operation, "", nil, operation == "backup"); err != nil {
+			m.logger.Debug("skip operation after manager stopped", "project_id", projectCopy.ID, "operation", operation)
+		}
 	}); err != nil {
 		return nil, fmt.Errorf("register project %s %s schedule: %w", project.ID, operation, err)
 	}
@@ -106,12 +128,20 @@ func (m *Manager) operationCron(project domain.AgentProject, expression, timezon
 
 func (m *Manager) Stop() {
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		m.wg.Wait()
+		return
+	}
+	m.stopped = true
 	crons := m.crons
 	m.crons = nil
+	m.cancel()
 	m.mu.Unlock()
 	for _, runner := range crons {
 		runner.Stop()
 	}
+	m.wg.Wait()
 }
 
 func (m *Manager) Manual(command domain.Command) error {
@@ -126,17 +156,26 @@ func (m *Manager) Manual(command domain.Command) error {
 		default:
 			return fmt.Errorf("unsupported command type %q", command.Type)
 		}
-		go m.executeWithKey(project, scheduledAt, "manual:"+command.ID, command.Type, command.ID, command.Payload)
-		return nil
+		return m.startOperation(project, scheduledAt, "manual:"+command.ID, command.Type, command.ID, command.Payload, false)
 	}
 	return fmt.Errorf("project %s is not present in applied configuration revision %d", command.ProjectID, config.Revision)
 }
 
-func (m *Manager) executeOperation(project domain.AgentProject, scheduledAt time.Time, operation string) {
-	m.executeWithKey(project, scheduledAt, project.ID+":"+operation+":"+scheduledAt.UTC().Format(time.RFC3339), operation, "", nil)
+func (m *Manager) startOperation(project domain.AgentProject, scheduledAt time.Time, idempotencyKey, operation, commandID string, payload map[string]any, applyJitter bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped {
+		return errors.New("agent manager is stopped")
+	}
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.executeWithKey(project, scheduledAt, idempotencyKey, operation, commandID, payload, applyJitter)
+	}()
+	return nil
 }
 
-func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.Time, idempotencyKey, operation, commandID string, payload map[string]any) {
+func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.Time, idempotencyKey, operation, commandID string, payload map[string]any, applyJitter bool) {
 	runID := deterministicRunID(idempotencyKey)
 	now := time.Now().UTC()
 	report := domain.RunReport{
@@ -158,19 +197,46 @@ func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.T
 		return
 	}
 
+	// The project schedule only supports concurrency_policy=forbid. A long
+	// backup must not queue duplicate triggers behind the repository lock, so
+	// an overlapping trigger of the same operation records a visible skipped
+	// terminal state instead of piling onto the repository semaphore. The guard
+	// is taken after the jitter delay so a pending jittered trigger never
+	// starves manual operations.
+	if acquired := m.claimInflight(project.ID, operation); !acquired {
+		skipped := domain.RunReport{
+			ID:             runID,
+			IdempotencyKey: idempotencyKey,
+			ProjectID:      project.ID,
+			ScheduledAt:    scheduledAt,
+			StartedAt:      now,
+			FinishedAt:     &now,
+			Status:         domain.RunSkipped,
+			ErrorCode:      "concurrency_forbidden",
+			ErrorMessage:   "an identical " + operation + " operation is still running for this project",
+			Stats:          map[string]any{"operation": operation},
+		}
+		if err := m.state.FinishRun(skipped); err != nil {
+			m.logger.Error("persist skipped run", "project_id", project.ID, "error", err)
+		}
+		m.logger.Info("skipped overlapping operation", "operation", operation, "run_id", runID, "project_id", project.ID)
+		return
+	}
+	defer m.releaseInflight(project.ID, operation)
+
 	maxRuntime := time.Duration(project.Schedule.MaxRuntimeSeconds) * time.Second
 	if maxRuntime <= 0 {
 		maxRuntime = 6 * time.Hour
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), maxRuntime)
+	ctx, cancel := context.WithTimeout(m.ctx, maxRuntime)
 	defer cancel()
-	if jitter := project.Schedule.JitterSeconds; jitter > 0 {
+	if jitter := project.Schedule.JitterSeconds; applyJitter && jitter > 0 {
 		delay := time.Duration(rand.IntN(jitter+1)) * time.Second
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			m.finishTimedOut(report, "jitter exceeded the configured runtime")
+			m.finishContextError(report, ctx.Err(), "jitter exceeded the configured runtime")
 			return
 		case <-timer.C:
 		}
@@ -178,7 +244,7 @@ func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.T
 
 	release, err := m.acquireRepository(ctx, project.Repository.ID)
 	if err != nil {
-		m.finishTimedOut(report, "timed out waiting for another operation on the same repository")
+		m.finishContextError(report, ctx.Err(), "timed out waiting for another operation on the same repository")
 		return
 	}
 	defer release()
@@ -204,15 +270,32 @@ func (m *Manager) executeWithKey(project domain.AgentProject, scheduledAt time.T
 		result = m.runner.Execute(ctx, m.identity.AgentID, project)
 	}
 	if operation == "backup" && result.SnapshotID != "" {
+		// The full inventory is delivered through the dedicated snapshot
+		// endpoint, not the run report: run history must stay bounded while
+		// the control-plane index still converges to the repository truth.
 		inventory := m.runner.ListSnapshots(ctx, m.identity.AgentID, project)
 		if result.Stats == nil {
 			result.Stats = make(map[string]any)
 		}
 		if inventory.Status == domain.RunSucceeded {
-			result.Stats["snapshots"] = inventory.Stats["snapshots"]
 			result.Stats["snapshot_count"] = inventory.Stats["snapshot_count"]
+			result.Stats["snapshots"] = inventory.Stats["snapshots"]
 		} else {
 			result.Stats["snapshot_sync_error"] = inventory.ErrorMessage
+		}
+	}
+	// The runner attaches the verified inventory to the operation result.
+	// Move it into the persistent inventory outbox so the dedicated snapshot
+	// endpoint can deliver it without ever embedding it in run history.
+	if raw, ok := result.Stats["snapshots"]; ok {
+		delete(result.Stats, "snapshots")
+		if snapshots, ok := raw.([]domain.Snapshot); ok {
+			if len(snapshots) > maxSnapshotInventoryEntries {
+				result.Stats["snapshot_inventory_dropped"] = true
+				m.logger.Warn("snapshot inventory exceeds the delivery limit", "project_id", project.ID, "count", len(snapshots))
+			} else if err := m.state.QueueSnapshotInventory(project.ID, snapshots); err != nil {
+				m.logger.Error("queue snapshot inventory", "project_id", project.ID, "error", err)
+			}
 		}
 	}
 	finished := time.Now().UTC()
@@ -237,6 +320,28 @@ func payloadString(payload map[string]any, key string) string {
 func payloadBool(payload map[string]any, key string) bool {
 	value, _ := payload[key].(bool)
 	return value
+}
+
+func (m *Manager) claimInflight(projectID, operation string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := projectID + ":" + operation
+	if m.inflight[key] > 0 {
+		return false
+	}
+	m.inflight[key] = 1
+	return true
+}
+
+func (m *Manager) releaseInflight(projectID, operation string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := projectID + ":" + operation
+	if m.inflight[key] <= 1 {
+		delete(m.inflight, key)
+		return
+	}
+	m.inflight[key]--
 }
 
 func (m *Manager) acquireRepository(ctx context.Context, repositoryID string) (func(), error) {
@@ -265,6 +370,21 @@ func (m *Manager) finishTimedOut(report domain.RunReport, message string) {
 	if err := m.state.FinishRun(report); err != nil {
 		m.logger.Error("persist timed out run", "run_id", report.ID, "error", err)
 	}
+}
+
+func (m *Manager) finishContextError(report domain.RunReport, cause error, timeoutMessage string) {
+	if errors.Is(cause, context.Canceled) {
+		finished := time.Now().UTC()
+		report.FinishedAt = &finished
+		report.Status = domain.RunCanceled
+		report.ErrorCode = "agent_stopping"
+		report.ErrorMessage = "agent stopped while the operation was in progress"
+		if err := m.state.FinishRun(report); err != nil {
+			m.logger.Error("persist canceled run", "run_id", report.ID, "error", err)
+		}
+		return
+	}
+	m.finishTimedOut(report, timeoutMessage)
 }
 
 func deterministicRunID(idempotencyKey string) string {

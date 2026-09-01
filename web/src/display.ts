@@ -67,6 +67,7 @@ export function projectHealthLabel(health?: ProjectHealth): string {
   const labels: Record<string, string> = {
     healthy: 'RPO 正常',
     pending: '等待首次备份',
+    running: '备份执行中',
     late: '备份迟到',
     overdue: 'RPO 已超时',
     paused: '监控已暂停',
@@ -79,6 +80,7 @@ export function describeProjectHealth(health: ProjectHealth | undefined, nowEpoc
   if (!health) return '正在计算计划健康状态'
   if (health.status === 'paused') return '项目暂停后不计算 RPO'
   if (health.status === 'invalid') return 'Cron 或时区无法解析，请编辑项目修复'
+  if (health.status === 'running') return '备份正在执行，等待本次运行结果'
   if (health.status === 'overdue' && health.deadline_at) {
     return `超过完成时限 ${formatCountdown(Math.max(0, nowEpoch - new Date(health.deadline_at).getTime()))}`
   }
@@ -127,9 +129,12 @@ export function auditActionLabel(action: string): string {
     'security.passkey.register': '注册通行密钥',
     'security.passkey.delete': '移除通行密钥',
     'server.create': '创建服务器',
+    'server.archive': '归档服务器',
     'repository.create': '创建备份仓库',
+    'repository.archive': '归档备份仓库',
     'project.create': '创建备份项目',
     'project.update': '更新备份项目',
+    'project.archive': '归档备份项目',
     'notification.channel.create': '创建通知渠道',
     'notification.channel.update': '更新通知渠道',
     'notification.channel.archive': '归档通知渠道',
@@ -167,18 +172,19 @@ export function sourceTypeLabel(type: SourceType): string {
 }
 
 export function sourceSummary(source: Project['sources'][number]): string {
+  const requirement = source.required ? '' : ' · 可选'
   if (source.type === 'files') {
     const paths = source.paths ?? []
     const visible = paths.slice(0, 2).join(', ')
-    return `文件 · ${visible || '未配置路径'}${paths.length > 2 ? ` +${paths.length - 2}` : ''}`
+    return `文件 · ${visible || '未配置路径'}${paths.length > 2 ? ` +${paths.length - 2}` : ''}${requirement}`
   }
   if (source.type === 'docker') {
     const containers = source.docker?.containers ?? []
-    return `Docker · ${containers.slice(0, 2).join(', ') || '未配置容器'}${containers.length > 2 ? ` +${containers.length - 2}` : ''}`
+    return `Docker · ${containers.slice(0, 2).join(', ') || '未配置容器'}${containers.length > 2 ? ` +${containers.length - 2}` : ''}${requirement}`
   }
   const database = source.database
-  if (!database) return sourceTypeLabel(source.type)
-  return `${sourceTypeLabel(source.type)} · ${database.database}@${database.host}:${database.port}`
+  if (!database) return sourceTypeLabel(source.type) + requirement
+  return `${sourceTypeLabel(source.type)} · ${database.database}@${database.host}:${database.port}${requirement}`
 }
 
 export function retentionSummary(project: Project): string {
@@ -269,13 +275,13 @@ export function statusLabel(status: string): string {
   const labels: Record<string, string> = {
     pending: '待注册', online: '在线', offline: '离线', running: '执行中',
     succeeded: '成功', partial: '部分成功', failed: '失败', timed_out: '超时',
-    canceled: '已取消', unknown: '状态未知',
+    canceled: '已取消', unknown: '状态未知', skipped: '已跳过',
   }
   return labels[status] ?? status
 }
 
 export function alertKindLabel(kind: string): string {
-  return kind === 'rpo_overdue' ? 'RPO 超时' : kind === 'backup_failure' ? '备份失败' : kind
+  return kind === 'rpo_overdue' ? 'RPO 超时' : kind === 'backup_failure' ? '备份失败' : kind === 'agent_offline' ? 'Agent 离线' : kind === 'config_error' ? '配置降级' : kind
 }
 
 export function notificationTransitionLabel(transition: string): string {

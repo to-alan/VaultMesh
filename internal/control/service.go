@@ -11,6 +11,7 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,6 +32,7 @@ type Service struct {
 	sealer             *secret.Sealer
 	now                func() time.Time
 	notificationSender notificationSender
+	dataRetention      domain.DataRetention
 }
 
 func NewService(dataStore store.Store, sealer *secret.Sealer) *Service {
@@ -39,6 +41,13 @@ func NewService(dataStore store.Store, sealer *secret.Sealer) *Service {
 		now:                func() time.Time { return time.Now().UTC() },
 		notificationSender: sendNotification,
 	}
+}
+
+// SetDataRetention configures how long finished runs, completed commands,
+// resolved incidents, delivery history, and audit events are kept. Zero days
+// disables pruning for that scope.
+func (s *Service) SetDataRetention(retention domain.DataRetention) {
+	s.dataRetention = retention
 }
 
 func (s *Service) CreateServer(ctx context.Context, name string) (domain.EnrollmentResult, error) {
@@ -261,6 +270,67 @@ func (s *Service) SetProjectEnabled(ctx context.Context, projectID string, enabl
 	return publicProject(project, s.now()), nil
 }
 
+// ArchiveServer retires a server that is no longer backed up. The server is
+// hidden from the console, its agent credentials are revoked, and its offline
+// incidents are closed. Historical runs and audit events keep referencing it.
+func (s *Service) ArchiveServer(ctx context.Context, serverID string) (domain.Server, error) {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return domain.Server{}, validationError("server_id", "is required")
+	}
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return domain.Server{}, err
+	}
+	for _, project := range projects {
+		if project.ServerID == serverID {
+			return domain.Server{}, validationError("server_id", "archive its backup projects first")
+		}
+	}
+	server, err := s.store.ArchiveServer(ctx, serverID, s.now())
+	if err != nil {
+		return domain.Server{}, err
+	}
+	_ = s.reconcileAlert(ctx, "agent:"+serverID, nil)
+	_ = s.reconcileAlert(ctx, "config:"+serverID, nil)
+	return server, nil
+}
+
+// ArchiveProject removes a project from scheduling and agent delivery while
+// keeping its run history, snapshot index, and audit trail for evidence.
+func (s *Service) ArchiveProject(ctx context.Context, projectID string) (domain.Project, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return domain.Project{}, validationError("project_id", "is required")
+	}
+	project, err := s.store.ArchiveProject(ctx, projectID, s.now())
+	if err != nil {
+		return domain.Project{}, err
+	}
+	_ = s.reconcileAlert(ctx, "rpo:"+projectID, nil)
+	_ = s.reconcileAlert(ctx, "backup:"+projectID, nil)
+	return publicProject(project, s.now()), nil
+}
+
+// ArchiveRepository hides an unused storage channel. Repositories referenced
+// by active projects are rejected to protect the recovery chain.
+func (s *Service) ArchiveRepository(ctx context.Context, repositoryID string) (domain.Repository, error) {
+	repositoryID = strings.TrimSpace(repositoryID)
+	if repositoryID == "" {
+		return domain.Repository{}, validationError("repository_id", "is required")
+	}
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return domain.Repository{}, err
+	}
+	for _, project := range projects {
+		if project.RepositoryID == repositoryID {
+			return domain.Repository{}, validationError("repository_id", "is still used by active backup projects; archive them first")
+		}
+	}
+	return s.store.ArchiveRepository(ctx, repositoryID, s.now())
+}
+
 func (s *Service) ProjectHealth(ctx context.Context) ([]domain.ProjectHealth, error) {
 	projects, err := s.store.ListProjects(ctx)
 	if err != nil {
@@ -312,6 +382,11 @@ func (s *Service) ProjectHealth(ctx context.Context) ([]domain.ProjectHealth, er
 		deadline := expected.Add(time.Duration(project.Schedule.JitterSeconds+maxRuntimeSeconds+graceSeconds) * time.Second)
 		health.ExpectedAt = &expected
 		health.DeadlineAt = &deadline
+		// A backup that started for this slot and is still inside its execution
+		// window is reported as running. Past the deadline the run report can no
+		// longer be trusted, so health escalates back to late/overdue.
+		running := now.Before(deadline) && item.LatestRunStatus == domain.RunRunning &&
+			item.LatestRunAt != nil && !item.LatestRunAt.Before(expected)
 		switch {
 		case now.Before(expected):
 			if item.LastSuccessfulAt == nil {
@@ -319,6 +394,8 @@ func (s *Service) ProjectHealth(ctx context.Context) ([]domain.ProjectHealth, er
 			} else {
 				health.Status = "healthy"
 			}
+		case running:
+			health.Status = "running"
 		case now.Before(deadline):
 			health.Status = "late"
 		default:
@@ -354,42 +431,88 @@ func (s *Service) DesiredConfig(ctx context.Context, serverID string) (domain.Ag
 	if err != nil {
 		return domain.AgentConfig{}, err
 	}
-	for index := range config.Projects {
-		repository := &config.Projects[index].Repository
-		plaintext, err := s.sealer.Open(repository.SecretCiphertext)
-		if err != nil {
-			return domain.AgentConfig{}, fmt.Errorf("decrypt repository %s: %w", repository.ID, err)
+	degraded := make([]domain.DegradedProject, 0)
+	projects := make([]domain.AgentProject, 0, len(config.Projects))
+	for _, project := range config.Projects {
+		if reason := s.decryptProjectSecrets(&project); reason != "" {
+			degraded = append(degraded, domain.DegradedProject{
+				ProjectID: project.ID, ProjectName: project.Name, Reason: reason,
+			})
+			continue
 		}
-		var payload struct {
-			Password    string            `json:"password"`
-			Environment map[string]string `json:"environment"`
-			Options     map[string]string `json:"options,omitempty"`
-		}
-		if err := json.Unmarshal(plaintext, &payload); err != nil {
-			return domain.AgentConfig{}, fmt.Errorf("decode repository secret %s: %w", repository.ID, err)
-		}
-		repository.Password = payload.Password
-		repository.Environment = payload.Environment
-		repository.Options = payload.Options
-		repository.SecretCiphertext = nil
-		repository.URL = strings.TrimRight(repository.URL, "/") + "/" + serverID
-		for sourceIndex := range config.Projects[index].Sources {
-			source := &config.Projects[index].Sources[sourceIndex]
-			if source.SecretCiphertext == "" {
-				continue
-			}
-			password, err := s.sealer.Open([]byte(source.SecretCiphertext))
-			if err != nil {
-				return domain.AgentConfig{}, fmt.Errorf("decrypt source %s: %w", source.ID, err)
-			}
-			if source.Database == nil {
-				return domain.AgentConfig{}, fmt.Errorf("source %s has a secret but no database configuration", source.ID)
-			}
-			source.Database.Password = string(password)
-			source.SecretCiphertext = ""
-		}
+		projects = append(projects, project)
 	}
+	config.Projects = projects
+	config.DegradedProjects = degraded
+	// Surface a server-scoped alert so credential loss is visible even when
+	// the Agent itself never reports a failure. Best-effort: a notification
+	// failure must not block the configuration delivery.
+	_ = s.reconcileConfigDegradation(ctx, serverID, config.Revision, degraded)
 	return config, nil
+}
+
+// decryptProjectSecrets unseals the repository credentials and database
+// passwords for one project. It returns a human-readable reason when the
+// project must be dropped from the agent configuration.
+func (s *Service) decryptProjectSecrets(project *domain.AgentProject) string {
+	repository := &project.Repository
+	plaintext, err := s.sealer.Open(repository.SecretCiphertext)
+	if err != nil {
+		return "repository credentials cannot be decrypted: " + err.Error()
+	}
+	var payload struct {
+		Password    string            `json:"password"`
+		Environment map[string]string `json:"environment"`
+		Options     map[string]string `json:"options,omitempty"`
+	}
+	if err := json.Unmarshal(plaintext, &payload); err != nil {
+		return "repository credentials cannot be decoded: " + err.Error()
+	}
+	repository.Password = payload.Password
+	repository.Environment = payload.Environment
+	repository.Options = payload.Options
+	repository.SecretCiphertext = nil
+	repository.URL = strings.TrimRight(repository.URL, "/") + "/" + project.ServerID
+	for sourceIndex := range project.Sources {
+		source := &project.Sources[sourceIndex]
+		if source.SecretCiphertext == "" {
+			continue
+		}
+		password, err := s.sealer.Open([]byte(source.SecretCiphertext))
+		if err != nil {
+			return "database credentials cannot be decrypted: " + err.Error()
+		}
+		if source.Database == nil {
+			return "source has a secret but no database configuration"
+		}
+		source.Database.Password = string(password)
+		source.SecretCiphertext = ""
+	}
+	return ""
+}
+
+// reconcileConfigDegradation keeps one firing incident per server while any
+// project secret cannot be unsealed, and resolves it once decryption recovers.
+func (s *Service) reconcileConfigDegradation(ctx context.Context, serverID string, revision int64, degraded []domain.DegradedProject) error {
+	if len(degraded) == 0 {
+		return s.reconcileAlert(ctx, "config:"+serverID, nil)
+	}
+	names := make([]string, 0, len(degraded))
+	ids := make([]string, 0, len(degraded))
+	for _, item := range degraded {
+		names = append(names, fmt.Sprintf("%s (%s)", item.ProjectName, item.ProjectID))
+		ids = append(ids, item.ProjectID)
+	}
+	sort.Strings(ids)
+	sort.Strings(names)
+	condition := &alertCondition{
+		Kind: "config_error", ResourceType: "server", ResourceID: serverID,
+		SourceEventID: fmt.Sprintf("rev%d:%s", revision, strings.Join(ids, ",")),
+		Severity:      "critical",
+		Summary:       "Agent 配置降级",
+		Description:   "以下项目的仓库或数据源凭据无法解密，已从下发给该 Agent 的配置中移除：" + strings.Join(names, "、") + "。请检查 VAULTMESH_MASTER_KEY 是否与加密时一致。",
+	}
+	return s.reconcileAlert(ctx, "config:"+serverID, condition)
 }
 
 func (s *Service) CreateManualRun(ctx context.Context, projectID string) (domain.Command, error) {

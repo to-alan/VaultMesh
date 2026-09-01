@@ -232,6 +232,93 @@ func TestPausingProjectResolvesActiveBackupAlerts(t *testing.T) {
 	}
 }
 
+func TestAgentOfflineAlertUsesServerRoutingAndSendsRecovery(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{24}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	current := time.Now().UTC()
+	service.now = func() time.Time { return current }
+	enrollment, err := service.CreateServer(ctx, "Primary Agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "primary-agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherEnrollment, err := service.CreateServer(ctx, "Other Agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	matching, err := service.CreateNotificationChannel(ctx, domain.NotificationChannel{
+		Name: "Primary Agent alerts", Type: "webhook", Enabled: true, SendResolved: true,
+		RepeatIntervalSeconds: 3600, EventTypes: []string{"agent_offline"}, ServerIDs: []string{identity.AgentID},
+		Config: map[string]string{"url": "https://alerts.example.com/primary"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreateNotificationChannel(ctx, domain.NotificationChannel{
+		Name: "Other Agent alerts", Type: "webhook", Enabled: true, SendResolved: true,
+		RepeatIntervalSeconds: 3600, EventTypes: []string{"agent_offline"}, ServerIDs: []string{otherEnrollment.Server.ID},
+		Config: map[string]string{"url": "https://alerts.example.com/other"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	type deliveredTransition struct {
+		channelID, transition string
+		alert                 domain.AlertIncident
+	}
+	var delivered []deliveredTransition
+	service.notificationSender = func(_ context.Context, channel domain.NotificationChannel, _ map[string]string, alert domain.AlertIncident, transition string) error {
+		delivered = append(delivered, deliveredTransition{channelID: channel.ID, transition: transition, alert: alert})
+		return nil
+	}
+	lastSeen := time.Now().UTC().Add(-domain.AgentOfflineAfter - time.Second)
+	if err := dataStore.UpdateHeartbeat(ctx, identity.AgentID, domain.Heartbeat{AgentInfo: domain.AgentInfo{Hostname: "primary-agent"}}, lastSeen); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.EvaluateAlerts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DeliverNotifications(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(delivered) != 1 || delivered[0].channelID != matching.ID || delivered[0].transition != "firing" {
+		t.Fatalf("unexpected offline routing: %#v", delivered)
+	}
+	alert := delivered[0].alert
+	if alert.Kind != "agent_offline" || alert.ResourceType != "server" || alert.ResourceID != identity.AgentID || alert.ResourceName != "Primary Agent" {
+		t.Fatalf("unexpected Agent incident: %#v", alert)
+	}
+	if alert.ProjectID != "" || alert.ProjectName != "" {
+		t.Fatalf("server incident was forced into project scope: %#v", alert)
+	}
+
+	current = current.Add(time.Minute)
+	if err := dataStore.UpdateHeartbeat(ctx, identity.AgentID, domain.Heartbeat{AgentInfo: domain.AgentInfo{Hostname: "primary-agent"}}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.EvaluateAlerts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DeliverNotifications(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(delivered) != 2 || delivered[1].channelID != matching.ID || delivered[1].transition != "resolved" {
+		t.Fatalf("Agent recovery notification missing: %#v", delivered)
+	}
+	incidents, err := dataStore.ListAlertIncidents(ctx, 10)
+	if err != nil || len(incidents) != 1 || incidents[0].Status != "resolved" {
+		t.Fatalf("unexpected Agent incident history: %#v err=%v", incidents, err)
+	}
+}
+
 func TestNotificationChannelRejectsUnknownConfigFields(t *testing.T) {
 	sealer, err := secret.New(bytes.Repeat([]byte{22}, 32))
 	if err != nil {
@@ -247,6 +334,23 @@ func TestNotificationChannelRejectsUnknownConfigFields(t *testing.T) {
 	var validation *ValidationError
 	if !errors.As(err, &validation) || validation.Field != "config.api_key" {
 		t.Fatalf("unknown notification field was not rejected safely: %v", err)
+	}
+}
+
+func TestNotificationChannelRejectsUnknownServerRoute(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{25}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(memory.New(), sealer)
+	_, err = service.CreateNotificationChannel(context.Background(), domain.NotificationChannel{
+		Name: "Unknown server route", Type: "webhook", Enabled: true,
+		EventTypes: []string{"agent_offline"}, ServerIDs: []string{"srv_missing"},
+		Config: map[string]string{"url": "https://alerts.example.com/hook"},
+	})
+	var validation *ValidationError
+	if !errors.As(err, &validation) || validation.Field != "server_ids" {
+		t.Fatalf("unknown server route was not rejected: %v", err)
 	}
 }
 

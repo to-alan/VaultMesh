@@ -14,9 +14,12 @@ const (
 	RunCanceled  = "canceled"
 	RunTimedOut  = "timed_out"
 	RunUnknown   = "unknown"
+	RunSkipped   = "skipped"
 
 	AuditSucceeded = "succeeded"
 	AuditFailed    = "failed"
+
+	AgentOfflineAfter = 90 * time.Second
 )
 
 type Server struct {
@@ -30,6 +33,7 @@ type Server struct {
 	LastSeenAt      *time.Time `json:"last_seen_at,omitempty"`
 	DesiredRevision int64      `json:"desired_revision"`
 	AppliedRevision int64      `json:"applied_revision"`
+	ArchivedAt      *time.Time `json:"archived_at,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 }
 
@@ -42,6 +46,7 @@ type Repository struct {
 	Environment      map[string]string `json:"environment,omitempty"`
 	Options          map[string]string `json:"options,omitempty"`
 	SecretCiphertext []byte            `json:"-"`
+	ArchivedAt       *time.Time        `json:"archived_at,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
 }
 
@@ -139,6 +144,7 @@ type Project struct {
 	Policy       ProjectPolicy `json:"policy"`
 	Revision     int64         `json:"revision"`
 	NextRunAt    *time.Time    `json:"next_run_at,omitempty"`
+	ArchivedAt   *time.Time    `json:"archived_at,omitempty"`
 	CreatedAt    time.Time     `json:"created_at"`
 	UpdatedAt    time.Time     `json:"updated_at"`
 }
@@ -148,9 +154,49 @@ type AgentProject struct {
 	Repository Repository `json:"repository"`
 }
 
+// RetentionScope selects which control-plane table a PruneBefore call
+// removes expired rows from.
+type RetentionScope string
+
+const (
+	RetentionRuns       RetentionScope = "runs"
+	RetentionCommands   RetentionScope = "commands"
+	RetentionDeliveries RetentionScope = "notification_deliveries"
+	RetentionIncidents  RetentionScope = "alert_incidents"
+	RetentionAudit      RetentionScope = "audit_events"
+)
+
+// DataRetention controls per-scope pruning of finished control-plane facts.
+// A scope with zero or negative days is never pruned.
+type DataRetention struct {
+	RunsDays        int
+	CommandsDays    int
+	DeliveriesDays  int
+	IncidentsDays   int
+	AuditEventsDays int
+}
+
+// Enabled reports whether any retention scope will prune rows.
+func (r DataRetention) Enabled() bool {
+	return r.RunsDays > 0 || r.CommandsDays > 0 || r.DeliveriesDays > 0 ||
+		r.IncidentsDays > 0 || r.AuditEventsDays > 0
+}
+
+// DegradedProject describes a project that was dropped from an agent
+// configuration because its repository or database secrets cannot be
+// unsealed with the current master key.
+type DegradedProject struct {
+	ProjectID   string `json:"project_id"`
+	ProjectName string `json:"project_name"`
+	Reason      string `json:"reason"`
+}
+
 type AgentConfig struct {
 	Revision int64          `json:"revision"`
 	Projects []AgentProject `json:"projects"`
+	// DegradedProjects lists projects that were omitted because their secrets
+	// could not be decrypted. Non-empty only on master-key incidents.
+	DegradedProjects []DegradedProject `json:"degraded_projects,omitempty"`
 }
 
 type EnrollmentResult struct {
@@ -249,6 +295,7 @@ type NotificationChannel struct {
 	RepeatIntervalSeconds int               `json:"repeat_interval_seconds"`
 	EventTypes            []string          `json:"event_types"`
 	ProjectIDs            []string          `json:"project_ids,omitempty"`
+	ServerIDs             []string          `json:"server_ids,omitempty"`
 	Config                map[string]string `json:"config,omitempty"`
 	Destination           string            `json:"destination,omitempty"`
 	Configured            bool              `json:"configured"`
@@ -262,8 +309,11 @@ type AlertIncident struct {
 	ID              string     `json:"id"`
 	Fingerprint     string     `json:"fingerprint"`
 	Kind            string     `json:"kind"`
-	ProjectID       string     `json:"project_id"`
-	ProjectName     string     `json:"project_name"`
+	ResourceType    string     `json:"resource_type"`
+	ResourceID      string     `json:"resource_id"`
+	ResourceName    string     `json:"resource_name"`
+	ProjectID       string     `json:"project_id,omitempty"`
+	ProjectName     string     `json:"project_name,omitempty"`
 	Status          string     `json:"status"`
 	Severity        string     `json:"severity"`
 	Summary         string     `json:"summary"`

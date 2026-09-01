@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,6 +16,15 @@ import (
 	"github.com/to-alan/vaultmesh/internal/agent"
 	"github.com/to-alan/vaultmesh/internal/domain"
 	"github.com/to-alan/vaultmesh/internal/version"
+)
+
+const (
+	// Loop intervals stay in the same range as the previous fixed tickers, but
+	// every cycle adds up to 1/6 of the interval as random jitter so a fleet
+	// of agents never fires in lockstep against the control plane.
+	syncInterval    = 30 * time.Second
+	reportInterval  = 10 * time.Second
+	commandInterval = 10 * time.Second
 )
 
 func main() {
@@ -33,6 +42,7 @@ func main() {
 	dockerPath := flag.String("docker", envOr("VAULTMESH_DOCKER_PATH", "docker"), "path to the Docker CLI executable")
 	stagingRoot := flag.String("staging-root", os.Getenv("VAULTMESH_STAGING_ROOT"), "parent directory for protected temporary database dumps")
 	restoreRoot := flag.String("restore-root", envOr("VAULTMESH_RESTORE_ROOT", defaultRestoreRoot()), "directory for isolated restore jobs")
+	acceptRollback := flag.Bool("accept-rollback", os.Getenv("VAULTMESH_ACCEPT_ROLLBACK") == "true", "allow the next configuration to move to a lower revision after a control-plane restore")
 	flag.Parse()
 	if strings.TrimSpace(*serverURL) == "" {
 		logger.Error("control plane URL is required", "flag", "--server")
@@ -47,6 +57,10 @@ func main() {
 	if err != nil {
 		logger.Error("open agent state", "error", err)
 		os.Exit(1)
+	}
+	if rejected := state.RejectedReports(); len(rejected) > 0 {
+		logger.Warn("agent state contains quarantined run reports",
+			"count", len(rejected), "latest_run_id", rejected[0].Report.ID)
 	}
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -79,6 +93,10 @@ func main() {
 		logger.Info("agent enrolled", "agent_id", identity.AgentID)
 	}
 
+	if *acceptRollback {
+		state.AcceptRollback()
+		logger.Warn("configuration rollback accepted once; pass this flag only while recovering a restored control plane")
+	}
 	runner := agent.NewRunnerWithTools(*resticPath, *mysqlDumpPath, *pgDumpPath, *dockerPath, *stagingRoot).SetRestoreRoot(*restoreRoot)
 	manager := agent.NewManager(state, runner, identity, logger)
 	if cached := state.Config(); cached.Revision > 0 || len(cached.Projects) > 0 {
@@ -91,33 +109,90 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	syncConfig(ctx, client, state, manager, identity, logger)
-	sendHeartbeat(ctx, client, state, identity, info, logger)
-	flushReports(ctx, client, state, identity, logger)
-	fetchCommands(ctx, client, manager, identity, logger)
 
-	configTicker := time.NewTicker(30 * time.Second)
-	heartbeatTicker := time.NewTicker(30 * time.Second)
-	reportTicker := time.NewTicker(10 * time.Second)
-	commandTicker := time.NewTicker(10 * time.Second)
-	defer configTicker.Stop()
-	defer heartbeatTicker.Stop()
-	defer reportTicker.Stop()
-	defer commandTicker.Stop()
+	// One merged round trip per interval: the heartbeat carries the applied
+	// revision and the response delivers a new configuration when the agent
+	// lags behind. Each loop adds per-cycle jitter so a fleet of agents never
+	// fires in lockstep against the control plane.
+	sync := func() { syncAgent(ctx, client, state, manager, identity, logger) }
+	reports := func() { flushReports(ctx, client, state, identity, logger) }
+	inventories := func() { flushSnapshotInventories(ctx, client, state, identity, logger) }
+	commands := func() { fetchCommands(ctx, client, manager, identity, logger) }
+
 	logger.Info("VaultMesh agent started", "agent_id", identity.AgentID, "version", version.Version)
+	go loop(ctx, syncInterval, sync)
+	go loop(ctx, reportInterval, reports)
+	go loop(ctx, reportInterval, inventories)
+	go loop(ctx, commandInterval, commands)
+
+	<-ctx.Done()
+	manager.Stop()
+	logger.Info("VaultMesh agent stopped")
+}
+
+// loop runs task immediately and then waits a jittered interval between
+// invocations until the context is canceled. The jitter spreads recurring
+// requests so agents restarted together do not synchronize into a thundering
+// herd against the control plane.
+func loop(ctx context.Context, interval time.Duration, task func()) {
+	task()
 	for {
+		delay := jitteredInterval(interval)
 		select {
 		case <-ctx.Done():
-			logger.Info("VaultMesh agent stopped")
 			return
-		case <-configTicker.C:
-			syncConfig(ctx, client, state, manager, identity, logger)
-		case <-heartbeatTicker.C:
-			sendHeartbeat(ctx, client, state, identity, info, logger)
-		case <-reportTicker.C:
-			flushReports(ctx, client, state, identity, logger)
-		case <-commandTicker.C:
-			fetchCommands(ctx, client, manager, identity, logger)
+		case <-time.After(delay):
+		}
+		task()
+	}
+}
+
+func jitteredInterval(interval time.Duration) time.Duration {
+	maxJitter := int64(interval / 6)
+	return interval + time.Duration(rand.Int64N(maxJitter+1))
+}
+
+func syncAgent(ctx context.Context, client *agent.Client, state *agent.StateStore, manager *agent.Manager, identity domain.AgentIdentity, logger *slog.Logger) {
+	heartbeat := domain.Heartbeat{AgentInfo: agentInfo(), AppliedRevision: state.Config().Revision}
+	config, changed, err := client.Sync(ctx, identity.Token, heartbeat)
+	if err != nil {
+		logger.Warn("heartbeat and configuration sync", "error", err)
+		return
+	}
+	if !changed {
+		return
+	}
+	for _, degraded := range config.DegradedProjects {
+		logger.Warn("control plane omitted a project from this configuration",
+			"project_id", degraded.ProjectID, "project_name", degraded.ProjectName, "reason", degraded.Reason)
+	}
+	if err := manager.Apply(config); err != nil {
+		logger.Error("reject invalid configuration", "revision", config.Revision, "error", err)
+	}
+}
+
+func agentInfo() domain.AgentInfo {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = ""
+	}
+	return domain.AgentInfo{
+		Hostname:     hostname,
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
+		AgentVersion: version.Version,
+	}
+}
+
+func flushSnapshotInventories(ctx context.Context, client *agent.Client, state *agent.StateStore, identity domain.AgentIdentity, logger *slog.Logger) {
+	for _, inventory := range state.PendingSnapshotInventories() {
+		if err := client.ReportSnapshots(ctx, identity.Token, inventory.ProjectID, inventory.Snapshots); err != nil {
+			logger.Warn("report snapshot inventory", "project_id", inventory.ProjectID, "error", err)
+			return
+		}
+		if err := state.AckSnapshotInventory(inventory.ProjectID); err != nil {
+			logger.Error("acknowledge snapshot inventory", "project_id", inventory.ProjectID, "error", err)
+			return
 		}
 	}
 }
@@ -141,31 +216,17 @@ func fetchCommands(ctx context.Context, client *agent.Client, manager *agent.Man
 	}
 }
 
-func syncConfig(ctx context.Context, client *agent.Client, state *agent.StateStore, manager *agent.Manager, identity domain.AgentIdentity, logger *slog.Logger) {
-	revision := state.Config().Revision
-	config, err := client.Config(ctx, identity.Token, revision)
-	if errors.Is(err, agent.ErrNotModified) {
-		return
-	}
-	if err != nil {
-		logger.Warn("synchronize configuration", "error", err)
-		return
-	}
-	if err := manager.Apply(config); err != nil {
-		logger.Error("reject invalid configuration", "revision", config.Revision, "error", err)
-	}
-}
-
-func sendHeartbeat(ctx context.Context, client *agent.Client, state *agent.StateStore, identity domain.AgentIdentity, info domain.AgentInfo, logger *slog.Logger) {
-	heartbeat := domain.Heartbeat{AgentInfo: info, AppliedRevision: state.Config().Revision}
-	if err := client.Heartbeat(ctx, identity.Token, heartbeat); err != nil {
-		logger.Warn("send heartbeat", "error", err)
-	}
-}
-
 func flushReports(ctx context.Context, client *agent.Client, state *agent.StateStore, identity domain.AgentIdentity, logger *slog.Logger) {
 	for _, report := range state.PendingReports() {
 		if err := client.Report(ctx, identity.Token, report); err != nil {
+			if agent.IsPermanentReportError(err) {
+				if quarantineErr := state.QuarantineReport(report.ID, err.Error(), time.Now().UTC()); quarantineErr != nil {
+					logger.Error("quarantine rejected run report", "run_id", report.ID, "error", quarantineErr)
+					return
+				}
+				logger.Error("run report permanently rejected and quarantined", "run_id", report.ID, "error", err)
+				continue
+			}
 			logger.Warn("report backup run", "run_id", report.ID, "error", err)
 			return
 		}

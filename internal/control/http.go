@@ -24,6 +24,13 @@ const (
 	maxRunKeyLength    = 512
 	maxRunErrorLength  = 16 << 10
 	maxRunErrorCodeLen = 128
+
+	// Snapshot inventories are reported through a dedicated endpoint and are
+	// bounded independently of the general run report body.
+	maxSnapshotInventoryEntries = 10000
+	// 10000 entries require roughly 6 MiB of JSON; the extra headroom absorbs
+	// tags and paths while staying far below any realistic DoS surface.
+	maxSnapshotInventoryBody = 16 << 20
 )
 
 type HTTPServer struct {
@@ -37,6 +44,13 @@ type HTTPServer struct {
 }
 
 type agentContextKey struct{}
+
+type reportClockSkewError struct {
+	message    string
+	retryAfter time.Duration
+}
+
+func (e *reportClockSkewError) Error() string { return e.message }
 
 func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthConfig, allowedOrigins []string) (*HTTPServer, error) {
 	adminAuth, err := newAdminAuthenticator(context.Background(), service, adminConfig)
@@ -83,12 +97,15 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("GET /api/v1/dashboard", s.admin(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /api/v1/servers", s.admin(http.HandlerFunc(s.listServers)))
 	mux.Handle("POST /api/v1/servers", s.admin(http.HandlerFunc(s.createServer)))
+	mux.Handle("DELETE /api/v1/servers/{serverID}", s.admin(http.HandlerFunc(s.archiveServer)))
 	mux.Handle("GET /api/v1/repositories", s.admin(http.HandlerFunc(s.listRepositories)))
 	mux.Handle("POST /api/v1/repositories", s.admin(http.HandlerFunc(s.createRepository)))
+	mux.Handle("DELETE /api/v1/repositories/{repositoryID}", s.admin(http.HandlerFunc(s.archiveRepository)))
 	mux.Handle("GET /api/v1/projects", s.admin(http.HandlerFunc(s.listProjects)))
 	mux.Handle("POST /api/v1/projects", s.admin(http.HandlerFunc(s.createProject)))
 	mux.Handle("PUT /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.replaceProject)))
 	mux.Handle("PATCH /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.updateProject)))
+	mux.Handle("DELETE /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.archiveProject)))
 	mux.Handle("GET /api/v1/project-health", s.admin(http.HandlerFunc(s.listProjectHealth)))
 	mux.Handle("POST /api/v1/projects/{projectID}/run", s.admin(http.HandlerFunc(s.createManualRun)))
 	mux.Handle("POST /api/v1/projects/{projectID}/retention-preview", s.admin(http.HandlerFunc(s.createRetentionPreview)))
@@ -113,6 +130,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("GET /api/v1/agent/config", s.agent(http.HandlerFunc(s.agentConfig)))
 	mux.Handle("GET /api/v1/agent/commands", s.agent(http.HandlerFunc(s.agentCommands)))
 	mux.Handle("POST /api/v1/agent/runs", s.agent(http.HandlerFunc(s.agentRun)))
+	mux.Handle("PUT /api/v1/agent/snapshots", s.agent(http.HandlerFunc(s.agentSnapshots)))
 
 	mux.HandleFunc("/", s.notFound)
 	return s.securityHeaders(s.cors(s.logging(mux)))
@@ -249,6 +267,36 @@ func (s *HTTPServer) listServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *HTTPServer) archiveServer(w http.ResponseWriter, r *http.Request) {
+	server, err := s.service.ArchiveServer(r.Context(), r.PathValue("serverID"))
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, server.ID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *HTTPServer) archiveRepository(w http.ResponseWriter, r *http.Request) {
+	repository, err := s.service.ArchiveRepository(r.Context(), r.PathValue("repositoryID"))
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, repository.ID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *HTTPServer) archiveProject(w http.ResponseWriter, r *http.Request) {
+	project, err := s.service.ArchiveProject(r.Context(), r.PathValue("projectID"))
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, project.ID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *HTTPServer) enrollAgent(w http.ResponseWriter, r *http.Request) {
@@ -593,6 +641,18 @@ func (s *HTTPServer) agentHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.handleServiceError(w, err)
 		return
 	}
+	// Merge configuration delivery into the heartbeat so each agent needs one
+	// control-plane round trip per interval. A lagging revision triggers the
+	// full config; otherwise the response stays empty.
+	if heartbeat.AppliedRevision < server.DesiredRevision {
+		config, err := s.service.DesiredConfig(r.Context(), server.ID)
+		if err != nil {
+			s.handleServiceError(w, err)
+			return
+		}
+		s.writeJSON(w, http.StatusOK, map[string]any{"config": config})
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -629,6 +689,16 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 	}
 	receivedAt := s.service.now()
 	if err := validateRunReport(report, receivedAt); err != nil {
+		var clockSkew *reportClockSkewError
+		if errors.As(err, &clockSkew) {
+			retryAfter := (clockSkew.retryAfter + time.Second - 1) / time.Second
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			w.Header().Set("Retry-After", strconv.FormatInt(int64(retryAfter), 10))
+			s.writeError(w, http.StatusBadRequest, "agent_clock_ahead", err.Error(), nil)
+			return
+		}
 		s.writeError(w, http.StatusBadRequest, "validation_failed", err.Error(), nil)
 		return
 	}
@@ -638,6 +708,11 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 		hasSnapshotInventory bool
 		snapshotSyncedAt     time.Time
 	)
+	// Legacy Agent releases deliver the snapshot inventory inline in the run
+	// report. The inventory is extracted, validated, and then stripped so the
+	// bulky index is never persisted inside run history. An oversized inventory
+	// must not poison an otherwise successful run: the report is accepted and
+	// only the inventory is dropped.
 	if report.Status == domain.RunSucceeded && report.Stats != nil {
 		if raw, ok := report.Stats["snapshots"]; ok {
 			encoded, err := json.Marshal(raw)
@@ -649,26 +724,27 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 				s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory is invalid", nil)
 				return
 			}
-			if len(snapshotInventory) > 10000 {
-				s.writeError(w, http.StatusRequestEntityTooLarge, "snapshot_inventory_too_large", "snapshot inventory contains too many entries", nil)
-				return
-			}
-			for index := range snapshotInventory {
-				snapshot := &snapshotInventory[index]
-				if !fullResticSnapshotID.MatchString(snapshot.ID) || snapshot.Time.IsZero() {
-					s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory contains an invalid ID or timestamp", nil)
-					return
-				}
-				snapshot.Protected = false
-				for _, tag := range snapshot.Tags {
-					if tag == protectedSnapshotTag {
-						snapshot.Protected = true
-						break
+			if len(snapshotInventory) > maxSnapshotInventoryEntries {
+				snapshotInventory = nil
+			} else {
+				for index := range snapshotInventory {
+					snapshot := &snapshotInventory[index]
+					if !fullResticSnapshotID.MatchString(snapshot.ID) || snapshot.Time.IsZero() {
+						s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory contains an invalid ID or timestamp", nil)
+						return
+					}
+					snapshot.Protected = false
+					for _, tag := range snapshot.Tags {
+						if tag == protectedSnapshotTag {
+							snapshot.Protected = true
+							break
+						}
 					}
 				}
+				hasSnapshotInventory = true
+				snapshotSyncedAt = snapshotSyncTime(report.FinishedAt, receivedAt)
 			}
-			hasSnapshotInventory = true
-			snapshotSyncedAt = snapshotSyncTime(report.FinishedAt, receivedAt)
+			delete(report.Stats, "snapshots")
 		}
 	}
 	if err := s.service.Store().UpsertRun(r.Context(), report); err != nil {
@@ -680,6 +756,59 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 			s.handleServiceError(w, err)
 			return
 		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// agentSnapshots receives the Restic snapshot index through a dedicated,
+// idempotent channel so an unbounded inventory can never reject or bloat an
+// otherwise immutable run report.
+func (s *HTTPServer) agentSnapshots(w http.ResponseWriter, r *http.Request) {
+	server := agentFromContext(r.Context())
+	var payload struct {
+		ProjectID string            `json:"project_id"`
+		Snapshots []domain.Snapshot `json:"snapshots"`
+	}
+	if !s.decodeJSONLimit(w, r, &payload, maxSnapshotInventoryBody) {
+		return
+	}
+	receivedAt := s.service.now()
+	projectID := strings.TrimSpace(payload.ProjectID)
+	if projectID == "" {
+		s.writeError(w, http.StatusBadRequest, "validation_failed", "project_id is required", nil)
+		return
+	}
+	if len(payload.Snapshots) > maxSnapshotInventoryEntries {
+		s.writeError(w, http.StatusRequestEntityTooLarge, "snapshot_inventory_too_large", "snapshot inventory contains too many entries", nil)
+		return
+	}
+	project, err := s.service.Store().GetProject(r.Context(), projectID)
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	if project.ServerID != server.ID {
+		s.writeError(w, http.StatusNotFound, "not_found", "project does not belong to this agent", nil)
+		return
+	}
+	for index := range payload.Snapshots {
+		snapshot := &payload.Snapshots[index]
+		if !fullResticSnapshotID.MatchString(snapshot.ID) || snapshot.Time.IsZero() {
+			s.writeError(w, http.StatusBadRequest, "validation_failed", "snapshot inventory contains an invalid ID or timestamp", nil)
+			return
+		}
+		snapshot.Protected = false
+		for _, tag := range snapshot.Tags {
+			if tag == protectedSnapshotTag {
+				snapshot.Protected = true
+				break
+			}
+		}
+	}
+	syncedAt := snapshotSyncTime(&receivedAt, receivedAt)
+	if err := s.service.Store().ReplaceProjectSnapshots(r.Context(), projectID, server.ID, payload.Snapshots, syncedAt); err != nil {
+		s.handleServiceError(w, err)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -786,7 +915,10 @@ func validateRunReport(report domain.RunReport, receivedAt time.Time) error {
 		return errors.New("run schedule time must not be after its start time")
 	}
 	if report.StartedAt.After(receivedAt.Add(maxAgentClockSkew)) {
-		return errors.New("run start time is too far in the future")
+		return &reportClockSkewError{
+			message:    "run start time is too far in the future",
+			retryAfter: report.StartedAt.Sub(receivedAt.Add(maxAgentClockSkew)),
+		}
 	}
 	if report.Status == domain.RunRunning {
 		if report.FinishedAt != nil {
@@ -801,7 +933,10 @@ func validateRunReport(report domain.RunReport, receivedAt time.Time) error {
 		return errors.New("run finish time must not be before its start time")
 	}
 	if report.FinishedAt.After(receivedAt.Add(maxAgentClockSkew)) {
-		return errors.New("run finish time is too far in the future")
+		return &reportClockSkewError{
+			message:    "run finish time is too far in the future",
+			retryAfter: report.FinishedAt.Sub(receivedAt.Add(maxAgentClockSkew)),
+		}
 	}
 	return nil
 }
@@ -909,12 +1044,19 @@ func setAuditResourceID(w http.ResponseWriter, resourceID string) {
 }
 
 func (s *HTTPServer) decodeJSON(w http.ResponseWriter, r *http.Request, output any) bool {
+	return s.decodeJSONLimit(w, r, output, maxRequestBody)
+}
+
+// decodeJSONLimit decodes a JSON body under an explicit size budget. Snapshot
+// inventories legitimately outweigh the general 1 MiB management-API envelope,
+// so the dedicated agent endpoint raises its own limit.
+func (s *HTTPServer) decodeJSONLimit(w http.ResponseWriter, r *http.Request, output any, limit int64) bool {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		s.writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "request content type must be application/json", nil)
 		return false
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(output); err != nil {
@@ -979,7 +1121,7 @@ func agentFromContext(ctx context.Context) domain.Server {
 func validRunStatus(status string) bool {
 	switch status {
 	case domain.RunRunning, domain.RunSucceeded, domain.RunPartial, domain.RunFailed,
-		domain.RunCanceled, domain.RunTimedOut, domain.RunUnknown:
+		domain.RunCanceled, domain.RunTimedOut, domain.RunUnknown, domain.RunSkipped:
 		return true
 	default:
 		return false

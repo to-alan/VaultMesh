@@ -152,8 +152,11 @@ const notificationForm = reactive({
   repeat_minutes: 240,
   backup_failure: true,
   rpo_overdue: true,
+  agent_offline: true,
+  config_error: true,
   allow_private_address: false,
   project_ids: [] as string[],
+  server_ids: [] as string[],
   config: notificationDefaults('webhook') as Record<string, string>,
 })
 
@@ -799,7 +802,8 @@ function resetNotificationForm() {
   editingNotificationID.value = ''
   Object.assign(notificationForm, {
     type: 'webhook', name: '', enabled: true, send_resolved: true, repeat_minutes: 240,
-    backup_failure: true, rpo_overdue: true, allow_private_address: false, project_ids: [], config: notificationDefaults('webhook'),
+    backup_failure: true, rpo_overdue: true, agent_offline: true, config_error: true, allow_private_address: false,
+    project_ids: [], server_ids: [], config: notificationDefaults('webhook'),
   })
 }
 
@@ -813,8 +817,11 @@ function editNotificationChannel(channel: NotificationChannel) {
     repeat_minutes: Math.round(channel.repeat_interval_seconds / 60),
     backup_failure: channel.event_types.includes('backup_failure'),
     rpo_overdue: channel.event_types.includes('rpo_overdue'),
+    agent_offline: channel.event_types.includes('agent_offline'),
+    config_error: channel.event_types.includes('config_error'),
     allow_private_address: channel.config?.allow_private_address === 'true',
     project_ids: [...(channel.project_ids ?? [])],
+    server_ids: [...(channel.server_ids ?? [])],
     config: { ...notificationDefaults(channel.type), ...(channel.config ?? {}) },
   })
   window.requestAnimationFrame(() => document.getElementById('notification-builder')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
@@ -825,6 +832,8 @@ async function saveNotificationChannel() {
     const eventTypes = [
       notificationForm.backup_failure ? 'backup_failure' : '',
       notificationForm.rpo_overdue ? 'rpo_overdue' : '',
+      notificationForm.agent_offline ? 'agent_offline' : '',
+      notificationForm.config_error ? 'config_error' : '',
     ].filter(Boolean) as NotificationChannelWriteInput['event_types']
     if (!eventTypes.length) throw new Error('至少选择一种告警事件。')
     const id = editingNotificationID.value
@@ -836,6 +845,7 @@ async function saveNotificationChannel() {
       repeat_interval_seconds: Number(notificationForm.repeat_minutes) * 60,
       event_types: eventTypes,
       project_ids: notificationForm.project_ids,
+      server_ids: notificationForm.server_ids,
       config: { ...notificationForm.config, allow_private_address: String(notificationForm.allow_private_address) },
     }
     if (id) await controlPlane.notifications.replaceChannel(id, input)
@@ -879,12 +889,18 @@ async function evaluateAlertsNow() {
   await perform(async () => {
     await controlPlane.notifications.evaluate()
     await Promise.all([loadNotificationData(), loadCoreData()])
-    success.value = '已重新评估运行事实和 RPO，并处理当前可投递消息。'
+    success.value = '已重新评估运行事实、RPO 和 Agent 心跳，并处理当前可投递消息。'
   })
 }
 
 function notificationTypeLabel(type: string): string {
   return notificationProvider(type).label
+}
+
+function notificationRoutingLabel(channel: NotificationChannel): string {
+  const projects = channel.project_ids?.length ? `${channel.project_ids.length} 项目` : '全部项目'
+  const servers = channel.server_ids?.length ? `${channel.server_ids.length} 服务器` : '全部服务器'
+  return `${projects} · ${servers}`
 }
 
 async function saveProject() {
@@ -1046,6 +1062,35 @@ async function toggleProject(project: Project) {
     await controlPlane.projects.setEnabled(project.id, enabled)
     await loadCoreData()
     success.value = enabled ? `${project.name} 已恢复，Agent 将重新加载执行计划。` : `${project.name} 已暂停，不再接受计划或手动备份。`
+  })
+}
+
+async function archiveProject(project: Project) {
+  if (!window.confirm(`归档项目“${project.name}”？归档后停止调度并从 Agent 配置移除，历史运行与快照索引会保留。`)) return
+  await perform(async () => {
+    await controlPlane.projects.archive(project.id)
+    await loadCoreData()
+    await loadTabData(activeTab.value, true)
+    success.value = `${project.name} 已归档。运行历史与审计记录保留，可在数据库中追溯。`
+  })
+}
+
+async function archiveServer(server: Server) {
+  if (!window.confirm(`归档服务器“${server.name}”？归档后其 Agent 凭据将被吊销，服务器从控制台隐藏，历史记录保留。`)) return
+  await perform(async () => {
+    await controlPlane.servers.archive(server.id)
+    await loadCoreData()
+    await loadTabData(activeTab.value, true)
+    success.value = `${server.name} 已归档。运行历史与审计记录保留，可在数据库中追溯。`
+  })
+}
+
+async function archiveRepository(repository: Repository) {
+  if (!window.confirm(`归档仓库“${repository.name}”？归档后不可再被项目选择，历史记录保留。`)) return
+  await perform(async () => {
+    await controlPlane.repositories.archive(repository.id)
+    await loadCoreData()
+    success.value = `${repository.name} 已归档。运行历史与审计记录保留，可在数据库中追溯。`
   })
 }
 
@@ -1369,8 +1414,8 @@ onBeforeUnmount(() => {
           <section class="panel">
             <div class="panel-heading"><div><p class="eyebrow">AGENTS</p><h2>已接入服务器</h2></div></div>
             <div v-if="!servers.length" class="empty-state">还没有服务器。</div>
-            <div v-else class="table-wrap"><table><thead><tr><th>名称</th><th>状态</th><th>主机</th><th>版本</th><th>配置</th><th>最后心跳</th></tr></thead><tbody>
-              <tr v-for="server in servers" :key="server.id"><td><strong>{{ server.name }}</strong><small>{{ server.id }}</small></td><td><span class="status-pill" :class="server.status">{{ statusLabel(server.status) }}</span></td><td>{{ server.hostname || '—' }}<small>{{ server.os }} {{ server.arch }}</small></td><td>{{ server.agent_version || '—' }}</td><td>{{ server.applied_revision }}/{{ server.desired_revision }}</td><td>{{ formatDate(server.last_seen_at) }}</td></tr>
+            <div v-else class="table-wrap"><table><thead><tr><th>名称</th><th>状态</th><th>主机</th><th>版本</th><th>配置</th><th>最后心跳</th><th>操作</th></tr></thead><tbody>
+              <tr v-for="server in servers" :key="server.id"><td><strong>{{ server.name }}</strong><small>{{ server.id }}</small></td><td><span class="status-pill" :class="server.status">{{ statusLabel(server.status) }}</span></td><td>{{ server.hostname || '—' }}<small>{{ server.os }} {{ server.arch }}</small></td><td>{{ server.agent_version || '—' }}</td><td>{{ server.applied_revision }}/{{ server.desired_revision }}</td><td>{{ formatDate(server.last_seen_at) }}</td><td><button type="button" class="text-button danger-text" :disabled="loading" @click="archiveServer(server)">归档</button></td></tr>
             </tbody></table></div>
           </section>
           <aside class="panel form-panel">
@@ -1400,7 +1445,7 @@ onBeforeUnmount(() => {
           <section class="panel">
             <div class="panel-heading"><div><p class="eyebrow">STORAGE CHANNELS</p><h2>独立备份仓库</h2></div><span class="sample-size">{{ repositories.length }} CHANNELS</span></div>
             <div v-if="!repositories.length" class="empty-state">尚未配置仓库。</div>
-            <div v-else class="card-list"><article v-for="repository in repositories" :key="repository.id" class="data-card repository-card"><div><strong>{{ repository.name }}</strong><small>{{ providerLabel(repository.provider) }} · 被 {{ repositoryUsageCount(repository.id) }} 个项目使用</small></div><span class="status-pill online">全局渠道</span><code>{{ repository.url }}</code></article></div>
+            <div v-else class="card-list"><article v-for="repository in repositories" :key="repository.id" class="data-card repository-card"><div><strong>{{ repository.name }}</strong><small>{{ providerLabel(repository.provider) }} · 被 {{ repositoryUsageCount(repository.id) }} 个项目使用</small></div><span class="status-pill online">全局渠道</span><code>{{ repository.url }}</code><button type="button" class="text-button danger-text" :disabled="loading" @click="archiveRepository(repository)">归档</button></article></div>
           </section>
           <aside class="panel form-panel wide-form"><p class="eyebrow">NEW STORAGE CHANNEL</p><h2>添加备份仓库</h2><p class="form-intro">仓库是全局存储渠道，不绑定服务器。创建项目时再选择由哪个 Agent 写入。</p>
             <form @submit.prevent="createRepository">
@@ -1442,7 +1487,7 @@ onBeforeUnmount(() => {
               <article v-for="project in group.projects" :key="project.id" class="project-card" :class="{ 'project-disabled': !project.enabled }">
                 <div class="project-top">
                   <div><strong>{{ project.name }}</strong><small>{{ serverName(project.server_id) }} · {{ repositoryName(project.repository_id) }}</small></div>
-                  <div class="project-actions"><span class="status-pill" :class="project.enabled ? 'online' : 'neutral'">{{ project.enabled ? `Revision ${project.revision}` : '已暂停' }}</span><button type="button" class="text-button" :disabled="loading" @click="openProjectEditor(project)">编辑</button><button type="button" class="text-button" :disabled="loading" @click="toggleProject(project)">{{ project.enabled ? '暂停' : '恢复' }}</button><button v-if="project.policy?.retention.enabled" type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedPreviewProjectIDs.has(project.id)" @click="previewRetention(project)">{{ queuedPreviewProjectIDs.has(project.id) ? '预览排队中' : '清理预览' }}</button><button type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button></div>
+                  <div class="project-actions"><span class="status-pill" :class="project.enabled ? 'online' : 'neutral'">{{ project.enabled ? `Revision ${project.revision}` : '已暂停' }}</span><button type="button" class="text-button" :disabled="loading" @click="openProjectEditor(project)">编辑</button><button type="button" class="text-button" :disabled="loading" @click="toggleProject(project)">{{ project.enabled ? '暂停' : '恢复' }}</button><button v-if="project.policy?.retention.enabled" type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedPreviewProjectIDs.has(project.id)" @click="previewRetention(project)">{{ queuedPreviewProjectIDs.has(project.id) ? '预览排队中' : '清理预览' }}</button><button type="button" class="ghost compact" :disabled="loading || !project.enabled || queuedProjectIDs.has(project.id)" @click="runNow(project)">{{ queuedProjectIDs.has(project.id) ? '已排队 ✓' : '立即备份' }}</button><button type="button" class="text-button danger-text" :disabled="loading" @click="archiveProject(project)">归档</button></div>
                 </div>
                 <div class="project-source-list">
                   <span v-for="source in project.sources" :key="source.id" class="source-chip" :class="source.type">{{ sourceSummary(source) }}</span>
@@ -1484,6 +1529,7 @@ onBeforeUnmount(() => {
                 <article v-for="(source, index) in projectForm.sources" :key="source.key" class="source-editor">
                   <header><strong>数据源 {{ index + 1 }}</strong><button v-if="projectForm.sources.length > 1" type="button" class="text-button danger-text" @click="removeProjectSource(index)">移除</button></header>
                   <label>类型<select v-model="source.type" @change="changeSourceType(source)"><option value="files">文件与目录</option><option value="docker">Docker 容器与挂载卷</option><option value="mysql">MySQL 逻辑备份</option><option value="postgresql">PostgreSQL 逻辑备份</option></select></label>
+                  <label class="check-row"><input v-model="source.required" type="checkbox" /><span><strong>必需数据源</strong><small>{{ source.required ? '准备失败时中止本次备份，防止生成缺少关键数据的快照。' : '准备失败时跳过此来源、继续备份其他内容，并将运行标记为部分成功。' }}</small></span></label>
                   <template v-if="source.type === 'files'">
                     <label>绝对路径（每行一个）<textarea v-model="source.paths" rows="3" required placeholder="/etc&#10;/opt/app"></textarea></label>
                     <label>排除规则（每行一个）<textarea v-model="source.excludes" rows="2" placeholder="/opt/app/cache/**"></textarea></label>
@@ -1646,7 +1692,7 @@ onBeforeUnmount(() => {
           <div v-if="!runs.length" class="empty-state">尚无运行记录。</div>
           <div v-else-if="!filteredRuns.length" class="empty-state">没有匹配当前筛选条件的运行记录。</div>
           <div v-else class="table-wrap run-table-wrap"><table><thead><tr><th>项目 / Agent</th><th>类型</th><th>状态</th><th>开始 / 耗时</th><th>快照 / 预览结果</th><th>错误</th></tr></thead><tbody>
-            <tr v-for="run in filteredRuns" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ serverName(run.server_id) }} · {{ run.id }}</small></td><td><span class="source-chip">{{ runOperationLabel(run) }}</span></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td><strong>{{ formatDate(run.started_at) }}</strong><small>{{ formatDuration(run) }}</small></td><td><code v-if="run.snapshot_id">{{ run.snapshot_id.slice(0, 16) }}</code><span v-else-if="run.stats?.operation === 'retention_preview'">保留 {{ Number(run.stats?.snapshots_kept || 0) }} · 删除 {{ Number(run.stats?.snapshots_removed || 0) }}</span><span v-else-if="run.stats?.operation === 'snapshot_restore'">{{ run.stats?.restore_target || run.stats?.path }}</span><span v-else-if="run.stats?.snapshot_id"><code>{{ String(run.stats.snapshot_id).slice(0, 16) }}</code></span><span v-else>—</span></td><td class="error-cell" :title="run.error_message">{{ run.error_message || '—' }}</td></tr>
+            <tr v-for="run in filteredRuns" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ serverName(run.server_id) }} · {{ run.id }}</small></td><td><span class="source-chip">{{ runOperationLabel(run) }}</span></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td><strong>{{ formatDate(run.started_at) }}</strong><small>{{ formatDuration(run) }}</small></td><td><template v-if="run.snapshot_id"><code>{{ run.snapshot_id.slice(0, 16) }}</code><small v-if="Number(run.stats?.optional_source_count || 0)">跳过 {{ Number(run.stats?.optional_source_count) }} 个可选源</small></template><span v-else-if="run.stats?.operation === 'retention_preview'">保留 {{ Number(run.stats?.snapshots_kept || 0) }} · 删除 {{ Number(run.stats?.snapshots_removed || 0) }}</span><span v-else-if="run.stats?.operation === 'snapshot_restore'">{{ run.stats?.restore_target || run.stats?.path }}</span><span v-else-if="run.stats?.snapshot_id"><code>{{ String(run.stats.snapshot_id).slice(0, 16) }}</code></span><span v-else>—</span></td><td class="error-cell" :title="run.error_message">{{ run.error_message || '—' }}</td></tr>
           </tbody></table></div>
         </section>
       </template>
@@ -1661,7 +1707,7 @@ onBeforeUnmount(() => {
 
         <section class="panel notification-reference">
           <div><p class="eyebrow">ALERTMANAGER-STYLE DELIVERY</p><h2>状态变化通知，不按轮询刷屏</h2></div>
-          <div class="notification-flow"><span>运行 / RPO 事实</span><i>→</i><span>稳定指纹 Incident</span><i>→</i><span>持久化 Outbox</span><i>→</i><span>用户 Contact Point</span></div>
+          <div class="notification-flow"><span>运行 / RPO / 心跳</span><i>→</i><span>稳定指纹 Incident</span><i>→</i><span>持久化 Outbox</span><i>→</i><span>用户 Contact Point</span></div>
           <button type="button" class="primary compact-action" :disabled="loading" @click="evaluateAlertsNow">立即评估并投递</button>
         </section>
 
@@ -1672,7 +1718,7 @@ onBeforeUnmount(() => {
             <div v-else class="notification-channel-list">
               <article v-for="channel in notificationChannels" :key="channel.id" class="notification-channel-card" :class="{ disabled: !channel.enabled }">
                 <header><span class="channel-symbol">{{ channel.type === 'email' ? '@' : channel.type === 'telegram' ? '✈' : channel.type === 'webhook' ? '↗' : '◆' }}</span><div><strong>{{ channel.name }}</strong><small>{{ notificationTypeLabel(channel.type) }} · {{ channel.destination }}</small></div><span class="status-pill" :class="channel.enabled ? 'online' : 'neutral'">{{ channel.enabled ? '已启用' : '已停用' }}</span></header>
-                <div class="channel-policy"><span><small>EVENTS</small><strong>{{ channel.event_types.map(alertKindLabel).join(' · ') }}</strong></span><span><small>ROUTING</small><strong>{{ channel.project_ids?.length ? `${channel.project_ids.length} 个项目` : '所有项目' }}</strong></span><span><small>REPEAT</small><strong>{{ repeatIntervalLabel(channel.repeat_interval_seconds) }}</strong></span><span><small>RESOLVED</small><strong>{{ channel.send_resolved ? '发送' : '不发送' }}</strong></span></div>
+                <div class="channel-policy"><span><small>EVENTS</small><strong>{{ channel.event_types.map(alertKindLabel).join(' · ') }}</strong></span><span><small>ROUTING</small><strong>{{ notificationRoutingLabel(channel) }}</strong></span><span><small>REPEAT</small><strong>{{ repeatIntervalLabel(channel.repeat_interval_seconds) }}</strong></span><span><small>RESOLVED</small><strong>{{ channel.send_resolved ? '发送' : '不发送' }}</strong></span></div>
                 <footer><button type="button" class="text-button" :disabled="loading" @click="editNotificationChannel(channel)">编辑</button><button type="button" class="text-button" :disabled="loading" @click="toggleNotificationChannel(channel)">{{ channel.enabled ? '停用' : '启用' }}</button><button type="button" class="ghost compact" :disabled="loading || testingChannelIDs.has(channel.id)" @click="testNotificationChannel(channel)">{{ testingChannelIDs.has(channel.id) ? '测试中…' : '发送测试' }}</button><button type="button" class="text-button danger-text" :disabled="loading" @click="archiveNotificationChannel(channel)">归档</button></footer>
               </article>
             </div>
@@ -1680,7 +1726,7 @@ onBeforeUnmount(() => {
 
           <aside id="notification-builder" class="panel form-panel notification-builder" :class="{ editing: editingNotificationID }">
             <div class="builder-heading"><div><p class="eyebrow">{{ editingNotificationID ? 'EDIT CONTACT POINT' : 'NEW CONTACT POINT' }}</p><h2>{{ editingNotificationID ? '编辑通知渠道' : '添加通知渠道' }}</h2></div><button v-if="editingNotificationID" type="button" class="ghost compact" @click="resetNotificationForm">取消编辑</button></div>
-            <p class="form-intro">渠道是全局 Contact Point；可以订阅全部项目，也可以只路由指定项目。敏感字段只写不读。</p>
+            <p class="form-intro">渠道是全局 Contact Point；项目事件和服务器事件可以分别设置路由范围。敏感字段只写不读。</p>
             <form @submit.prevent="saveNotificationChannel">
               <div class="form-row"><label>渠道类型<select v-model="notificationForm.type" :disabled="Boolean(editingNotificationID)" @change="changeNotificationType"><optgroup v-for="group in notificationProviderGroups" :key="group" :label="group"><option v-for="provider in notificationProviders.filter((item) => item.group === group)" :key="provider.id" :value="provider.id">{{ provider.label }}</option></optgroup></select></label><label>渠道名称<input v-model.trim="notificationForm.name" required maxlength="100" placeholder="例如：运维 Telegram 群" /></label></div>
               <div class="repository-kind notification-kind"><div><span class="engine-badge">CONTACT</span><strong>{{ activeNotificationProvider.label }}</strong></div><p>{{ activeNotificationProvider.summary }}</p></div>
@@ -1693,13 +1739,14 @@ onBeforeUnmount(() => {
                 </label>
               </div>
               <section class="form-section compact-section"><div class="section-title"><span>1</span><div><strong>事件与恢复</strong><small>选择这个渠道关注的状态变化</small></div></div>
-                <div class="policy-option-grid"><label class="check-row"><input v-model="notificationForm.backup_failure" type="checkbox" /><span><strong>备份失败</strong><small>部分成功、失败、超时、取消或状态未知。</small></span></label><label class="check-row"><input v-model="notificationForm.rpo_overdue" type="checkbox" /><span><strong>RPO 超时</strong><small>没有失败上报也能发现静默中断。</small></span></label></div>
+                <div class="policy-option-grid"><label class="check-row"><input v-model="notificationForm.backup_failure" type="checkbox" /><span><strong>备份失败</strong><small>部分成功、失败、超时、取消或状态未知。</small></span></label><label class="check-row"><input v-model="notificationForm.rpo_overdue" type="checkbox" /><span><strong>RPO 超时</strong><small>没有失败上报也能发现备份静默中断。</small></span></label><label class="check-row"><input v-model="notificationForm.agent_offline" type="checkbox" /><span><strong>Agent 离线</strong><small>心跳中断超过 90 秒时告警，恢复上线后自动关闭。</small></span></label><label class="check-row"><input v-model="notificationForm.config_error" type="checkbox" /><span><strong>配置降级</strong><small>仓库或数据库凭据无法解密，Agent 配置缺失项目时立即告警。</small></span></label></div>
                 <label class="check-row"><input v-model="notificationForm.send_resolved" type="checkbox" /><span><strong>发送恢复通知</strong><small>事件从 firing 变为 resolved 时发送一次，确认故障已经结束。</small></span></label>
               </section>
               <section class="form-section compact-section"><div class="section-title"><span>2</span><div><strong>去重与路由</strong><small>持续故障只按周期重复提醒</small></div></div>
                 <label>重复提醒间隔（分钟）<input v-model.number="notificationForm.repeat_minutes" type="number" min="5" max="10080" required /><small class="field-help">默认 240 分钟。相同 Incident 在此期间不会重复发送。</small></label>
                 <label class="check-row security-choice"><input v-model="notificationForm.allow_private_address" type="checkbox" /><span><strong>允许访问私有网络地址</strong><small>仅用于自建 Gotify、ntfy、SMTP 或内网 Webhook。默认阻止回环与 RFC1918 地址；链路本地和云元数据地址始终禁止。</small></span></label>
-                <div class="project-routing"><strong>项目范围</strong><small>不勾选表示所有项目；新项目也会自动纳入。</small><div><label v-for="project in projects" :key="project.id"><input v-model="notificationForm.project_ids" type="checkbox" :value="project.id" /><span>{{ project.name }}<small>{{ serverName(project.server_id) }}</small></span></label></div></div>
+                <div class="project-routing"><strong>项目事件范围</strong><small>作用于备份失败和 RPO；不勾选表示所有项目。</small><div><label v-for="project in projects" :key="project.id"><input v-model="notificationForm.project_ids" type="checkbox" :value="project.id" /><span>{{ project.name }}<small>{{ serverName(project.server_id) }}</small></span></label></div></div>
+                <div class="project-routing"><strong>服务器事件范围</strong><small>作用于 Agent 离线；不勾选表示所有服务器。</small><div><label v-for="server in servers" :key="server.id"><input v-model="notificationForm.server_ids" type="checkbox" :value="server.id" /><span>{{ server.name }}<small>{{ server.hostname || statusLabel(server.status) }}</small></span></label></div></div>
               </section>
               <div class="form-actions"><button v-if="editingNotificationID" type="button" class="ghost" @click="resetNotificationForm">取消</button><button class="primary" :disabled="loading">{{ editingNotificationID ? '保存渠道' : '加密并创建渠道' }}</button></div>
             </form>
@@ -1709,7 +1756,7 @@ onBeforeUnmount(() => {
         <section class="panel alert-history-panel">
           <div class="panel-heading"><div><p class="eyebrow">INCIDENT TIMELINE</p><h2>告警事件</h2></div><span class="sample-size">{{ alertIncidents.length }} INCIDENTS</span></div>
           <div v-if="!alertIncidents.length" class="empty-state">暂无告警事件。后台每 30 秒评估一次，也可以手动立即评估。</div>
-          <div v-else class="table-wrap"><table><thead><tr><th>状态</th><th>事件 / 项目</th><th>首次发生</th><th>最近变化</th><th>次数</th><th>说明</th></tr></thead><tbody><tr v-for="incident in alertIncidents" :key="incident.id"><td><span class="status-pill" :class="incident.status === 'firing' ? 'overdue' : 'succeeded'">{{ incident.status === 'firing' ? '告警中' : '已恢复' }}</span></td><td><strong>{{ alertKindLabel(incident.kind) }}</strong><small>{{ incident.project_name }}</small></td><td>{{ formatDate(incident.started_at) }}</td><td>{{ formatDate(incident.resolved_at || incident.updated_at) }}</td><td><strong>{{ incident.occurrence_count }}</strong></td><td class="notification-description">{{ incident.description }}</td></tr></tbody></table></div>
+          <div v-else class="table-wrap"><table><thead><tr><th>状态</th><th>事件 / 对象</th><th>首次发生</th><th>最近变化</th><th>次数</th><th>说明</th></tr></thead><tbody><tr v-for="incident in alertIncidents" :key="incident.id"><td><span class="status-pill" :class="incident.status === 'firing' ? 'overdue' : 'succeeded'">{{ incident.status === 'firing' ? '告警中' : '已恢复' }}</span></td><td><strong>{{ alertKindLabel(incident.kind) }}</strong><small>{{ incident.resource_name || incident.project_name || incident.resource_id }}</small></td><td>{{ formatDate(incident.started_at) }}</td><td>{{ formatDate(incident.resolved_at || incident.updated_at) }}</td><td><strong>{{ incident.occurrence_count }}</strong></td><td class="notification-description">{{ incident.description }}</td></tr></tbody></table></div>
         </section>
 
         <section class="panel delivery-history-panel">

@@ -60,6 +60,7 @@ func main() {
 	defer dataStore.Close()
 
 	service := control.NewService(dataStore, sealer)
+	service.SetDataRetention(config.Retention)
 	httpServer, err := control.NewHTTPServer(service, logger, control.AdminAuthConfig{
 		Username:          config.AdminUsername,
 		Password:          config.AdminPassword,

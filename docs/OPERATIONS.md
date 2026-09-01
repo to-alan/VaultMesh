@@ -11,7 +11,7 @@
 
 丢失主密钥后，即使数据库仍在，仓库密码、对象存储凭据、数据库来源密码和管理员安全资料也无法解密。备份数据本身不经过控制面；Restic 仓库密码和存储凭据还应在独立的密码管理器中托管，以便控制面完全丢失时直接使用 Restic 恢复。
 
-Agent 的 `/var/lib/vaultmesh-agent/state.json` 包含设备身份、最后有效配置和待上报事件。可加密备份，但不得复制到另一台同时在线的主机，否则会克隆设备身份。恢复文件位于 `/var/lib/vaultmesh-agent/restores`，应按工单验收后清理。
+Agent 的 `/var/lib/vaultmesh-agent/state.json` 包含设备身份、最后有效配置、待上报事件和被控制面永久拒绝的隔离报告。可加密备份，但不得复制到另一台同时在线的主机，否则会克隆设备身份。恢复文件位于 `/var/lib/vaultmesh-agent/restores`，应按工单验收后清理。
 
 ## 控制面备份
 
@@ -51,6 +51,21 @@ sudo docker compose up -d control web
 
 新主机恢复必须在第一次创建 PostgreSQL 数据卷之前放回匹配的 `.env`。如果目标已有使用另一密码初始化的数据卷，不要只替换 `.env`；应使用干净数据卷恢复，或由 PostgreSQL 管理员同步更新 `vaultmesh` 角色密码。随后检查健康端点、登录、服务器/项目数量和一条历史运行记录。不要在原 Control Plane 仍在线时启动恢复副本；两个控制面共享 Agent 身份和项目配置会产生不确定行为。
 
+恢复数据库后，控制面的配置 Revision 会回退到备份时刻，Agent 会拒绝更低 Revision 的新配置并记录 `refusing configuration rollback`。此时使用一次性覆盖重启 Agent：
+
+```bash
+# 在 Agent 环境文件中临时加入，重启后生效
+echo 'VAULTMESH_ACCEPT_ROLLBACK=true' | sudo tee -a /etc/vaultmesh-agent.env
+sudo systemctl restart vaultmesh-agent
+# 确认配置收敛后，从环境文件移除该变量并再次重启
+```
+
+该覆盖只允许下一次更低 Revision 的配置写入，成功后自动恢复严格模式；也可以用 `vaultmesh-agent --accept-rollback` 达到同样效果。恢复后还应检查每个项目的仓库凭据是否可以用当前 `VAULTMESH_MASTER_KEY` 解密：解密失败的项目不会阻塞整份配置下发，而是按项目降级，并触发一条服务器范围的 `config_error` 告警。
+
+## 控制面数据保留
+
+控制面按天清理已完成的事实：运行记录默认保留 90 天、已完成命令 30 天、已完成的投递记录 90 天、已恢复的告警事件 180 天、审计事件 365 天。可用 `VAULTMESH_RETENTION_*_DAYS` 环境变量调整，设置为 `0` 关闭对应范围的清理（完整变量列表见 `.env.example`）。进行中的运行、待投递的通知和 firing 中的告警事件不受保留策略影响。归档的服务器、项目和仓库不会参与保留清理。
+
 ## 升级
 
 升级前先执行控制面备份并阅读目标版本说明。标准流程：
@@ -81,7 +96,7 @@ sudo docker compose logs --since=30m control
 curl --fail http://127.0.0.1:8080/healthz
 ```
 
-还应在 UI 中检查：Agent 是否在线、是否存在失败/部分成功/超时任务、下一次计划是否合理、快照索引是否近期同步、仓库 Check 是否按维护窗口完成、是否存在最终失败的通知投递、审计日志是否出现异常认证或失败操作，以及恢复目录是否积压。
+还应在 UI 中检查：Agent 是否在线、是否存在活动的 Agent 离线 Incident、是否存在失败/部分成功/超时任务、下一次计划是否合理、快照索引是否近期同步、仓库 Check 是否按维护窗口完成、是否存在最终失败的通知投递、审计日志是否出现异常认证或失败操作，以及恢复目录是否积压。
 
 Agent 主机可检查：
 
@@ -92,6 +107,8 @@ sudo test -s /var/lib/vaultmesh-agent/state.json
 sudo find /var/lib/vaultmesh-agent/restores -mindepth 1 -maxdepth 1 -type d -print
 ```
 
+升级或维护 Agent 时使用 `systemctl stop/restart vaultmesh-agent`，不要直接发送 `SIGKILL`。收到 `SIGTERM` 后，Agent 会先停止接受新的计划和手动任务，取消正在运行的 Restic/数据库进程，等待终态写入本地 Outbox，再退出；被取消的任务会以 `canceled` 上报。systemd 单元提供 30 秒停止上限，正常命令应在此时间内响应上下文取消。若最终被强制终止，下次启动会把遗留的 `running` 记录恢复为 `unknown`，避免把未确认完成的备份误报为成功。
+
 ## 故障处理
 
 ### Agent 离线
@@ -101,6 +118,10 @@ sudo find /var/lib/vaultmesh-agent/restores -mindepth 1 -maxdepth 1 -type d -pri
 3. 检查 systemd 日志和状态文件权限；
 4. 不要直接删除 `state.json`，否则会丢失设备凭据和未上报 Outbox；
 5. 若凭据确实丢失，创建新的服务器注册记录并重新注册，不要复用其他主机状态文件。
+
+已注册 Agent 连续 90 秒无心跳后，控制面会创建单个服务器级 `agent_offline` Incident；心跳恢复时自动关闭，并按渠道配置选择是否发送恢复通知。项目路由和服务器路由彼此独立，确认负责基础设施告警的渠道已订阅 Agent 离线事件并选择正确的服务器范围。
+
+若日志出现 `run report permanently rejected and quarantined`，Agent 已将该记录从 Outbox 移到 `state.json` 的 `rejected_reports`，后续报告仍会继续上报。先复制状态文件留证，再检查其中受限的拒绝原因、Agent/Control Plane 版本、项目是否已删除以及系统时间。不要直接手改或清空状态文件；结构校验、快照清单超限或幂等冲突通常表示版本不兼容或实现缺陷，应在修复前保留该报告。启动时日志会报告现存隔离数量；最多保存最近 200 条。
 
 ### 备份失败
 

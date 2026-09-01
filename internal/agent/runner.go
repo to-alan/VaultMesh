@@ -26,6 +26,12 @@ type RunResult struct {
 	Stats        map[string]any
 }
 
+type sourcePreparationWarning struct {
+	SourceID   string `json:"source_id"`
+	SourceType string `json:"source_type"`
+	Message    string `json:"message"`
+}
+
 type Runner struct {
 	resticPath    string
 	mysqlDumpPath string
@@ -58,7 +64,7 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 	if result := r.ensureRepository(ctx, project.Repository); result != nil {
 		return *result
 	}
-	paths, excludes, cleanup, err := r.prepareSources(ctx, project.Sources)
+	paths, excludes, sourceWarnings, cleanup, err := r.prepareSources(ctx, project.Sources)
 	if err != nil {
 		return RunResult{Status: domain.RunFailed, ErrorCode: "source_preparation_failed", ErrorMessage: redact(truncate(err.Error(), 4096), project.Repository)}
 	}
@@ -129,6 +135,13 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 		"duration_seconds":      summary.TotalDuration,
 		"restic_exit_code":      exitCode,
 	}
+	for index := range sourceWarnings {
+		sourceWarnings[index].Message = redact(truncate(sourceWarnings[index].Message, 1024), project.Repository)
+	}
+	if len(sourceWarnings) > 0 {
+		stats["optional_source_count"] = len(sourceWarnings)
+		stats["optional_sources_skipped"] = sourceWarnings
+	}
 	if exitCode == 3 {
 		if errorMessage == "" {
 			errorMessage = "restic created an incomplete snapshot because some source data could not be read"
@@ -150,6 +163,12 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 	if !project.Policy.Maintenance.Separate {
 		if result := r.applyPostBackupPolicy(ctx, agentID, project, summary.SnapshotID, stats); result != nil {
 			return *result
+		}
+	}
+	if len(sourceWarnings) > 0 {
+		return RunResult{
+			Status: domain.RunPartial, SnapshotID: summary.SnapshotID, ErrorCode: "optional_source_failed",
+			ErrorMessage: optionalSourceWarningMessage(sourceWarnings), Stats: stats,
 		}
 	}
 	return RunResult{Status: domain.RunSucceeded, SnapshotID: summary.SnapshotID, Stats: stats}
@@ -405,8 +424,9 @@ func parseResticOutput(reader io.Reader) (resticSummary, error) {
 	return summary, nil
 }
 
-func (r *Runner) prepareSources(ctx context.Context, sources []domain.Source) ([]string, []string, func(), error) {
+func (r *Runner) prepareSources(ctx context.Context, sources []domain.Source) ([]string, []string, []sourcePreparationWarning, func(), error) {
 	var paths, excludes []string
+	var warnings []sourcePreparationWarning
 	stagingDirectory := ""
 	cleanup := func() {
 		if stagingDirectory != "" {
@@ -437,78 +457,96 @@ func (r *Runner) prepareSources(ctx context.Context, sources []domain.Source) ([
 		return value, nil
 	}
 	for _, source := range sources {
-		switch source.Type {
-		case "files":
-			for _, path := range source.Paths {
-				cleaned := filepath.Clean(path)
-				if !filepath.IsAbs(cleaned) {
-					cleanup()
-					return nil, nil, func() {}, fmt.Errorf("source path %q is not absolute", path)
-				}
-				if cleaned == "/" || cleaned == "/proc" || strings.HasPrefix(cleaned, "/proc/") ||
-					cleaned == "/sys" || strings.HasPrefix(cleaned, "/sys/") ||
-					cleaned == "/dev" || strings.HasPrefix(cleaned, "/dev/") {
-					cleanup()
-					return nil, nil, func() {}, fmt.Errorf("source path %q is blocked by the agent safety policy", cleaned)
-				}
-				paths = append(paths, cleaned)
-			}
-			excludes = append(excludes, source.Excludes...)
-		case "mysql", "postgresql":
-			if source.Database == nil {
-				cleanup()
-				return nil, nil, func() {}, fmt.Errorf("database source %s has no connection configuration", source.ID)
-			}
-			directory, err := ensureStaging()
-			if err != nil {
-				cleanup()
-				return nil, nil, func() {}, err
-			}
-			var output string
-			if source.Type == "mysql" {
-				output = filepath.Join(directory, source.ID+".mysql.sql")
-				err = r.dumpMySQL(ctx, directory, output, *source.Database)
-			} else {
-				output = filepath.Join(directory, source.ID+".postgres.dump")
-				err = r.dumpPostgreSQL(ctx, directory, output, *source.Database)
-			}
-			if err != nil {
-				cleanup()
-				return nil, nil, func() {}, fmt.Errorf("prepare %s source %s: %w", source.Type, source.ID, err)
-			}
-			paths = append(paths, output)
-		case "docker":
-			if source.Docker == nil {
-				cleanup()
-				return nil, nil, func() {}, fmt.Errorf("Docker source %s has no container configuration", source.ID)
-			}
-			directory, err := ensureStaging()
-			if err != nil {
-				cleanup()
-				return nil, nil, func() {}, err
-			}
-			dockerPaths, manifest, err := r.prepareDockerSource(ctx, *source.Docker)
-			if err != nil {
-				cleanup()
-				return nil, nil, func() {}, fmt.Errorf("prepare Docker source %s: %w", source.ID, err)
-			}
-			manifestPath := filepath.Join(directory, safeFilename(source.ID)+".docker.json")
-			if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
-				cleanup()
-				return nil, nil, func() {}, fmt.Errorf("write Docker source manifest: %w", err)
-			}
-			paths = append(paths, manifestPath)
-			paths = append(paths, dockerPaths...)
-		default:
+		if source.Type != "files" && source.Type != "mysql" && source.Type != "postgresql" && source.Type != "docker" {
 			cleanup()
-			return nil, nil, func() {}, fmt.Errorf("source type %q is not supported by this agent version", source.Type)
+			return nil, nil, nil, func() {}, fmt.Errorf("source type %q is not supported by this agent version", source.Type)
 		}
+		sourcePaths, sourceExcludes, err := r.prepareSource(ctx, source, ensureStaging)
+		if err != nil {
+			wrapped := fmt.Errorf("prepare %s source %s: %w", source.Type, source.ID, err)
+			if source.Required || ctx.Err() != nil {
+				cleanup()
+				return nil, nil, nil, func() {}, wrapped
+			}
+			warnings = append(warnings, sourcePreparationWarning{
+				SourceID: source.ID, SourceType: source.Type, Message: err.Error(),
+			})
+			continue
+		}
+		paths = append(paths, sourcePaths...)
+		excludes = append(excludes, sourceExcludes...)
 	}
 	if len(paths) == 0 {
 		cleanup()
-		return nil, nil, func() {}, errors.New("project contains no backup paths or database artifacts")
+		return nil, nil, nil, func() {}, errors.New("no data source could be prepared for backup")
 	}
-	return paths, excludes, cleanup, nil
+	return paths, excludes, warnings, cleanup, nil
+}
+
+func (r *Runner) prepareSource(ctx context.Context, source domain.Source, ensureStaging func() (string, error)) ([]string, []string, error) {
+	switch source.Type {
+	case "files":
+		paths := make([]string, 0, len(source.Paths))
+		for _, value := range source.Paths {
+			cleaned, err := safeBackupPath(value)
+			if err != nil {
+				return nil, nil, err
+			}
+			paths = append(paths, cleaned)
+		}
+		return paths, append([]string(nil), source.Excludes...), nil
+	case "mysql", "postgresql":
+		if source.Database == nil {
+			return nil, nil, errors.New("database connection configuration is missing")
+		}
+		directory, err := ensureStaging()
+		if err != nil {
+			return nil, nil, err
+		}
+		if source.Type == "mysql" {
+			output := filepath.Join(directory, safeFilename(source.ID)+".mysql.sql")
+			if err := r.dumpMySQL(ctx, directory, output, *source.Database); err != nil {
+				return nil, nil, err
+			}
+			return []string{output}, nil, nil
+		}
+		output := filepath.Join(directory, safeFilename(source.ID)+".postgres.dump")
+		if err := r.dumpPostgreSQL(ctx, directory, output, *source.Database); err != nil {
+			return nil, nil, err
+		}
+		return []string{output}, nil, nil
+	case "docker":
+		if source.Docker == nil {
+			return nil, nil, errors.New("Docker configuration is missing")
+		}
+		directory, err := ensureStaging()
+		if err != nil {
+			return nil, nil, err
+		}
+		dockerPaths, manifest, err := r.prepareDockerSource(ctx, *source.Docker)
+		if err != nil {
+			return nil, nil, err
+		}
+		manifestPath := filepath.Join(directory, safeFilename(source.ID)+".docker.json")
+		if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+			return nil, nil, fmt.Errorf("write Docker source manifest: %w", err)
+		}
+		return append([]string{manifestPath}, dockerPaths...), nil, nil
+	default:
+		return nil, nil, fmt.Errorf("source type %q is not supported", source.Type)
+	}
+}
+
+func optionalSourceWarningMessage(warnings []sourcePreparationWarning) string {
+	parts := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		identity := warning.SourceType
+		if warning.SourceID != "" {
+			identity += " " + warning.SourceID
+		}
+		parts = append(parts, identity+": "+warning.Message)
+	}
+	return fmt.Sprintf("%d optional source(s) were skipped: %s", len(warnings), strings.Join(parts, "; "))
 }
 
 type dockerInspection struct {

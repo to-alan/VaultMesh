@@ -14,18 +14,45 @@ import (
 	"github.com/to-alan/vaultmesh/internal/domain"
 )
 
+const (
+	maxRejectedReports    = 200
+	maxReportRejectReason = 4096
+)
+
+// RejectedReport is a run report that the Control Plane permanently rejected.
+// It remains in the root-only Agent state for diagnosis, but no longer blocks
+// newer reports in the ordered Outbox.
+type RejectedReport struct {
+	Report     domain.RunReport `json:"report"`
+	Reason     string           `json:"reason"`
+	RejectedAt time.Time        `json:"rejected_at"`
+}
+
 type persistedState struct {
-	Identity *domain.AgentIdentity       `json:"identity,omitempty"`
-	Config   domain.AgentConfig          `json:"config"`
-	RunKeys  map[string]string           `json:"run_keys"`
-	Runs     map[string]domain.RunReport `json:"runs"`
-	Outbox   map[string]domain.RunReport `json:"outbox"`
+	Identity        *domain.AgentIdentity       `json:"identity,omitempty"`
+	Config          domain.AgentConfig          `json:"config"`
+	RunKeys         map[string]string           `json:"run_keys"`
+	Runs            map[string]domain.RunReport `json:"runs"`
+	Outbox          map[string]domain.RunReport `json:"outbox"`
+	RejectedReports map[string]RejectedReport   `json:"rejected_reports,omitempty"`
+	// SnapshotInventories holds the latest verified inventory per project until
+	// the dedicated control-plane endpoint acknowledges delivery. Only the most
+	// recent inventory per project is kept: older entries can never converge a
+	// control-plane index that a newer one cannot fully replace.
+	SnapshotInventories map[string]SnapshotInventory `json:"snapshot_inventories,omitempty"`
+}
+
+// SnapshotInventory is a pending delivery of a project's Restic snapshot index.
+type SnapshotInventory struct {
+	Snapshots []domain.Snapshot `json:"snapshots"`
+	QueuedAt  time.Time         `json:"queued_at"`
 }
 
 type StateStore struct {
-	mu    sync.Mutex
-	path  string
-	state persistedState
+	mu            sync.Mutex
+	path          string
+	state         persistedState
+	allowRollback bool
 }
 
 func OpenState(path string) (*StateStore, error) {
@@ -45,6 +72,7 @@ func OpenState(path string) (*StateStore, error) {
 	store.state.RunKeys = make(map[string]string)
 	store.state.Runs = make(map[string]domain.RunReport)
 	store.state.Outbox = make(map[string]domain.RunReport)
+	store.state.RejectedReports = make(map[string]RejectedReport)
 	data, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read agent state: %w", err)
@@ -100,16 +128,32 @@ func (s *StateStore) Config() domain.AgentConfig {
 func (s *StateStore) SetConfig(config domain.AgentConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if config.Revision < s.state.Config.Revision {
+	if config.Revision < s.state.Config.Revision && !s.allowRollback {
 		return fmt.Errorf("refusing configuration rollback from revision %d to %d", s.state.Config.Revision, config.Revision)
 	}
 	previous := s.state.Config
+	previousRollback := s.allowRollback
 	s.state.Config = cloneAgentConfig(config)
+	// A rollback acceptance is one-shot: after any config write succeeds the
+	// guard returns to its strict default so routine downgrades stay blocked.
+	s.allowRollback = false
 	if err := s.saveLocked(); err != nil {
 		s.state.Config = previous
+		s.allowRollback = previousRollback
 		return err
 	}
 	return nil
+}
+
+// AcceptRollback allows the next SetConfig call to move to a lower revision.
+// It exists for the documented control-plane restore procedure: after the
+// database is restored from a backup its revision counter resets, and the
+// Agent would otherwise refuse every new configuration until its local state
+// file was deleted.
+func (s *StateStore) AcceptRollback() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.allowRollback = true
 }
 
 func (s *StateStore) BeginRun(report domain.RunReport) (bool, error) {
@@ -138,14 +182,19 @@ func (s *StateStore) FinishRun(report domain.RunReport) error {
 		return errors.New("cannot finish unknown run")
 	}
 	previousOutbox, hadOutbox := s.state.Outbox[report.ID]
+	previousRejection, wasRejected := s.state.RejectedReports[report.ID]
 	s.state.Runs[report.ID] = cloneReport(report)
 	s.state.Outbox[report.ID] = cloneReport(report)
+	delete(s.state.RejectedReports, report.ID)
 	if err := s.saveLocked(); err != nil {
 		s.state.Runs[report.ID] = previousRun
 		if hadOutbox {
 			s.state.Outbox[report.ID] = previousOutbox
 		} else {
 			delete(s.state.Outbox, report.ID)
+		}
+		if wasRejected {
+			s.state.RejectedReports[report.ID] = previousRejection
 		}
 		return err
 	}
@@ -176,6 +225,112 @@ func (s *StateStore) AckReport(id string) error {
 	return nil
 }
 
+func (s *StateStore) QuarantineReport(id, reason string, rejectedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	report, exists := s.state.Outbox[id]
+	if !exists {
+		return errors.New("cannot quarantine unknown report")
+	}
+	previous := clonePersistedState(s.state)
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "control plane permanently rejected the report"
+	}
+	if len(reason) > maxReportRejectReason {
+		reason = reason[:maxReportRejectReason]
+	}
+	if rejectedAt.IsZero() {
+		rejectedAt = time.Now().UTC()
+	}
+	s.state.RejectedReports[id] = RejectedReport{
+		Report:     cloneReport(report),
+		Reason:     reason,
+		RejectedAt: rejectedAt.UTC(),
+	}
+	delete(s.state.Outbox, id)
+	s.pruneRejectedReportsLocked(maxRejectedReports)
+	s.pruneHistoryLocked(2000)
+	if err := s.saveLocked(); err != nil {
+		s.state = previous
+		return err
+	}
+	return nil
+}
+
+func (s *StateStore) RejectedReports() []RejectedReport {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]RejectedReport, 0, len(s.state.RejectedReports))
+	for _, rejection := range s.state.RejectedReports {
+		result = append(result, cloneRejectedReport(rejection))
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].RejectedAt.After(result[j].RejectedAt) })
+	return result
+}
+
+// QueueSnapshotInventory persists the latest snapshot index for a project,
+// replacing any older undelivered inventory for the same project.
+func (s *StateStore) QueueSnapshotInventory(projectID string, snapshots []domain.Snapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.SnapshotInventories == nil {
+		s.state.SnapshotInventories = make(map[string]SnapshotInventory)
+	}
+	previous, hadPrevious := s.state.SnapshotInventories[projectID]
+	s.state.SnapshotInventories[projectID] = SnapshotInventory{
+		Snapshots: append([]domain.Snapshot(nil), snapshots...),
+		QueuedAt:  time.Now().UTC(),
+	}
+	if err := s.saveLocked(); err != nil {
+		if hadPrevious {
+			s.state.SnapshotInventories[projectID] = previous
+		} else {
+			delete(s.state.SnapshotInventories, projectID)
+		}
+		return err
+	}
+	return nil
+}
+
+// PendingSnapshotInventory is one undelivered project index.
+type PendingSnapshotInventory struct {
+	ProjectID string
+	Snapshots []domain.Snapshot
+	QueuedAt  time.Time
+}
+
+// PendingSnapshotInventories returns one undelivered inventory per project,
+// oldest delivery attempt first so newer indexes cannot overtake stale ones.
+func (s *StateStore) PendingSnapshotInventories() []PendingSnapshotInventory {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]PendingSnapshotInventory, 0, len(s.state.SnapshotInventories))
+	for projectID, inventory := range s.state.SnapshotInventories {
+		result = append(result, PendingSnapshotInventory{
+			ProjectID: projectID,
+			Snapshots: append([]domain.Snapshot(nil), inventory.Snapshots...),
+			QueuedAt:  inventory.QueuedAt,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].QueuedAt.Before(result[j].QueuedAt) })
+	return result
+}
+
+func (s *StateStore) AckSnapshotInventory(projectID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, hadPrevious := s.state.SnapshotInventories[projectID]
+	delete(s.state.SnapshotInventories, projectID)
+	if err := s.saveLocked(); err != nil {
+		if hadPrevious {
+			s.state.SnapshotInventories[projectID] = previous
+		}
+		return err
+	}
+	return nil
+}
+
 func (s *StateStore) initializeMaps() {
 	if s.state.RunKeys == nil {
 		s.state.RunKeys = make(map[string]string)
@@ -185,6 +340,12 @@ func (s *StateStore) initializeMaps() {
 	}
 	if s.state.Outbox == nil {
 		s.state.Outbox = make(map[string]domain.RunReport)
+	}
+	if s.state.RejectedReports == nil {
+		s.state.RejectedReports = make(map[string]RejectedReport)
+	}
+	if s.state.SnapshotInventories == nil {
+		s.state.SnapshotInventories = make(map[string]SnapshotInventory)
 	}
 }
 
@@ -201,6 +362,7 @@ func (s *StateStore) recoverInterruptedRuns() bool {
 		report.FinishedAt = &now
 		s.state.Runs[id] = report
 		s.state.Outbox[id] = report
+		delete(s.state.RejectedReports, id)
 		changed = true
 	}
 	return changed
@@ -280,6 +442,20 @@ func (s *StateStore) pruneHistoryLocked(limit int) {
 	}
 }
 
+func (s *StateStore) pruneRejectedReportsLocked(limit int) {
+	if len(s.state.RejectedReports) <= limit {
+		return
+	}
+	items := make([]RejectedReport, 0, len(s.state.RejectedReports))
+	for _, rejection := range s.state.RejectedReports {
+		items = append(items, rejection)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].RejectedAt.Before(items[j].RejectedAt) })
+	for _, rejection := range items[:len(items)-limit] {
+		delete(s.state.RejectedReports, rejection.Report.ID)
+	}
+}
+
 func cloneAgentConfig(config domain.AgentConfig) domain.AgentConfig {
 	data, _ := json.Marshal(config)
 	var result domain.AgentConfig
@@ -294,12 +470,22 @@ func cloneReport(report domain.RunReport) domain.RunReport {
 	return result
 }
 
+func cloneRejectedReport(rejection RejectedReport) RejectedReport {
+	return RejectedReport{
+		Report:     cloneReport(rejection.Report),
+		Reason:     rejection.Reason,
+		RejectedAt: rejection.RejectedAt,
+	}
+}
+
 func clonePersistedState(state persistedState) persistedState {
 	result := persistedState{
-		Config:  cloneAgentConfig(state.Config),
-		RunKeys: make(map[string]string, len(state.RunKeys)),
-		Runs:    make(map[string]domain.RunReport, len(state.Runs)),
-		Outbox:  make(map[string]domain.RunReport, len(state.Outbox)),
+		Config:              cloneAgentConfig(state.Config),
+		RunKeys:             make(map[string]string, len(state.RunKeys)),
+		Runs:                make(map[string]domain.RunReport, len(state.Runs)),
+		Outbox:              make(map[string]domain.RunReport, len(state.Outbox)),
+		RejectedReports:     make(map[string]RejectedReport, len(state.RejectedReports)),
+		SnapshotInventories: make(map[string]SnapshotInventory, len(state.SnapshotInventories)),
 	}
 	if state.Identity != nil {
 		identity := *state.Identity
@@ -313,6 +499,15 @@ func clonePersistedState(state persistedState) persistedState {
 	}
 	for id, report := range state.Outbox {
 		result.Outbox[id] = cloneReport(report)
+	}
+	for id, rejection := range state.RejectedReports {
+		result.RejectedReports[id] = cloneRejectedReport(rejection)
+	}
+	for projectID, inventory := range state.SnapshotInventories {
+		result.SnapshotInventories[projectID] = SnapshotInventory{
+			Snapshots: append([]domain.Snapshot(nil), inventory.Snapshots...),
+			QueuedAt:  inventory.QueuedAt,
+		}
 	}
 	return result
 }

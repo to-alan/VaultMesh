@@ -347,8 +347,8 @@ tbody tr:hover { background: rgba(93, 240, 168, .025); }
 .rpo-strip > span:last-child { overflow: hidden; color: #80928a; font-size: 9px; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
 .rpo-strip.healthy { border-color: #26513e; background: #091811; }
 .rpo-strip.healthy .rpo-state-dot { background: var(--accent); box-shadow: 0 0 0 4px rgba(93,240,168,.09); }
-.rpo-strip.pending, .rpo-strip.late { border-color: #5a4b27; background: #1b170c; }
-.rpo-strip.pending .rpo-state-dot, .rpo-strip.late .rpo-state-dot { background: var(--warning); box-shadow: 0 0 0 4px rgba(246,200,95,.09); }
+.rpo-strip.pending, .rpo-strip.late, .rpo-strip.running { border-color: #5a4b27; background: #1b170c; }
+.rpo-strip.pending .rpo-state-dot, .rpo-strip.late .rpo-state-dot, .rpo-strip.running .rpo-state-dot { background: var(--warning); box-shadow: 0 0 0 4px rgba(246,200,95,.09); }
 .rpo-strip.overdue, .rpo-strip.invalid { border-color: #65343b; background: #241216; }
 .rpo-strip.overdue .rpo-state-dot, .rpo-strip.invalid .rpo-state-dot { background: #ff6b73; box-shadow: 0 0 0 4px rgba(255,107,115,.1); }
 .rpo-strip.overdue strong, .rpo-strip.invalid strong { color: #ff9ca2; }

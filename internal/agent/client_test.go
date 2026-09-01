@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -81,6 +82,55 @@ func TestClientRejectsAmbiguousAndOversizedJSON(t *testing.T) {
 			}
 			if _, err := client.Config(context.Background(), "agent-token", 0); err == nil {
 				t.Fatal("invalid control plane response was accepted")
+			}
+		})
+	}
+}
+
+func TestClientPreservesControlPlaneErrorAndClassifiesReportRejections(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":"agent_clock_ahead","message":"run start time is too far in the future"}}`)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Report(context.Background(), "agent-token", domain.RunReport{})
+	var controlError *ControlPlaneError
+	if !errors.As(err, &controlError) {
+		t.Fatalf("expected typed control plane error, got %T: %v", err, err)
+	}
+	if controlError.StatusCode != http.StatusBadRequest || controlError.Code != "agent_clock_ahead" {
+		t.Fatalf("unexpected control plane error: %#v", controlError)
+	}
+	if IsPermanentReportError(err) {
+		t.Fatal("clock skew rejection must remain retryable")
+	}
+
+	tests := []struct {
+		name      string
+		err       error
+		permanent bool
+	}{
+		{name: "malformed report", err: &ControlPlaneError{StatusCode: 400, Code: "validation_failed"}, permanent: true},
+		{name: "legacy clock skew", err: &ControlPlaneError{StatusCode: 400, Code: "validation_failed", Message: "run finish time is too far in the future"}},
+		{name: "malformed JSON", err: &ControlPlaneError{StatusCode: 400, Code: "invalid_json"}, permanent: true},
+		{name: "inventory too large", err: &ControlPlaneError{StatusCode: 413, Code: "snapshot_inventory_too_large"}, permanent: true},
+		{name: "identity conflict", err: &ControlPlaneError{StatusCode: 409, Code: "conflict"}, permanent: true},
+		{name: "project removed", err: &ControlPlaneError{StatusCode: 404, Code: "not_found"}, permanent: true},
+		{name: "authentication", err: &ControlPlaneError{StatusCode: 401, Code: "unauthorized"}},
+		{name: "rate limit", err: &ControlPlaneError{StatusCode: 429, Code: "rate_limited"}},
+		{name: "server failure", err: &ControlPlaneError{StatusCode: 500, Code: "internal_error"}},
+		{name: "unstructured proxy error", err: &ControlPlaneError{StatusCode: 400}},
+		{name: "network failure", err: errors.New("connection refused")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsPermanentReportError(test.err); got != test.permanent {
+				t.Fatalf("IsPermanentReportError() = %v, want %v", got, test.permanent)
 			}
 		})
 	}

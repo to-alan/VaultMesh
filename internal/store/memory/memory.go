@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -104,7 +105,7 @@ func (s *Store) EnrollAgent(_ context.Context, enrollmentHash, credentialHash []
 		return domain.Server{}, store.ErrInvalidEnrollment
 	}
 	server, ok := s.servers[entry.serverID]
-	if !ok {
+	if !ok || server.ArchivedAt != nil {
 		return domain.Server{}, store.ErrInvalidEnrollment
 	}
 	entry.used = true
@@ -129,7 +130,7 @@ func (s *Store) AuthenticateAgent(_ context.Context, credentialHash []byte) (dom
 		return domain.Server{}, store.ErrUnauthorized
 	}
 	server, ok := s.servers[serverID]
-	if !ok {
+	if !ok || server.ArchivedAt != nil {
 		return domain.Server{}, store.ErrUnauthorized
 	}
 	return server, nil
@@ -159,13 +160,36 @@ func (s *Store) ListServers(context.Context) ([]domain.Server, error) {
 	defer s.mu.RUnlock()
 	result := make([]domain.Server, 0, len(s.servers))
 	for _, server := range s.servers {
-		if server.LastSeenAt != nil && time.Since(*server.LastSeenAt) > 90*time.Second {
+		if server.ArchivedAt != nil {
+			continue
+		}
+		if server.LastSeenAt != nil && time.Since(*server.LastSeenAt) > domain.AgentOfflineAfter {
 			server.Status = domain.ServerOffline
 		}
 		result = append(result, server)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.Before(result[j].CreatedAt) })
 	return result, nil
+}
+
+func (s *Store) ArchiveServer(_ context.Context, id string, archivedAt time.Time) (domain.Server, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	server, ok := s.servers[id]
+	if !ok {
+		return domain.Server{}, store.ErrNotFound
+	}
+	if server.ArchivedAt == nil {
+		server.ArchivedAt = &archivedAt
+		server.Status = domain.ServerOffline
+		s.servers[id] = server
+		for credential, serverID := range s.credentials {
+			if serverID == id {
+				delete(s.credentials, credential)
+			}
+		}
+	}
+	return s.servers[id], nil
 }
 
 func (s *Store) CreateRepository(_ context.Context, repository domain.Repository) (domain.Repository, error) {
@@ -183,6 +207,9 @@ func (s *Store) ListRepositories(context.Context) ([]domain.Repository, error) {
 	defer s.mu.RUnlock()
 	result := make([]domain.Repository, 0, len(s.repositories))
 	for _, repository := range s.repositories {
+		if repository.ArchivedAt != nil {
+			continue
+		}
 		result = append(result, publicRepository(repository))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.Before(result[j].CreatedAt) })
@@ -193,10 +220,22 @@ func (s *Store) GetRepository(_ context.Context, id string) (domain.Repository, 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	repository, ok := s.repositories[id]
-	if !ok {
+	if !ok || repository.ArchivedAt != nil {
 		return domain.Repository{}, store.ErrNotFound
 	}
 	return cloneRepository(repository), nil
+}
+
+func (s *Store) ArchiveRepository(_ context.Context, id string, archivedAt time.Time) (domain.Repository, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	repository, ok := s.repositories[id]
+	if !ok || repository.ArchivedAt != nil {
+		return domain.Repository{}, store.ErrNotFound
+	}
+	repository.ArchivedAt = &archivedAt
+	s.repositories[id] = repository
+	return repository, nil
 }
 
 func (s *Store) CreateProject(_ context.Context, project domain.Project) (domain.Project, error) {
@@ -234,10 +273,34 @@ func (s *Store) ListProjects(context.Context) ([]domain.Project, error) {
 	defer s.mu.RUnlock()
 	result := make([]domain.Project, 0, len(s.projects))
 	for _, project := range s.projects {
+		if project.ArchivedAt != nil {
+			continue
+		}
 		result = append(result, cloneProject(project))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.Before(result[j].CreatedAt) })
 	return result, nil
+}
+
+func (s *Store) ArchiveProject(_ context.Context, id string, archivedAt time.Time) (domain.Project, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	project, ok := s.projects[id]
+	if !ok || project.ArchivedAt != nil {
+		return domain.Project{}, store.ErrNotFound
+	}
+	server, ok := s.servers[project.ServerID]
+	if !ok {
+		return domain.Project{}, store.ErrNotFound
+	}
+	server.DesiredRevision++
+	s.servers[server.ID] = server
+	project.ArchivedAt = &archivedAt
+	project.Enabled = false
+	project.Revision = server.DesiredRevision
+	project.UpdatedAt = archivedAt
+	s.projects[id] = project
+	return cloneProject(project), nil
 }
 
 func (s *Store) UpdateProject(_ context.Context, project domain.Project, updatedAt time.Time) (domain.Project, error) {
@@ -301,10 +364,13 @@ func (s *Store) DesiredConfig(_ context.Context, serverID string) (domain.AgentC
 	}
 	config := domain.AgentConfig{Revision: server.DesiredRevision}
 	for _, project := range s.projects {
-		if project.ServerID != serverID || !project.Enabled {
+		if project.ServerID != serverID || !project.Enabled || project.ArchivedAt != nil {
 			continue
 		}
 		repository := s.repositories[project.RepositoryID]
+		if repository.ArchivedAt != nil {
+			continue
+		}
 		config.Projects = append(config.Projects, domain.AgentProject{
 			Project:    cloneProject(project),
 			Repository: cloneRepository(repository),
@@ -339,6 +405,9 @@ func (s *Store) ClaimCommands(_ context.Context, serverID string, now, leaseUnti
 	var candidates []domain.Command
 	for id, command := range s.commands {
 		if command.ServerID != serverID {
+			continue
+		}
+		if project, ok := s.projects[command.ProjectID]; ok && project.ArchivedAt != nil {
 			continue
 		}
 		if _, accepted := s.accepted[id]; accepted {
@@ -520,6 +589,64 @@ func (s *Store) ListProjectBackupActivity(_ context.Context) ([]domain.ProjectBa
 	return result, nil
 }
 
+func (s *Store) PruneBefore(_ context.Context, scope store.RetentionScope, before time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var removed int64
+	switch scope {
+	case store.RetentionRuns:
+		for id, run := range s.runs {
+			if run.Status == domain.RunRunning || run.StartedAt.After(before) {
+				continue
+			}
+			delete(s.runs, id)
+			delete(s.runKeys, run.IdempotencyKey)
+			removed++
+		}
+	case store.RetentionCommands:
+		for id := range s.commands {
+			completed, ok := s.completed[id]
+			if !ok || !completed.Before(before) {
+				continue
+			}
+			delete(s.commands, id)
+			delete(s.accepted, id)
+			delete(s.completed, id)
+			removed++
+		}
+	case store.RetentionDeliveries:
+		for id, delivery := range s.deliveries {
+			if !delivery.CreatedAt.Before(before) || (delivery.Status != "sent" && delivery.Status != "failed") {
+				continue
+			}
+			delete(s.deliveries, id)
+			removed++
+		}
+	case store.RetentionIncidents:
+		for id, incident := range s.alerts {
+			if incident.Status != "resolved" || !incident.UpdatedAt.Before(before) {
+				continue
+			}
+			delete(s.alerts, id)
+			removed++
+		}
+	case store.RetentionAudit:
+		kept := s.auditEvents[:0]
+		for _, event := range s.auditEvents {
+			if event.CreatedAt.Before(before) {
+				delete(s.auditIDs, event.ID)
+				removed++
+				continue
+			}
+			kept = append(kept, event)
+		}
+		s.auditEvents = kept
+	default:
+		return 0, fmt.Errorf("unknown retention scope %q", scope)
+	}
+	return removed, nil
+}
+
 func (s *Store) CreateNotificationChannel(_ context.Context, channel domain.NotificationChannel) (domain.NotificationChannel, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -592,6 +719,9 @@ func (s *Store) ArchiveNotificationChannel(_ context.Context, id string, at time
 func (s *Store) CreateAlertIncident(_ context.Context, alert domain.AlertIncident) (domain.AlertIncident, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if alert.ResourceType == "" && alert.ProjectID != "" {
+		alert.ResourceType, alert.ResourceID, alert.ResourceName = "project", alert.ProjectID, alert.ProjectName
+	}
 	for _, existing := range s.alerts {
 		if existing.Fingerprint == alert.Fingerprint && existing.Status == "firing" {
 			return domain.AlertIncident{}, store.ErrConflict
@@ -765,7 +895,7 @@ func (s *Store) Dashboard(_ context.Context, since time.Time) (domain.Dashboard,
 	defer s.mu.RUnlock()
 	dashboard := domain.Dashboard{ServersTotal: len(s.servers), ProjectsTotal: len(s.projects)}
 	for _, server := range s.servers {
-		if server.LastSeenAt != nil && time.Since(*server.LastSeenAt) <= 90*time.Second {
+		if server.LastSeenAt != nil && time.Since(*server.LastSeenAt) <= domain.AgentOfflineAfter {
 			dashboard.ServersOnline++
 		}
 	}
@@ -820,6 +950,7 @@ func cloneNotificationChannel(channel domain.NotificationChannel) domain.Notific
 	channel.SecretCiphertext = append([]byte(nil), channel.SecretCiphertext...)
 	channel.EventTypes = append([]string(nil), channel.EventTypes...)
 	channel.ProjectIDs = append([]string(nil), channel.ProjectIDs...)
+	channel.ServerIDs = append([]string(nil), channel.ServerIDs...)
 	channel.Config = cloneMap(channel.Config)
 	return channel
 }

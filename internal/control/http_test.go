@@ -1008,6 +1008,649 @@ func TestValidateRunReportRejectsMalformedTimelines(t *testing.T) {
 	}
 }
 
+// TestAgentSnapshotInventoryEndpointIsolatedFromRuns verifies the dedicated
+// inventory channel: the index is replaced, inventories from other servers are
+// rejected, and run history stays free of the bulky inventory payload.
+// TestArchiveLifecycleCoversServersProjectsAndRepositories verifies the soft
+// delete flow: guards for referenced resources, removal from DesiredConfig,
+// revision bumps, and agent credential revocation.
+func TestArchiveLifecycleCoversServersProjectsAndRepositories(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{18}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	enrollment, err := service.CreateServer(ctx, "Archive host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "archive-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Archive repository", URL: "/tmp/archive-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Archive project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A repository referenced by an active project, and a server that still
+	// owns projects, must both refuse archival to protect the recovery chain.
+	if _, err := service.ArchiveRepository(ctx, repository.ID); err == nil || !strings.Contains(err.Error(), "active backup projects") {
+		t.Fatalf("expected referenced repository archival to be rejected, got %v", err)
+	}
+	if _, err := service.ArchiveServer(ctx, identity.AgentID); err == nil || !strings.Contains(err.Error(), "archive its backup projects first") {
+		t.Fatalf("expected server with active projects to be rejected, got %v", err)
+	}
+
+	// Archiving the project removes it from the agent's DesiredConfig and
+	// bumps the revision so the change propagates.
+	archived, err := service.ArchiveProject(ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archived.ArchivedAt == nil || archived.Enabled {
+		t.Fatalf("project was not archived: %#v", archived)
+	}
+	config, err := service.DesiredConfig(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Projects) != 0 {
+		t.Fatalf("archived project remained in DesiredConfig: %#v", config.Projects)
+	}
+	if config.Revision == 0 {
+		t.Fatal("archival did not bump the desired revision")
+	}
+
+	// The now-unused repository can be archived; archiving the server then
+	// revokes the agent credential and hides it from the server list.
+	if _, err := service.ArchiveRepository(ctx, repository.ID); err != nil {
+		t.Fatalf("unused repository archival failed: %v", err)
+	}
+	if _, err := service.ArchiveServer(ctx, identity.AgentID); err != nil {
+		t.Fatalf("server archival failed: %v", err)
+	}
+	if _, err := service.AuthenticateAgent(ctx, identity.Token); !errors.Is(err, store.ErrUnauthorized) {
+		t.Fatalf("archived server agent credentials were not revoked: %v", err)
+	}
+	listed, err := service.Store().ListServers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range listed {
+		if server.ID == identity.AgentID {
+			t.Fatalf("archived server remained in the server list: %#v", listed)
+		}
+	}
+}
+
+// TestDesiredConfigDegradesPerProjectOnSecretLoss verifies that a lost master
+// key no longer blinds the entire agent: healthy projects keep flowing and a
+// server-scoped config_error incident fires and resolves.
+func TestDesiredConfigDegradesPerProjectOnSecretLoss(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	healthySealer, err := secret.New(bytes.Repeat([]byte{19}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lostSealer, err := secret.New(bytes.Repeat([]byte{20}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, healthySealer)
+	enrollment, err := service.CreateServer(ctx, "Degraded host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "degraded-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Degraded repository", URL: "/tmp/degraded-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Degraded project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A service holding the wrong master key simulates the credential loss.
+	blinded := NewService(dataStore, lostSealer)
+	config, err := blinded.DesiredConfig(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatalf("DesiredConfig failed entirely instead of degrading: %v", err)
+	}
+	if len(config.Projects) != 0 || len(config.DegradedProjects) != 1 || config.DegradedProjects[0].ProjectID != project.ID {
+		t.Fatalf("expected one degraded project and no projects: %#v", config)
+	}
+	incident, err := dataStore.GetFiringAlertIncident(ctx, "config:"+identity.AgentID)
+	if err != nil {
+		t.Fatalf("config_error incident was not raised: %v", err)
+	}
+	if incident.Kind != "config_error" || incident.Severity != "critical" {
+		t.Fatalf("unexpected config_error incident: %#v", incident)
+	}
+
+	// Recovery: with the correct key the config is complete and the incident
+	// resolves.
+	config, err = service.DesiredConfig(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Projects) != 1 || len(config.DegradedProjects) != 0 {
+		t.Fatalf("healthy service did not deliver the full config: %#v", config)
+	}
+	if _, err := dataStore.GetFiringAlertIncident(ctx, "config:"+identity.AgentID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("config_error incident did not resolve: %v", err)
+	}
+}
+
+// TestAgentHeartbeatDeliversMergedConfiguration verifies the one round trip
+// sync: a lagging revision receives the full config, a current one gets 204.
+func TestAgentHeartbeatDeliversMergedConfiguration(t *testing.T) {
+	ctx := context.Background()
+	sealer, err := secret.New(bytes.Repeat([]byte{21}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(memory.New(), sealer)
+	enrollment, err := service.CreateServer(ctx, "Sync host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "sync-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Sync repository", URL: "/tmp/sync-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Sync project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, service, slog.New(slog.NewTextHandler(io.Discard, nil)), false, nil)
+
+	postHeartbeat := func(appliedRevision int64) *httptest.ResponseRecorder {
+		t.Helper()
+		body := mustJSON(t, domain.Heartbeat{
+			AgentInfo:       domain.AgentInfo{Hostname: "sync-host", OS: "linux", Arch: "amd64", AgentVersion: "test"},
+			AppliedRevision: appliedRevision,
+		})
+		request := httptest.NewRequest(http.MethodPost, "/api/v1/agent/heartbeat", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+identity.Token)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	recorder := postHeartbeat(0)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("lagging heartbeat did not return config: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Config *domain.AgentConfig `json:"config"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Config == nil || len(payload.Config.Projects) != 1 || payload.Config.Revision == 0 {
+		t.Fatalf("merged heartbeat did not deliver the desired config: %s", recorder.Body.String())
+	}
+
+	recorder = postHeartbeat(payload.Config.Revision)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("current heartbeat did not return 204: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestPruneExpiredRemovesOnlyFinishedFacts verifies the retention scopes: a
+// running run, a pending delivery, and a firing incident survive; finished
+// facts past their retention window are removed.
+func TestPruneExpiredRemovesOnlyFinishedFacts(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{22}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	service.SetDataRetention(domain.DataRetention{
+		RunsDays: 90, CommandsDays: 30, DeliveriesDays: 90, IncidentsDays: 180, AuditEventsDays: 365,
+	})
+	// Retention math runs against the real clock; the seeded facts simply use
+	// timestamps far enough in the past to exceed every configured window.
+	now := time.Now().UTC()
+	cutoff := now.AddDate(0, 0, -400)
+
+	enrollment, err := service.CreateServer(ctx, "Prune host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "prune-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Prune repository", URL: "/tmp/prune-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Prune project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	old := cutoff.Add(-time.Hour)
+	recent := now.Add(-time.Hour)
+	if err := dataStore.UpsertRun(ctx, domain.RunReport{ID: "run_old", IdempotencyKey: "k_old", ProjectID: project.ID, ServerID: identity.AgentID, ScheduledAt: old, StartedAt: old, FinishedAt: &old, Status: domain.RunSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.UpsertRun(ctx, domain.RunReport{ID: "run_new", IdempotencyKey: "k_new", ProjectID: project.ID, ServerID: identity.AgentID, ScheduledAt: recent, StartedAt: recent, FinishedAt: &recent, Status: domain.RunSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.UpsertRun(ctx, domain.RunReport{ID: "run_stuck", IdempotencyKey: "k_stuck", ProjectID: project.ID, ServerID: identity.AgentID, ScheduledAt: old, StartedAt: old, Status: domain.RunRunning}); err != nil {
+		t.Fatal(err)
+	}
+	command, err := service.CreateManualRun(ctx, project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.UpsertRun(ctx, domain.RunReport{ID: "run_manual_old", IdempotencyKey: "manual:" + command.ID, ProjectID: project.ID, ServerID: identity.AgentID, ScheduledAt: old, StartedAt: old, FinishedAt: &old, Status: domain.RunSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	incident, err := dataStore.CreateAlertIncident(ctx, domain.AlertIncident{
+		ID: "alt_old", Fingerprint: "backup:old", Kind: "backup_failure", ResourceType: "project",
+		ResourceID: project.ID, ProjectID: project.ID, Status: "resolved", Severity: "warning",
+		Summary: "old", SourceEventID: "old", StartedAt: old, UpdatedAt: old,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := domain.NotificationDelivery{
+		ID: "ntf_old", AlertID: incident.ID, ChannelID: "chn_missing", Transition: "firing",
+		Status: "pending", CreatedAt: old,
+	}
+	if err := dataStore.CreateNotificationDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.CompleteNotificationDelivery(ctx, delivery.ID, true, "", old, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.AppendAuditEvent(ctx, domain.AuditEvent{ID: "aud_old", Actor: "admin", Action: "auth.password", Outcome: "succeeded", CreatedAt: old}); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := service.PruneExpired(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed == 0 {
+		t.Fatal("retention pruning removed nothing")
+	}
+	runs, err := dataStore.ListRuns(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runIDs := make(map[string]bool, len(runs))
+	for _, run := range runs {
+		runIDs[run.ID] = true
+	}
+	if runIDs["run_old"] || runIDs["run_manual_old"] {
+		t.Fatalf("finished runs were not pruned: %#v", runIDs)
+	}
+	if !runIDs["run_new"] || !runIDs["run_stuck"] {
+		t.Fatalf("recent or running runs were pruned: %#v", runIDs)
+	}
+	if _, err := dataStore.GetAlertIncident(ctx, incident.ID); err == nil {
+		t.Fatal("resolved incident was not pruned")
+	}
+	deliveries, err := dataStore.ListNotificationDeliveries(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deliveries) != 0 {
+		t.Fatalf("completed delivery was not pruned: %#v", deliveries)
+	}
+	events, err := dataStore.ListAuditEvents(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("old audit event was not pruned: %#v", events)
+	}
+}
+
+func TestAgentSnapshotInventoryEndpointIsolatedFromRuns(t *testing.T) {
+	ctx := context.Background()
+	sealer, err := secret.New(bytes.Repeat([]byte{15}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(memory.New(), sealer)
+	enrollment, err := service.CreateServer(ctx, "Inventory host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "inventory-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Inventory repository", URL: "/tmp/inventory-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Inventory project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, service, slog.New(slog.NewTextHandler(io.Discard, nil)), false, nil)
+	now := time.Date(2026, time.July, 15, 2, 0, 0, 0, time.UTC)
+	const snapshotID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	reportSnapshotInventory := func(snapshots []domain.Snapshot) *httptest.ResponseRecorder {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{"project_id": project.ID, "snapshots": snapshots})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPut, "/api/v1/agent/snapshots", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+identity.Token)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	recorder := reportSnapshotInventory([]domain.Snapshot{{
+		ID: snapshotID, Time: now, Hostname: "inventory-host", Paths: []string{"/etc"},
+		Tags: []string{"vaultmesh.project_id=" + project.ID}, TotalFiles: 7, TotalBytes: 2048,
+	}})
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("inventory was not accepted: %d %s", recorder.Code, recorder.Body.String())
+	}
+	items, err := service.Store().ListSnapshots(ctx, project.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != snapshotID || items[0].ServerID != identity.AgentID {
+		t.Fatalf("snapshot index was not replaced: %#v", items)
+	}
+
+	// An empty inventory converges the index to the repository truth: the
+	// agent only queues inventories that reflect the current Restic listing.
+	recorder = reportSnapshotInventory(nil)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("empty inventory was not accepted: %d %s", recorder.Code, recorder.Body.String())
+	}
+	items, err = service.Store().ListSnapshots(ctx, project.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("empty inventory did not converge the snapshot index: %#v", items)
+	}
+
+	// A project owned by another server is out of scope for this agent.
+	otherEnrollment, err := service.CreateServer(ctx, "Other host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherIdentity, err := service.EnrollAgent(ctx, otherEnrollment.EnrollmentToken, domain.AgentInfo{Hostname: "other-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]any{"project_id": project.ID, "snapshots": []domain.Snapshot{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/api/v1/agent/snapshots", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+otherIdentity.Token)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("cross-server inventory was not rejected: %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	// The successful run report no longer carries the inventory payload, and
+	// stored run history must not contain it either.
+	finished := now.Add(time.Minute)
+	request = httptest.NewRequest(http.MethodPost, "/api/v1/agent/runs", bytes.NewReader(mustJSON(t, domain.RunReport{
+		ID: "run_inventory_backup", IdempotencyKey: project.ID + ":backup:inventory", ProjectID: project.ID,
+		ScheduledAt: now, StartedAt: now, FinishedAt: &finished, Status: domain.RunSucceeded,
+		Stats: map[string]any{"operation": "backup", "snapshot_count": 1, "snapshots": []domain.Snapshot{{
+			ID: snapshotID, Time: now, Hostname: "inventory-host", Paths: []string{"/etc"},
+		}}},
+	})))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+identity.Token)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("run report was not accepted: %d %s", recorder.Code, recorder.Body.String())
+	}
+	runs, err := service.Store().ListRuns(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range runs {
+		if run.ID != "run_inventory_backup" {
+			continue
+		}
+		if _, ok := run.Stats["snapshots"]; ok {
+			t.Fatalf("snapshot inventory leaked into stored run history: %#v", run.Stats)
+		}
+		if count, ok := run.Stats["snapshot_count"].(float64); !ok || count != 1 {
+			t.Fatalf("snapshot_count stat was not preserved: %#v", run.Stats)
+		}
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// TestProjectHealthReportsRunningBackup verifies that an in-flight backup is
+// surfaced as running instead of a misleading late status inside its window.
+func TestProjectHealthReportsRunningBackup(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	sealer, err := secret.New(bytes.Repeat([]byte{16}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(dataStore, sealer)
+	current := time.Date(2026, time.July, 15, 0, 0, 0, 0, time.UTC)
+	enrollment, err := service.CreateServer(ctx, "Running host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "running-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Running repository", URL: "/tmp/running-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return current }
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Long backup",
+		Sources: []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{
+			Cron: "0 1 * * *", Timezone: "UTC", MaxRuntimeSeconds: 3600, GraceSeconds: 1800,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Date(2026, time.July, 15, 1, 5, 0, 0, time.UTC)
+	if err := dataStore.UpsertRun(ctx, domain.RunReport{
+		ID: "run_long_backup", IdempotencyKey: "scheduled:long-backup", ProjectID: project.ID, ServerID: identity.AgentID,
+		ScheduledAt: time.Date(2026, time.July, 15, 1, 0, 0, 0, time.UTC), StartedAt: started,
+		Status: domain.RunRunning, Stats: map[string]any{"operation": "backup"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current = started.Add(30 * time.Minute)
+	items, err := service.ProjectHealth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != "running" {
+		t.Fatalf("in-flight backup was not reported as running: %#v", items)
+	}
+	// A run that outlives the deadline still escalates to overdue so a crashed
+	// agent can never hide behind a permanently running report.
+	current = time.Date(2026, time.July, 15, 2, 31, 0, 0, time.UTC)
+	items, err = service.ProjectHealth(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Status != "overdue" {
+		t.Fatalf("stale running report did not escalate to overdue: %#v", items)
+	}
+}
+
+// TestAgentRunAcceptsSkippedStatus verifies the terminal state recorded when a
+// concurrency_policy=forbid trigger overlaps a running operation.
+func TestAgentRunAcceptsSkippedStatus(t *testing.T) {
+	ctx := context.Background()
+	sealer, err := secret.New(bytes.Repeat([]byte{17}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(memory.New(), sealer)
+	enrollment, err := service.CreateServer(ctx, "Skipped host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "skipped-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Skipped repository", URL: "/tmp/skipped-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Skipped project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, service, slog.New(slog.NewTextHandler(io.Discard, nil)), false, nil)
+	now := time.Date(2026, time.July, 15, 2, 0, 0, 0, time.UTC)
+	finished := now.Add(time.Second)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agent/runs", bytes.NewReader(mustJSON(t, domain.RunReport{
+		ID: "run_skipped", IdempotencyKey: project.ID + ":backup:skipped", ProjectID: project.ID,
+		ScheduledAt: now, StartedAt: now, FinishedAt: &finished,
+		Status: domain.RunSkipped, ErrorCode: "concurrency_forbidden",
+		Stats: map[string]any{"operation": "backup"},
+	})))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+identity.Token)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("skipped report was not accepted: %d %s", recorder.Code, recorder.Body.String())
+	}
+	activity, err := service.Store().ListProjectBackupActivity(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activity) != 1 || activity[0].LatestRunStatus != domain.RunSkipped {
+		t.Fatalf("skipped run was not recorded: %#v", activity)
+	}
+}
+
+func TestAgentRunClockSkewResponseIsRetryable(t *testing.T) {
+	sealer, err := secret.New(bytes.Repeat([]byte{14}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(memory.New(), sealer)
+	enrollment, err := service.CreateServer(context.Background(), "Clock-skewed Agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(context.Background(), enrollment.EnrollmentToken, domain.AgentInfo{
+		Hostname: "clock-skewed", OS: "linux", Arch: "amd64",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return time.Date(2026, time.July, 15, 1, 0, 0, 0, time.UTC) }
+	handler := newTestHTTPHandler(t, service, slog.New(slog.NewTextHandler(io.Discard, nil)), false, nil)
+	startedAt := service.now().Add(maxAgentClockSkew + 91*time.Second)
+	finishedAt := startedAt.Add(time.Second)
+	body, err := json.Marshal(domain.RunReport{
+		ID: "run_future", IdempotencyKey: "project:future", ProjectID: "project",
+		ScheduledAt: startedAt, StartedAt: startedAt, FinishedAt: &finishedAt, Status: domain.RunSucceeded,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agent/runs", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+identity.Token)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("Retry-After") != "91" {
+		t.Fatalf("unexpected Retry-After %q", recorder.Header().Get("Retry-After"))
+	}
+	var response struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code != "agent_clock_ahead" {
+		t.Fatalf("unexpected error response: %s", recorder.Body.String())
+	}
+}
+
 func TestCreateProjectRejectsUnimplementedMissedRunPolicy(t *testing.T) {
 	sealer, err := secret.New(bytes.Repeat([]byte{4}, 32))
 	if err != nil {
@@ -1390,11 +2033,16 @@ func TestNotificationChannelHTTPFlowKeepsSecretsWriteOnly(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler := newTestHTTPHandler(t, service, logger, false, []string{"https://console.example.com"})
 	adminCookie := loginAdmin(t, handler)
+	routedServer, err := service.CreateServer(context.Background(), "Notification route")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var created domain.NotificationChannel
 	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/notification-channels", adminCookie, domain.NotificationChannel{
 		Name: "Operations webhook", Type: "webhook", Enabled: true, SendResolved: true,
-		RepeatIntervalSeconds: 14400, EventTypes: []string{"backup_failure", "rpo_overdue"},
+		RepeatIntervalSeconds: 14400, EventTypes: []string{"backup_failure", "rpo_overdue", "agent_offline"},
+		ServerIDs: []string{routedServer.Server.ID},
 		Config: map[string]string{
 			"url": "https://alerts.example.com/private-token", "method": "POST",
 			"authorization": "Bearer private-authorization", "headers": `{"X-Environment":"test"}`,
@@ -1402,6 +2050,9 @@ func TestNotificationChannelHTTPFlowKeepsSecretsWriteOnly(t *testing.T) {
 	}, http.StatusCreated, &created)
 	if created.ID == "" || !created.Configured || created.Destination != "alerts.example.com" {
 		t.Fatalf("unexpected public notification channel: %#v", created)
+	}
+	if len(created.ServerIDs) != 1 || created.ServerIDs[0] != routedServer.Server.ID {
+		t.Fatalf("server route was not returned: %#v", created.ServerIDs)
 	}
 	if created.Config["url"] != "" || created.Config["authorization"] != "" || created.Config["headers"] != "" {
 		t.Fatalf("notification channel response leaked a secret: %#v", created.Config)

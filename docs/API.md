@@ -59,6 +59,18 @@ Content-Type: application/json
 {"name":"Hong Kong VPS"}
 ```
 
+## Archive servers, projects, and repositories
+
+```http
+DELETE /api/v1/servers/{server_id}
+DELETE /api/v1/projects/{project_id}
+DELETE /api/v1/repositories/{repository_id}
+```
+
+All three endpoints archive instead of hard-delete. Archiving a project stops scheduling and removes it from the owning Agent's DesiredConfig on the next revision bump; archiving a server additionally revokes its Agent credentials and closes its offline and config incidents. Archived resources disappear from list responses and the console, while runs, snapshot indexes, and audit events keep referencing them as historical evidence.
+
+Guards protect the recovery chain: a repository still used by an active project returns `422 repository_id is still used by active backup projects; archive them first`, and a server that still owns projects returns `422 archive its backup projects first`.
+
 ## Create a global Cloudflare R2 storage channel
 
 ```http
@@ -193,6 +205,8 @@ Use a dedicated database user with the minimum privileges required by `mysqldump
 
 The password is replaced by AES-GCM ciphertext before the project JSON is persisted. The Agent writes a root-only temporary client option file, performs a single-transaction logical dump, backs up the artifact with Restic, and removes the staging directory.
 
+`sources[].required` controls source-preparation failure semantics. A required source failure aborts the run before Restic backup starts. An optional source failure allows the remaining sources to be backed up, but the resulting Run is `partial` with `error_code=optional_source_failed`; `stats.optional_sources_skipped` contains only the source ID, type, and a bounded redacted error. If no source can be prepared, the run fails and no empty snapshot is created.
+
 `policy.backup` maps directly to Restic backup options. For new projects, retention is scoped by Agent host and `vaultmesh.project_id`, while Forget, Prune, and optional verification run in independent maintenance windows. Legacy projects without `maintenance.separate` retain their original post-backup behavior. See [backup project policies](./BACKUP_PROJECTS.md) for the complete contract.
 
 Pause or resume a project without deleting its history:
@@ -242,8 +256,9 @@ Content-Type: application/json
   "enabled": true,
   "send_resolved": true,
   "repeat_interval_seconds": 14400,
-  "event_types": ["backup_failure", "rpo_overdue"],
+  "event_types": ["backup_failure", "rpo_overdue", "agent_offline"],
   "project_ids": [],
+  "server_ids": [],
   "config": {
     "url": "https://hooks.example.com/vaultmesh",
     "method": "POST",
@@ -253,7 +268,9 @@ Content-Type: application/json
 }
 ```
 
-`project_ids: []` routes matching events from every project; a non-empty array acts as an allowlist. `repeat_interval_seconds` accepts 300 seconds through 7 days. Supported event types currently are `backup_failure` and `rpo_overdue`.
+`project_ids: []` routes project-scoped events from every project; a non-empty array acts as a project allowlist. `server_ids` independently controls server-scoped events and an empty array means every server. `repeat_interval_seconds` accepts 300 seconds through 7 days. Supported event types are `backup_failure`, `rpo_overdue`, and `agent_offline`.
+
+Incident responses use `resource_type`, `resource_id`, and `resource_name` as their stable scope. Project incidents also retain `project_id` and `project_name` for compatibility; server incidents omit those optional fields. An enrolled Agent becomes offline after 90 seconds without a heartbeat. The notification worker opens one `agent:<server_id>` Incident, applies the channel's server allowlist and repeat interval, and resolves the same Incident after heartbeats resume.
 
 Channel configuration is encrypted as one AES-GCM payload. API responses set `configured: true`, expose only a safe destination summary and non-secret fields, and never return the URL, token, authorization value, custom headers or SMTP password. On `PUT`, omitted or blank secret fields preserve the encrypted value already stored; changing the channel type requires the new type's required fields.
 
@@ -313,6 +330,20 @@ The Agent runs `docker inspect` for the explicitly configured containers, stores
 The current scheduler accepts only `"missed_run_policy":"skip"`. A future `run_once` policy requires a persisted missed-run cursor and additional idempotency semantics and is intentionally rejected instead of being silently ignored.
 
 Agent run reports are accepted only when the run ID, project ID and idempotency key are bounded, scheduled/start times are present and ordered, terminal reports contain a finish time, running reports do not, and start/finish times are not more than five minutes ahead of Control Plane time. Delayed historical reports remain valid. These checks prevent a broken or compromised Agent clock from corrupting run ordering and dashboard state.
+
+An ahead-of-time report receives `400 agent_clock_ahead` plus `Retry-After`; the Agent keeps it in the durable Outbox and retries because it can become valid as Control Plane time catches up. Stable application rejections such as `validation_failed`, `snapshot_inventory_too_large`, `not_found`, and an idempotency `conflict` cannot be corrected by replaying the same immutable report. The Agent moves those records into the bounded `rejected_reports` quarantine in its root-only state file and continues with later Outbox entries. Network errors, unstructured proxy responses, authentication failures, rate limits and server errors never trigger quarantine.
+
+Snapshot inventories travel through a dedicated channel instead of the run report:
+
+```http
+PUT /api/v1/agent/snapshots
+```
+
+```json
+{ "project_id": "prj_example", "snapshots": [] }
+```
+
+The Agent persists the latest verified inventory per project in its local state and delivers it idempotently; a failed Control Plane keeps retrying without affecting run facts. An inventory larger than 10 000 entries is rejected with `413 snapshot_inventory_too_large`; the Agent drops it and records `snapshot_inventory_dropped` in the triggering run so the index stays stale only for oversized repositories. Legacy Agents that still embed `stats.snapshots` inside a run report remain accepted: the Control Plane extracts the inventory, then strips it before persisting the run, so run history never stores the bulky index.
 
 ## Snapshot index and safe restore
 

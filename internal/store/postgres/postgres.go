@@ -142,10 +142,11 @@ func (s *Store) EnrollAgent(ctx context.Context, enrollmentHash, credentialHash 
 	var expiresAt time.Time
 	var usedAt *time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT server_id, expires_at, used_at
-		FROM enrollments
-		WHERE token_hash = $1
-		FOR UPDATE`, enrollmentHash).Scan(&serverID, &expiresAt, &usedAt)
+		SELECT e.server_id, e.expires_at, e.used_at
+		FROM enrollments e
+		JOIN servers s ON s.id = e.server_id
+		WHERE e.token_hash = $1 AND s.archived_at IS NULL
+		FOR UPDATE OF e`, enrollmentHash).Scan(&serverID, &expiresAt, &usedAt)
 	if errors.Is(err, pgx.ErrNoRows) || usedAt != nil || time.Now().After(expiresAt) {
 		return domain.Server{}, store.ErrInvalidEnrollment
 	}
@@ -181,10 +182,10 @@ func (s *Store) EnrollAgent(ctx context.Context, enrollmentHash, credentialHash 
 func (s *Store) AuthenticateAgent(ctx context.Context, credentialHash []byte) (domain.Server, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT s.id, s.name, s.hostname, s.os, s.arch, s.agent_version,
-		       s.status, s.last_seen_at, s.desired_revision, s.applied_revision, s.created_at
+		       s.status, s.last_seen_at, s.desired_revision, s.applied_revision, s.created_at, s.archived_at
 		FROM agent_credentials a
 		JOIN servers s ON s.id = a.server_id
-		WHERE a.token_hash = $1 AND a.revoked_at IS NULL`, credentialHash)
+		WHERE a.token_hash = $1 AND a.revoked_at IS NULL AND s.archived_at IS NULL`, credentialHash)
 	server, err := scanServer(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Server{}, store.ErrUnauthorized
@@ -211,11 +212,12 @@ func (s *Store) UpdateHeartbeat(ctx context.Context, serverID string, heartbeat 
 func (s *Store) ListServers(ctx context.Context) ([]domain.Server, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, hostname, os, arch, agent_version,
-		       CASE WHEN last_seen_at IS NOT NULL AND last_seen_at < NOW() - INTERVAL '90 seconds'
+		       CASE WHEN last_seen_at IS NOT NULL AND last_seen_at < NOW() - $2::interval
 		            THEN $1 ELSE status END,
-		       last_seen_at, desired_revision, applied_revision, created_at
+		       last_seen_at, desired_revision, applied_revision, created_at, archived_at
 		FROM servers
-		ORDER BY created_at`, domain.ServerOffline)
+		WHERE archived_at IS NULL
+		ORDER BY created_at`, domain.ServerOffline, fmt.Sprintf("%d seconds", int64(domain.AgentOfflineAfter/time.Second)))
 	if err != nil {
 		return nil, err
 	}
@@ -231,6 +233,37 @@ func (s *Store) ListServers(ctx context.Context) ([]domain.Server, error) {
 	return result, rows.Err()
 }
 
+func (s *Store) ArchiveServer(ctx context.Context, id string, archivedAt time.Time) (domain.Server, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Server{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var existingArchived *time.Time
+	if err := tx.QueryRow(ctx, `SELECT archived_at FROM servers WHERE id = $1 FOR UPDATE`, id).Scan(&existingArchived); errors.Is(err, pgx.ErrNoRows) {
+		return domain.Server{}, store.ErrNotFound
+	} else if err != nil {
+		return domain.Server{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE agent_credentials SET revoked_at = $2
+		WHERE server_id = $1 AND revoked_at IS NULL`, id, archivedAt); err != nil {
+		return domain.Server{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE servers SET status = $2, archived_at = $3 WHERE id = $1`, id, domain.ServerOffline, archivedAt); err != nil {
+		return domain.Server{}, err
+	}
+	server, err := getServer(ctx, tx, id)
+	if err != nil {
+		return domain.Server{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Server{}, err
+	}
+	return server, nil
+}
+
 func (s *Store) CreateRepository(ctx context.Context, repository domain.Repository) (domain.Repository, error) {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO repositories (id, provider, name, url, secret_ciphertext, created_at)
@@ -244,8 +277,8 @@ func (s *Store) CreateRepository(ctx context.Context, repository domain.Reposito
 
 func (s *Store) ListRepositories(ctx context.Context) ([]domain.Repository, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, provider, name, url, created_at
-		FROM repositories ORDER BY created_at`)
+		SELECT id, provider, name, url, created_at, archived_at
+		FROM repositories WHERE archived_at IS NULL ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +286,7 @@ func (s *Store) ListRepositories(ctx context.Context) ([]domain.Repository, erro
 	var result []domain.Repository
 	for rows.Next() {
 		var repository domain.Repository
-		if err := rows.Scan(&repository.ID, &repository.Provider, &repository.Name, &repository.URL, &repository.CreatedAt); err != nil {
+		if err := rows.Scan(&repository.ID, &repository.Provider, &repository.Name, &repository.URL, &repository.CreatedAt, &repository.ArchivedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, repository)
@@ -264,13 +297,27 @@ func (s *Store) ListRepositories(ctx context.Context) ([]domain.Repository, erro
 func (s *Store) GetRepository(ctx context.Context, id string) (domain.Repository, error) {
 	var repository domain.Repository
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, provider, name, url, secret_ciphertext, created_at
-		FROM repositories WHERE id = $1`, id).Scan(&repository.ID, &repository.Provider,
-		&repository.Name, &repository.URL, &repository.SecretCiphertext, &repository.CreatedAt)
+		SELECT id, provider, name, url, secret_ciphertext, created_at, archived_at
+		FROM repositories WHERE id = $1 AND archived_at IS NULL`, id).Scan(&repository.ID, &repository.Provider,
+		&repository.Name, &repository.URL, &repository.SecretCiphertext, &repository.CreatedAt, &repository.ArchivedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Repository{}, store.ErrNotFound
 	}
 	return repository, err
+}
+
+func (s *Store) ArchiveRepository(ctx context.Context, id string, archivedAt time.Time) (domain.Repository, error) {
+	var repository domain.Repository
+	err := s.pool.QueryRow(ctx, `
+		UPDATE repositories SET archived_at = $2
+		WHERE id = $1 AND archived_at IS NULL
+		RETURNING id, provider, name, url, created_at, archived_at`,
+		id, archivedAt).Scan(&repository.ID, &repository.Provider,
+		&repository.Name, &repository.URL, &repository.CreatedAt, &repository.ArchivedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Repository{}, store.ErrNotFound
+	}
+	return repository, mapError(err)
 }
 
 func (s *Store) CreateProject(ctx context.Context, project domain.Project) (domain.Project, error) {
@@ -326,8 +373,8 @@ func (s *Store) CreateProject(ctx context.Context, project domain.Project) (doma
 func (s *Store) GetProject(ctx context.Context, id string) (domain.Project, error) {
 	project, err := scanProject(s.pool.QueryRow(ctx, `
 		SELECT id, server_id, repository_id, name, enabled, sources, schedule, policy,
-		       revision, created_at, updated_at
-		FROM projects WHERE id = $1`, id))
+		       revision, created_at, updated_at, archived_at
+		FROM projects WHERE id = $1 AND archived_at IS NULL`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Project{}, store.ErrNotFound
 	}
@@ -337,8 +384,8 @@ func (s *Store) GetProject(ctx context.Context, id string) (domain.Project, erro
 func (s *Store) ListProjects(ctx context.Context) ([]domain.Project, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, server_id, repository_id, name, enabled, sources, schedule, policy,
-		       revision, created_at, updated_at
-		FROM projects ORDER BY created_at`)
+		       revision, created_at, updated_at, archived_at
+		FROM projects WHERE archived_at IS NULL ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -374,8 +421,8 @@ func (s *Store) UpdateProject(ctx context.Context, project domain.Project, updat
 	defer tx.Rollback(ctx) //nolint:errcheck
 	current, err := scanProject(tx.QueryRow(ctx, `
 		SELECT id, server_id, repository_id, name, enabled, sources, schedule, policy,
-		       revision, created_at, updated_at
-		FROM projects WHERE id = $1 FOR UPDATE`, project.ID))
+		       revision, created_at, updated_at, archived_at
+		FROM projects WHERE id = $1 AND archived_at IS NULL FOR UPDATE`, project.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Project{}, store.ErrNotFound
 	}
@@ -399,7 +446,7 @@ func (s *Store) UpdateProject(ctx context.Context, project domain.Project, updat
 		    revision = $6, updated_at = $7
 		WHERE id = $1
 		RETURNING id, server_id, repository_id, name, enabled, sources, schedule, policy,
-		          revision, created_at, updated_at`, project.ID, project.Name, sources,
+		          revision, created_at, updated_at, archived_at`, project.ID, project.Name, sources,
 		schedule, policy, project.Revision, project.UpdatedAt))
 	if err != nil {
 		return domain.Project{}, mapError(err)
@@ -426,7 +473,7 @@ func (s *Store) SetProjectEnabled(ctx context.Context, id string, enabled bool, 
 	if current == enabled {
 		project, err := scanProject(tx.QueryRow(ctx, `
 			SELECT id, server_id, repository_id, name, enabled, sources, schedule, policy,
-			       revision, created_at, updated_at FROM projects WHERE id = $1`, id))
+			       revision, created_at, updated_at, archived_at FROM projects WHERE id = $1`, id))
 		if err != nil {
 			return domain.Project{}, err
 		}
@@ -445,9 +492,45 @@ func (s *Store) SetProjectEnabled(ctx context.Context, id string, enabled bool, 
 		UPDATE projects SET enabled = $2, revision = $3, updated_at = $4
 		WHERE id = $1
 		RETURNING id, server_id, repository_id, name, enabled, sources, schedule, policy,
-		          revision, created_at, updated_at`, id, enabled, revision, updatedAt))
+		          revision, created_at, updated_at, archived_at`, id, enabled, revision, updatedAt))
 	if err != nil {
 		return domain.Project{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Project{}, err
+	}
+	return project, nil
+}
+
+func (s *Store) ArchiveProject(ctx context.Context, id string, archivedAt time.Time) (domain.Project, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Project{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var serverID string
+	if err := tx.QueryRow(ctx, `
+		SELECT server_id FROM projects WHERE id = $1 AND archived_at IS NULL FOR UPDATE`, id).Scan(&serverID); errors.Is(err, pgx.ErrNoRows) {
+		return domain.Project{}, store.ErrNotFound
+	} else if err != nil {
+		return domain.Project{}, err
+	}
+	// The revision bump removes the project from the Agent's DesiredConfig on
+	// its next successful sync; run history and snapshot indexes keep their
+	// references for auditing and recovery evidence.
+	var revision int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE servers SET desired_revision = desired_revision + 1
+		WHERE id = $1 RETURNING desired_revision`, serverID).Scan(&revision); err != nil {
+		return domain.Project{}, err
+	}
+	project, err := scanProject(tx.QueryRow(ctx, `
+		UPDATE projects SET archived_at = $2, enabled = FALSE, revision = $3, updated_at = $4
+		WHERE id = $1
+		RETURNING id, server_id, repository_id, name, enabled, sources, schedule, policy,
+		          revision, created_at, updated_at, archived_at`, id, archivedAt, revision, archivedAt))
+	if err != nil {
+		return domain.Project{}, mapError(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Project{}, err
@@ -467,8 +550,8 @@ func (s *Store) DesiredConfig(ctx context.Context, serverID string) (domain.Agen
 		       p.schedule, p.policy, p.revision, p.created_at, p.updated_at,
 		       r.id, r.provider, r.name, r.url, r.secret_ciphertext, r.created_at
 		FROM projects p
-		JOIN repositories r ON r.id = p.repository_id
-		WHERE p.server_id = $1 AND p.enabled = TRUE
+		JOIN repositories r ON r.id = p.repository_id AND r.archived_at IS NULL
+		WHERE p.server_id = $1 AND p.enabled = TRUE AND p.archived_at IS NULL
 		ORDER BY p.id`, serverID)
 	if err != nil {
 		return domain.AgentConfig{}, err
@@ -783,18 +866,46 @@ func (s *Store) ListProjectBackupActivity(ctx context.Context) ([]domain.Project
 	return result, rows.Err()
 }
 
+// PruneBefore deletes expired operational facts from one scope. Runs and audit
+// events are plain deletes; deliveries cascade from incidents so a single
+// incident delete also removes its delivery history. Pending notification
+// work and firing incidents are never removed, regardless of age.
+func (s *Store) PruneBefore(ctx context.Context, scope store.RetentionScope, before time.Time) (int64, error) {
+	var query string
+	switch scope {
+	case store.RetentionRuns:
+		query = `WITH removed AS (DELETE FROM runs WHERE started_at < $1 AND status <> 'running' RETURNING 1) SELECT COUNT(*) FROM removed`
+	case store.RetentionCommands:
+		query = `WITH removed AS (DELETE FROM commands WHERE created_at < $1 AND completed_at IS NOT NULL RETURNING 1) SELECT COUNT(*) FROM removed`
+	case store.RetentionDeliveries:
+		query = `WITH removed AS (DELETE FROM notification_deliveries WHERE created_at < $1 AND status IN ('sent', 'failed') RETURNING 1) SELECT COUNT(*) FROM removed`
+	case store.RetentionIncidents:
+		query = `WITH removed AS (DELETE FROM alert_incidents WHERE updated_at < $1 AND status = 'resolved' RETURNING 1) SELECT COUNT(*) FROM removed`
+	case store.RetentionAudit:
+		query = `WITH removed AS (DELETE FROM audit_events WHERE created_at < $1 RETURNING 1) SELECT COUNT(*) FROM removed`
+	default:
+		return 0, fmt.Errorf("unknown retention scope %q", scope)
+	}
+	tag, err := s.pool.Exec(ctx, query, before)
+	if err != nil {
+		return 0, mapError(err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *Store) CreateNotificationChannel(ctx context.Context, channel domain.NotificationChannel) (domain.NotificationChannel, error) {
 	eventTypes, _ := json.Marshal(channel.EventTypes)
 	projectIDs, _ := json.Marshal(channel.ProjectIDs)
+	serverIDs, _ := json.Marshal(channel.ServerIDs)
 	created, err := scanNotificationChannel(s.pool.QueryRow(ctx, `
 		INSERT INTO notification_channels
 			(id, name, type, enabled, send_resolved, repeat_interval_seconds, event_types, project_ids,
-			 secret_ciphertext, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			 server_ids, secret_ciphertext, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		RETURNING id, name, type, enabled, send_resolved, repeat_interval_seconds, event_types,
-		          project_ids, secret_ciphertext, created_at, updated_at, deleted_at`,
+		          project_ids, server_ids, secret_ciphertext, created_at, updated_at, deleted_at`,
 		channel.ID, channel.Name, channel.Type, channel.Enabled, channel.SendResolved,
-		channel.RepeatIntervalSeconds, eventTypes, projectIDs, channel.SecretCiphertext,
+		channel.RepeatIntervalSeconds, eventTypes, projectIDs, serverIDs, channel.SecretCiphertext,
 		channel.CreatedAt, channel.UpdatedAt))
 	return created, mapError(err)
 }
@@ -802,7 +913,7 @@ func (s *Store) CreateNotificationChannel(ctx context.Context, channel domain.No
 func (s *Store) GetNotificationChannel(ctx context.Context, id string) (domain.NotificationChannel, error) {
 	channel, err := scanNotificationChannel(s.pool.QueryRow(ctx, `
 		SELECT id, name, type, enabled, send_resolved, repeat_interval_seconds, event_types,
-		       project_ids, secret_ciphertext, created_at, updated_at, deleted_at
+		       project_ids, server_ids, secret_ciphertext, created_at, updated_at, deleted_at
 		FROM notification_channels WHERE id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.NotificationChannel{}, store.ErrNotFound
@@ -813,7 +924,7 @@ func (s *Store) GetNotificationChannel(ctx context.Context, id string) (domain.N
 func (s *Store) ListNotificationChannels(ctx context.Context) ([]domain.NotificationChannel, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, type, enabled, send_resolved, repeat_interval_seconds, event_types,
-		       project_ids, secret_ciphertext, created_at, updated_at, deleted_at
+		       project_ids, server_ids, secret_ciphertext, created_at, updated_at, deleted_at
 		FROM notification_channels WHERE deleted_at IS NULL ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -833,15 +944,16 @@ func (s *Store) ListNotificationChannels(ctx context.Context) ([]domain.Notifica
 func (s *Store) UpdateNotificationChannel(ctx context.Context, channel domain.NotificationChannel) (domain.NotificationChannel, error) {
 	eventTypes, _ := json.Marshal(channel.EventTypes)
 	projectIDs, _ := json.Marshal(channel.ProjectIDs)
+	serverIDs, _ := json.Marshal(channel.ServerIDs)
 	updated, err := scanNotificationChannel(s.pool.QueryRow(ctx, `
 		UPDATE notification_channels
 		SET name=$2, type=$3, enabled=$4, send_resolved=$5, repeat_interval_seconds=$6,
-		    event_types=$7, project_ids=$8, secret_ciphertext=$9, updated_at=$10
+		    event_types=$7, project_ids=$8, server_ids=$9, secret_ciphertext=$10, updated_at=$11
 		WHERE id=$1 AND deleted_at IS NULL
 		RETURNING id, name, type, enabled, send_resolved, repeat_interval_seconds, event_types,
-		          project_ids, secret_ciphertext, created_at, updated_at, deleted_at`,
+		          project_ids, server_ids, secret_ciphertext, created_at, updated_at, deleted_at`,
 		channel.ID, channel.Name, channel.Type, channel.Enabled, channel.SendResolved,
-		channel.RepeatIntervalSeconds, eventTypes, projectIDs, channel.SecretCiphertext, channel.UpdatedAt))
+		channel.RepeatIntervalSeconds, eventTypes, projectIDs, serverIDs, channel.SecretCiphertext, channel.UpdatedAt))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.NotificationChannel{}, store.ErrNotFound
 	}
@@ -862,14 +974,19 @@ func (s *Store) ArchiveNotificationChannel(ctx context.Context, id string, at ti
 }
 
 func (s *Store) CreateAlertIncident(ctx context.Context, alert domain.AlertIncident) (domain.AlertIncident, error) {
+	if alert.ResourceType == "" && alert.ProjectID != "" {
+		alert.ResourceType, alert.ResourceID, alert.ResourceName = "project", alert.ProjectID, alert.ProjectName
+	}
 	created, err := scanAlertIncident(s.pool.QueryRow(ctx, `
 		INSERT INTO alert_incidents
-			(id, fingerprint, kind, project_id, project_name, status, severity, summary, description,
-			 source_event_id, occurrence_count, started_at, updated_at, resolved_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-		RETURNING id, fingerprint, kind, project_id, project_name, status, severity, summary,
+			(id, fingerprint, kind, resource_type, resource_id, resource_name, project_id, project_name,
+			 status, severity, summary, description, source_event_id, occurrence_count, started_at, updated_at, resolved_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+		RETURNING id, fingerprint, kind, resource_type, resource_id, resource_name,
+		          COALESCE(project_id, ''), COALESCE(project_name, ''), status, severity, summary,
 		          description, source_event_id, occurrence_count, started_at, updated_at, resolved_at`,
-		alert.ID, alert.Fingerprint, alert.Kind, alert.ProjectID, alert.ProjectName, alert.Status,
+		alert.ID, alert.Fingerprint, alert.Kind, alert.ResourceType, alert.ResourceID, alert.ResourceName,
+		nullableString(alert.ProjectID), nullableString(alert.ProjectName), alert.Status,
 		alert.Severity, alert.Summary, alert.Description, alert.SourceEventID, alert.OccurrenceCount,
 		alert.StartedAt, alert.UpdatedAt, alert.ResolvedAt))
 	return created, mapError(err)
@@ -877,7 +994,8 @@ func (s *Store) CreateAlertIncident(ctx context.Context, alert domain.AlertIncid
 
 func (s *Store) GetAlertIncident(ctx context.Context, id string) (domain.AlertIncident, error) {
 	alert, err := scanAlertIncident(s.pool.QueryRow(ctx, `
-		SELECT id, fingerprint, kind, project_id, project_name, status, severity, summary,
+		SELECT id, fingerprint, kind, resource_type, resource_id, resource_name,
+		       COALESCE(project_id, ''), COALESCE(project_name, ''), status, severity, summary,
 		       description, source_event_id, occurrence_count, started_at, updated_at, resolved_at
 		FROM alert_incidents WHERE id=$1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -888,7 +1006,8 @@ func (s *Store) GetAlertIncident(ctx context.Context, id string) (domain.AlertIn
 
 func (s *Store) GetFiringAlertIncident(ctx context.Context, fingerprint string) (domain.AlertIncident, error) {
 	alert, err := scanAlertIncident(s.pool.QueryRow(ctx, `
-		SELECT id, fingerprint, kind, project_id, project_name, status, severity, summary,
+		SELECT id, fingerprint, kind, resource_type, resource_id, resource_name,
+		       COALESCE(project_id, ''), COALESCE(project_name, ''), status, severity, summary,
 		       description, source_event_id, occurrence_count, started_at, updated_at, resolved_at
 		FROM alert_incidents WHERE fingerprint=$1 AND status='firing'`, fingerprint))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -900,12 +1019,13 @@ func (s *Store) GetFiringAlertIncident(ctx context.Context, fingerprint string) 
 func (s *Store) UpdateAlertIncident(ctx context.Context, alert domain.AlertIncident) (domain.AlertIncident, error) {
 	updated, err := scanAlertIncident(s.pool.QueryRow(ctx, `
 		UPDATE alert_incidents
-		SET project_name=$2, status=$3, severity=$4, summary=$5, description=$6,
-		    source_event_id=$7, occurrence_count=$8, updated_at=$9, resolved_at=$10
+		SET resource_name=$2, project_name=$3, status=$4, severity=$5, summary=$6, description=$7,
+		    source_event_id=$8, occurrence_count=$9, updated_at=$10, resolved_at=$11
 		WHERE id=$1
-		RETURNING id, fingerprint, kind, project_id, project_name, status, severity, summary,
+		RETURNING id, fingerprint, kind, resource_type, resource_id, resource_name,
+		          COALESCE(project_id, ''), COALESCE(project_name, ''), status, severity, summary,
 		          description, source_event_id, occurrence_count, started_at, updated_at, resolved_at`,
-		alert.ID, alert.ProjectName, alert.Status, alert.Severity, alert.Summary, alert.Description,
+		alert.ID, alert.ResourceName, nullableString(alert.ProjectName), alert.Status, alert.Severity, alert.Summary, alert.Description,
 		alert.SourceEventID, alert.OccurrenceCount, alert.UpdatedAt, alert.ResolvedAt))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.AlertIncident{}, store.ErrNotFound
@@ -918,7 +1038,8 @@ func (s *Store) ListAlertIncidents(ctx context.Context, limit int) ([]domain.Ale
 		limit = 100
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, fingerprint, kind, project_id, project_name, status, severity, summary,
+		SELECT id, fingerprint, kind, resource_type, resource_id, resource_name,
+		       COALESCE(project_id, ''), COALESCE(project_name, ''), status, severity, summary,
 		       description, source_event_id, occurrence_count, started_at, updated_at, resolved_at
 		FROM alert_incidents ORDER BY updated_at DESC, id DESC LIMIT $1`, limit)
 	if err != nil {
@@ -1072,12 +1193,12 @@ func (s *Store) Dashboard(ctx context.Context, since time.Time) (domain.Dashboar
 	err := s.pool.QueryRow(ctx, `
 		SELECT
 		  (SELECT COUNT(*) FROM servers),
-		  (SELECT COUNT(*) FROM servers WHERE last_seen_at >= NOW() - INTERVAL '90 seconds'),
+		  (SELECT COUNT(*) FROM servers WHERE last_seen_at >= NOW() - $2::interval),
 		  (SELECT COUNT(*) FROM projects),
-		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $2),
-		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status IN ($3, $4, $5)),
-		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $6)`,
-		since, domain.RunSucceeded, domain.RunFailed, domain.RunTimedOut,
+		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $3),
+		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status IN ($4, $5, $6)),
+		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $7)`,
+		since, fmt.Sprintf("%d seconds", int64(domain.AgentOfflineAfter/time.Second)), domain.RunSucceeded, domain.RunFailed, domain.RunTimedOut,
 		domain.RunUnknown, domain.RunPartial).Scan(&dashboard.ServersTotal,
 		&dashboard.ServersOnline, &dashboard.ProjectsTotal, &dashboard.RunsSucceeded,
 		&dashboard.RunsFailed, &dashboard.RunsPartial)
@@ -1092,14 +1213,14 @@ func scanServer(row scanner) (domain.Server, error) {
 	var server domain.Server
 	err := row.Scan(&server.ID, &server.Name, &server.Hostname, &server.OS, &server.Arch,
 		&server.AgentVersion, &server.Status, &server.LastSeenAt, &server.DesiredRevision,
-		&server.AppliedRevision, &server.CreatedAt)
+		&server.AppliedRevision, &server.CreatedAt, &server.ArchivedAt)
 	return server, err
 }
 
 func getServer(ctx context.Context, tx pgx.Tx, id string) (domain.Server, error) {
 	return scanServer(tx.QueryRow(ctx, `
 		SELECT id, name, hostname, os, arch, agent_version, status, last_seen_at,
-		       desired_revision, applied_revision, created_at
+		       desired_revision, applied_revision, created_at, archived_at
 		FROM servers WHERE id = $1`, id))
 }
 
@@ -1107,7 +1228,8 @@ func scanProject(row scanner) (domain.Project, error) {
 	var project domain.Project
 	var sources, schedule, policy []byte
 	err := row.Scan(&project.ID, &project.ServerID, &project.RepositoryID, &project.Name,
-		&project.Enabled, &sources, &schedule, &policy, &project.Revision, &project.CreatedAt, &project.UpdatedAt)
+		&project.Enabled, &sources, &schedule, &policy, &project.Revision, &project.CreatedAt, &project.UpdatedAt,
+		&project.ArchivedAt)
 	if err != nil {
 		return domain.Project{}, err
 	}
@@ -1142,9 +1264,9 @@ func scanSnapshot(row scanner) (domain.Snapshot, error) {
 
 func scanNotificationChannel(row scanner) (domain.NotificationChannel, error) {
 	var channel domain.NotificationChannel
-	var eventTypes, projectIDs []byte
+	var eventTypes, projectIDs, serverIDs []byte
 	err := row.Scan(&channel.ID, &channel.Name, &channel.Type, &channel.Enabled,
-		&channel.SendResolved, &channel.RepeatIntervalSeconds, &eventTypes, &projectIDs,
+		&channel.SendResolved, &channel.RepeatIntervalSeconds, &eventTypes, &projectIDs, &serverIDs,
 		&channel.SecretCiphertext, &channel.CreatedAt, &channel.UpdatedAt, &channel.DeletedAt)
 	if err != nil {
 		return domain.NotificationChannel{}, err
@@ -1155,13 +1277,17 @@ func scanNotificationChannel(row scanner) (domain.NotificationChannel, error) {
 	if err := json.Unmarshal(projectIDs, &channel.ProjectIDs); err != nil {
 		return domain.NotificationChannel{}, err
 	}
+	if err := json.Unmarshal(serverIDs, &channel.ServerIDs); err != nil {
+		return domain.NotificationChannel{}, err
+	}
 	return channel, nil
 }
 
 func scanAlertIncident(row scanner) (domain.AlertIncident, error) {
 	var alert domain.AlertIncident
-	err := row.Scan(&alert.ID, &alert.Fingerprint, &alert.Kind, &alert.ProjectID,
-		&alert.ProjectName, &alert.Status, &alert.Severity, &alert.Summary,
+	err := row.Scan(&alert.ID, &alert.Fingerprint, &alert.Kind, &alert.ResourceType,
+		&alert.ResourceID, &alert.ResourceName, &alert.ProjectID, &alert.ProjectName,
+		&alert.Status, &alert.Severity, &alert.Summary,
 		&alert.Description, &alert.SourceEventID, &alert.OccurrenceCount,
 		&alert.StartedAt, &alert.UpdatedAt, &alert.ResolvedAt)
 	return alert, err
@@ -1177,6 +1303,13 @@ func scanNotificationDelivery(row scanner) (domain.NotificationDelivery, error) 
 
 func nullableTime(value time.Time) any {
 	if value.IsZero() {
+		return nil
+	}
+	return value
+}
+
+func nullableString(value string) any {
+	if strings.TrimSpace(value) == "" {
 		return nil
 	}
 	return value

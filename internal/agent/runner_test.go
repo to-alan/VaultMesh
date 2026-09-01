@@ -455,6 +455,84 @@ func TestRunnerPassesValidatedRepositoryOptionsToEveryResticCommand(t *testing.T
 	}
 }
 
+func TestRunnerContinuesWhenOptionalSourcePreparationFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell scripts")
+	}
+	directory := t.TempDir()
+	restic := filepath.Join(directory, "fake-restic")
+	resticScript := "#!/bin/sh\n" +
+		"if [ \"$1\" = snapshots ]; then printf '%s\\n' '[]'; exit 0; fi\n" +
+		"printf '%s\\n' '{\"message_type\":\"summary\",\"snapshot_id\":\"optional123\"}'\n"
+	if err := os.WriteFile(restic, []byte(resticScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pgDump := filepath.Join(directory, "failing-pg-dump")
+	if err := os.WriteFile(pgDump, []byte("#!/bin/sh\nprintf '%s\\n' 'database unavailable' >&2\nexit 9\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.AgentProject{
+		Project: domain.Project{ID: "prj_optional", Sources: []domain.Source{
+			{ID: "src_files", Type: "files", Paths: []string{"/tmp"}, Required: true},
+			{ID: "src_database", Type: "postgresql", Required: false, Database: &domain.DatabaseSource{
+				Host: "127.0.0.1", Port: 5432, Username: "backup", Password: "db-secret", Database: "app",
+			}},
+		}},
+		Repository: domain.Repository{ID: "repo", URL: "/tmp/repository", Password: "repository-secret"},
+	}
+	result := NewRunnerWithTools(restic, "mysqldump", pgDump, "docker", filepath.Join(directory, "staging")).Execute(context.Background(), "srv", project)
+	if result.Status != domain.RunPartial || result.SnapshotID != "optional123" || result.ErrorCode != "optional_source_failed" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if result.Stats["optional_source_count"] != 1 {
+		t.Fatalf("optional source failure was not recorded: %#v", result.Stats)
+	}
+	warnings, ok := result.Stats["optional_sources_skipped"].([]sourcePreparationWarning)
+	if !ok || len(warnings) != 1 || warnings[0].SourceID != "src_database" {
+		t.Fatalf("unexpected optional source details: %#v", result.Stats["optional_sources_skipped"])
+	}
+	if strings.Contains(result.ErrorMessage, "db-secret") || strings.Contains(result.ErrorMessage, "repository-secret") {
+		t.Fatalf("optional source error leaked a credential: %q", result.ErrorMessage)
+	}
+}
+
+func TestRunnerStopsWhenRequiredSourcePreparationFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses POSIX shell scripts")
+	}
+	directory := t.TempDir()
+	backupMarker := filepath.Join(directory, "backup-ran")
+	t.Setenv("FAKE_BACKUP_MARKER", backupMarker)
+	restic := filepath.Join(directory, "fake-restic")
+	resticScript := "#!/bin/sh\n" +
+		"if [ \"$1\" = snapshots ]; then printf '%s\\n' '[]'; exit 0; fi\n" +
+		": > \"$FAKE_BACKUP_MARKER\"\n" +
+		"printf '%s\\n' '{\"message_type\":\"summary\",\"snapshot_id\":\"unexpected123\"}'\n"
+	if err := os.WriteFile(restic, []byte(resticScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pgDump := filepath.Join(directory, "failing-pg-dump")
+	if err := os.WriteFile(pgDump, []byte("#!/bin/sh\nexit 9\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	project := domain.AgentProject{
+		Project: domain.Project{ID: "prj_required", Sources: []domain.Source{
+			{ID: "src_files", Type: "files", Paths: []string{"/tmp"}, Required: true},
+			{ID: "src_database", Type: "postgresql", Required: true, Database: &domain.DatabaseSource{
+				Host: "127.0.0.1", Port: 5432, Username: "backup", Password: "secret", Database: "app",
+			}},
+		}},
+		Repository: domain.Repository{ID: "repo", URL: "/tmp/repository", Password: "secret"},
+	}
+	result := NewRunnerWithTools(restic, "mysqldump", pgDump, "docker", filepath.Join(directory, "staging")).Execute(context.Background(), "srv", project)
+	if result.Status != domain.RunFailed || result.ErrorCode != "source_preparation_failed" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if _, err := os.Stat(backupMarker); !os.IsNotExist(err) {
+		t.Fatalf("Restic backup ran after a required source failed: %v", err)
+	}
+}
+
 func contains(value, part string) bool {
 	for index := 0; index+len(part) <= len(value); index++ {
 		if value[index:index+len(part)] == part {

@@ -15,6 +15,18 @@ var (
 	ErrUnauthorized      = errors.New("unauthorized")
 )
 
+// RetentionScope selects which control-plane table a PruneBefore call
+// removes expired rows from.
+type RetentionScope = domain.RetentionScope
+
+const (
+	RetentionRuns       = domain.RetentionRuns
+	RetentionCommands   = domain.RetentionCommands
+	RetentionDeliveries = domain.RetentionDeliveries
+	RetentionIncidents  = domain.RetentionIncidents
+	RetentionAudit      = domain.RetentionAudit
+)
+
 type Store interface {
 	Ping(context.Context) error
 	Close()
@@ -27,16 +39,19 @@ type Store interface {
 	AuthenticateAgent(context.Context, []byte) (domain.Server, error)
 	UpdateHeartbeat(context.Context, string, domain.Heartbeat, time.Time) error
 	ListServers(context.Context) ([]domain.Server, error)
+	ArchiveServer(context.Context, string, time.Time) (domain.Server, error)
 
 	CreateRepository(context.Context, domain.Repository) (domain.Repository, error)
 	ListRepositories(context.Context) ([]domain.Repository, error)
 	GetRepository(context.Context, string) (domain.Repository, error)
+	ArchiveRepository(context.Context, string, time.Time) (domain.Repository, error)
 
 	CreateProject(context.Context, domain.Project) (domain.Project, error)
 	GetProject(context.Context, string) (domain.Project, error)
 	ListProjects(context.Context) ([]domain.Project, error)
 	UpdateProject(context.Context, domain.Project, time.Time) (domain.Project, error)
 	SetProjectEnabled(context.Context, string, bool, time.Time) (domain.Project, error)
+	ArchiveProject(context.Context, string, time.Time) (domain.Project, error)
 	DesiredConfig(context.Context, string) (domain.AgentConfig, error)
 	CreateCommand(context.Context, domain.Command) (domain.Command, error)
 	ClaimCommands(context.Context, string, time.Time, time.Time, int) ([]domain.Command, error)
@@ -47,6 +62,7 @@ type Store interface {
 	UpsertRun(context.Context, domain.RunReport) error
 	ListRuns(context.Context, int) ([]domain.RunReport, error)
 	ListProjectBackupActivity(context.Context) ([]domain.ProjectBackupActivity, error)
+	PruneBefore(context.Context, domain.RetentionScope, time.Time) (int64, error)
 
 	CreateNotificationChannel(context.Context, domain.NotificationChannel) (domain.NotificationChannel, error)
 	GetNotificationChannel(context.Context, string) (domain.NotificationChannel, error)

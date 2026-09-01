@@ -1,6 +1,6 @@
 # 通知与告警
 
-VaultMesh 把“告警状态”和“消息发送”分开处理：项目事实先形成 Incident，再根据用户定义的 Contact Point 创建持久化 Delivery。通知服务故障不会把一次已经成功的备份改成失败，也不会阻塞 Agent 上报。
+VaultMesh 把“告警状态”和“消息发送”分开处理：运行、计划和 Agent 心跳事实先形成 Incident，再根据用户定义的 Contact Point 创建持久化 Delivery。通知服务故障不会把一次已经成功的备份改成失败，也不会阻塞 Agent 上报。
 
 ## 设计依据
 
@@ -40,8 +40,9 @@ Webhook URL、令牌和密码通常本身就是凭据。VaultMesh 将渠道配�
 | 规则 | 语义 |
 |---|---|
 | `enabled` | 暂停后不再创建或发送新投递 |
-| `event_types` | 当前可选 `backup_failure`、`rpo_overdue` |
-| `project_ids` | 空数组表示所有项目；非空表示项目 allowlist |
+| `event_types` | 当前可选 `backup_failure`、`rpo_overdue`、`agent_offline`、`config_error` |
+| `project_ids` | 只作用于项目事件；空数组表示所有项目，非空表示项目 allowlist |
+| `server_ids` | 只作用于 Agent 离线与配置降级事件；空数组表示所有服务器，非空表示服务器 allowlist |
 | `repeat_interval_seconds` | 持续异常的提醒周期，5 分钟至 7 天，默认 4 小时 |
 | `send_resolved` | 异常恢复后是否发送恢复消息 |
 | `allow_private_address` | 默认关闭；仅在目标是明确受信的自建内网服务时开启 |
@@ -50,12 +51,18 @@ Webhook URL、令牌和密码通常本身就是凭据。VaultMesh 将渠道配�
 
 ## Incident、去重与恢复
 
-当前自动产生两类 Incident：
+当前自动产生四类 Incident：
 
 | 事件 | 指纹 | 触发 | 恢复 |
 |---|---|---|---|
-| 备份失败 | `backup:<project_id>` | 最近一次备份为 `partial`、`failed`、`timed_out`、`unknown` 或 `canceled` | 出现更新的成功备份，或项目被暂停 |
-| RPO 超时 | `rpo:<project_id>` | 项目健康状态进入 `overdue` | 项目不再 `overdue`，或项目被暂停 |
+| 备份失败 | `backup:<project_id>` | 最近一次备份为 `partial`、`failed`、`timed_out`、`unknown` 或 `canceled` | 出现更新的成功备份，项目被暂停，或项目被归档 |
+| RPO 超时 | `rpo:<project_id>` | 项目健康状态进入 `overdue` | 项目不再 `overdue`，或项目被暂停或归档 |
+| Agent 离线 | `agent:<server_id>` | 已注册 Agent 超过 90 秒没有心跳 | 同一 Agent 恢复心跳，或服务器被归档 |
+| 配置降级 | `config:<server_id>` | 某项目的仓库或数据库凭据无法用当前主密钥解密，配置按项目降级下发 | 解密恢复，配置重新完整，或服务器被归档 |
+
+Agent 离线告警按服务器聚合，而不是按该服务器上的每个项目复制，因此一台机器只产生一个 Incident。服务器事件使用 `resource_type=server`，并通过独立的 `server_ids` 路由；项目筛选不会意外屏蔽或复制服务器事件。Agent 尚未完成首次注册时不会产生离线告警。
+
+配置降级是主密钥丢失或数据库恢复到错误密钥版本的信号：Agent 仍会继续运行未受影响的项目，但缺失的项目必须修复密钥后由下一次同步补回。升级前已经存在的渠道会保留原 `event_types`，不会在无人确认的情况下自动订阅新增事件。新建渠道默认选择当前四类事件。
 
 同一指纹在 firing 期间只对应一个 Incident。状态流转为：
 
@@ -84,7 +91,7 @@ Webhook URL、令牌和密码通常本身就是凭据。VaultMesh 将渠道配�
 
 ## 当前边界
 
-- 尚未根据 Agent 离线、仓库 Check 失败、恢复演练过期产生 Incident；
+- 尚未根据仓库 Check 失败、恢复演练过期产生 Incident；
 - 尚无静默时段、维护窗口、告警确认和多级升级链；
 - 一个渠道就是一个联系点，尚未提供 Grafana 风格的联系点组合与路由树；
 - 投递与 Incident 都保存在控制面 PostgreSQL，生产环境必须把它们纳入控制面灾备。

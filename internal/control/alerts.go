@@ -14,11 +14,16 @@ import (
 )
 
 type alertCondition struct {
-	Kind, ProjectID, ProjectName, SourceEventID, Severity, Summary, Description string
+	Kind, ResourceType, ResourceID, ResourceName, ProjectID, ProjectName string
+	SourceEventID, Severity, Summary, Description                        string
 }
 
 func (s *Service) EvaluateAlerts(ctx context.Context) error {
 	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return err
+	}
+	servers, err := s.store.ListServers(ctx)
 	if err != nil {
 		return err
 	}
@@ -42,6 +47,21 @@ func (s *Service) EvaluateAlerts(ctx context.Context) error {
 	for _, item := range activityItems {
 		activity[item.ProjectID] = item
 	}
+	for _, server := range servers {
+		var offline *alertCondition
+		if server.Status == domain.ServerOffline && server.LastSeenAt != nil {
+			offline = &alertCondition{
+				Kind: "agent_offline", ResourceType: "server", ResourceID: server.ID, ResourceName: server.Name,
+				SourceEventID: strconv.FormatInt(server.LastSeenAt.Unix(), 10), Severity: "warning",
+				Summary: "Agent 已离线",
+				Description: fmt.Sprintf("Agent 自 %s 起未再上报心跳，已超过 %s。现有本地计划可能仍在执行，但控制面无法确认状态或下发命令。",
+					server.LastSeenAt.Format(time.RFC3339), domain.AgentOfflineAfter),
+			}
+		}
+		if err := s.reconcileAlert(ctx, "agent:"+server.ID, offline); err != nil {
+			return err
+		}
+	}
 	for _, project := range projects {
 		if !project.Enabled {
 			if err := s.reconcileAlert(ctx, "rpo:"+project.ID, nil); err != nil {
@@ -61,7 +81,8 @@ func (s *Service) EvaluateAlerts(ctx context.Context) error {
 				description = fmt.Sprintf("备份应在 %s 前完成，但控制面仍未看到新的成功记录。", healthItem.DeadlineAt.Format(time.RFC3339))
 				sourceEventID = strconv.FormatInt(healthItem.DeadlineAt.Unix(), 10)
 			}
-			rpo = &alertCondition{Kind: "rpo_overdue", ProjectID: project.ID, ProjectName: project.Name,
+			rpo = &alertCondition{Kind: "rpo_overdue", ResourceType: "project", ResourceID: project.ID, ResourceName: project.Name,
+				ProjectID: project.ID, ProjectName: project.Name,
 				SourceEventID: sourceEventID, Severity: "critical",
 				Summary: "备份项目超过 RPO", Description: description}
 		}
@@ -71,7 +92,8 @@ func (s *Service) EvaluateAlerts(ctx context.Context) error {
 		activityItem := activity[project.ID]
 		var failure *alertCondition
 		if isBackupFailureStatus(activityItem.LatestRunStatus) {
-			failure = &alertCondition{Kind: "backup_failure", ProjectID: project.ID, ProjectName: projectNames[project.ID],
+			failure = &alertCondition{Kind: "backup_failure", ResourceType: "project", ResourceID: project.ID, ResourceName: projectNames[project.ID],
+				ProjectID: project.ID, ProjectName: projectNames[project.ID],
 				SourceEventID: activityItem.LatestRunID, Severity: backupFailureSeverity(activityItem.LatestRunStatus),
 				Summary: "备份运行未成功", Description: fmt.Sprintf("最近一次备份运行状态为 %s。", activityItem.LatestRunStatus)}
 		}
@@ -107,8 +129,10 @@ func (s *Service) reconcileAlert(ctx context.Context, fingerprint string, condit
 			return err
 		}
 		created, err := s.store.CreateAlertIncident(ctx, domain.AlertIncident{
-			ID: id, Fingerprint: fingerprint, Kind: condition.Kind, ProjectID: condition.ProjectID,
-			ProjectName: condition.ProjectName, Status: "firing", Severity: condition.Severity,
+			ID: id, Fingerprint: fingerprint, Kind: condition.Kind,
+			ResourceType: condition.ResourceType, ResourceID: condition.ResourceID, ResourceName: condition.ResourceName,
+			ProjectID: condition.ProjectID, ProjectName: condition.ProjectName,
+			Status: "firing", Severity: condition.Severity,
 			Summary: condition.Summary, Description: condition.Description, SourceEventID: condition.SourceEventID,
 			OccurrenceCount: 1, StartedAt: now, UpdatedAt: now,
 		})
@@ -117,12 +141,23 @@ func (s *Service) reconcileAlert(ctx context.Context, fingerprint string, condit
 		}
 		return s.enqueueAlertNotifications(ctx, created, "firing")
 	}
+	changed := false
 	if current.SourceEventID != condition.SourceEventID {
 		current.SourceEventID = condition.SourceEventID
 		current.OccurrenceCount++
-		current.UpdatedAt = now
+		changed = true
+	}
+	if current.ResourceName != condition.ResourceName || current.ProjectName != condition.ProjectName ||
+		current.Severity != condition.Severity || current.Summary != condition.Summary || current.Description != condition.Description {
+		current.ResourceName = condition.ResourceName
+		current.ProjectName = condition.ProjectName
 		current.Severity = condition.Severity
+		current.Summary = condition.Summary
 		current.Description = condition.Description
+		changed = true
+	}
+	if changed {
+		current.UpdatedAt = now
 		current, err = s.store.UpdateAlertIncident(ctx, current)
 		if err != nil {
 			return err
@@ -138,7 +173,7 @@ func (s *Service) enqueueAlertNotifications(ctx context.Context, alert domain.Al
 	}
 	now := s.now()
 	for _, channel := range channels {
-		if !channel.Enabled || !containsString(channel.EventTypes, alert.Kind) || !matchesProject(channel.ProjectIDs, alert.ProjectID) {
+		if !channel.Enabled || !containsString(channel.EventTypes, alert.Kind) || !matchesAlertScope(channel, alert) {
 			continue
 		}
 		if transition == "resolved" && !channel.SendResolved {
@@ -180,6 +215,13 @@ func containsString(values []string, target string) bool {
 
 func matchesProject(projectIDs []string, projectID string) bool {
 	return len(projectIDs) == 0 || containsString(projectIDs, projectID)
+}
+
+func matchesAlertScope(channel domain.NotificationChannel, alert domain.AlertIncident) bool {
+	if alert.ResourceType == "server" {
+		return len(channel.ServerIDs) == 0 || containsString(channel.ServerIDs, alert.ResourceID)
+	}
+	return matchesProject(channel.ProjectIDs, alert.ProjectID)
 }
 
 func isBackupFailureStatus(status string) bool {
@@ -245,6 +287,36 @@ func boundedNotificationError(err error) string {
 	return value
 }
 
+func (s *Service) PruneExpired(ctx context.Context) (int64, error) {
+	retention := s.dataRetention
+	if !retention.Enabled() {
+		return 0, nil
+	}
+	now := s.now()
+	var total int64
+	scopes := []struct {
+		scope store.RetentionScope
+		days  int
+	}{
+		{store.RetentionRuns, retention.RunsDays},
+		{store.RetentionCommands, retention.CommandsDays},
+		{store.RetentionDeliveries, retention.DeliveriesDays},
+		{store.RetentionIncidents, retention.IncidentsDays},
+		{store.RetentionAudit, retention.AuditEventsDays},
+	}
+	for _, item := range scopes {
+		if item.days <= 0 {
+			continue
+		}
+		removed, err := s.store.PruneBefore(ctx, item.scope, now.Add(-time.Duration(item.days)*24*time.Hour))
+		if err != nil {
+			return total, err
+		}
+		total += removed
+	}
+	return total, nil
+}
+
 func (s *Service) RunNotificationWorker(ctx context.Context, logger *slog.Logger) {
 	run := func() {
 		cycleCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
@@ -257,7 +329,22 @@ func (s *Service) RunNotificationWorker(ctx context.Context, logger *slog.Logger
 			logger.Error("deliver notifications", "error", err)
 		}
 	}
+	prune := func() {
+		cycleCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		removed, err := s.PruneExpired(cycleCtx)
+		if err != nil {
+			logger.Error("prune expired control-plane records", "error", err)
+			return
+		}
+		if removed > 0 {
+			logger.Info("pruned expired control-plane records", "removed", removed)
+		}
+	}
 	run()
+	prune()
+	pruneTicker := time.NewTicker(retentionInterval)
+	defer pruneTicker.Stop()
 	ticker := time.NewTicker(notificationWorkerInterval)
 	defer ticker.Stop()
 	for {
@@ -266,6 +353,8 @@ func (s *Service) RunNotificationWorker(ctx context.Context, logger *slog.Logger
 			return
 		case <-ticker.C:
 			run()
+		case <-pruneTicker.C:
+			prune()
 		}
 	}
 }

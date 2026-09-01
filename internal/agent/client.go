@@ -27,6 +27,49 @@ var (
 	errRedirect    = errors.New("control plane redirects are not allowed")
 )
 
+// ControlPlaneError preserves the stable error code returned by the API so
+// callers can make retry decisions without matching human-readable messages.
+type ControlPlaneError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *ControlPlaneError) Error() string {
+	if e == nil {
+		return "control plane request failed"
+	}
+	if e.Code != "" && e.Message != "" {
+		return fmt.Sprintf("control plane returned HTTP %d (%s): %s", e.StatusCode, e.Code, e.Message)
+	}
+	if e.Code != "" {
+		return fmt.Sprintf("control plane returned HTTP %d (%s)", e.StatusCode, e.Code)
+	}
+	return fmt.Sprintf("control plane returned HTTP %d", e.StatusCode)
+}
+
+// IsPermanentReportError returns true only for application-level rejections
+// that cannot become valid by retrying the same immutable run report. Network
+// failures, authentication errors, rate limits, server errors, clock skew and
+// unstructured proxy responses remain retryable.
+func IsPermanentReportError(err error) bool {
+	var controlError *ControlPlaneError
+	if !errors.As(err, &controlError) {
+		return false
+	}
+	switch controlError.Code {
+	case "validation_failed":
+		// Older Control Planes used the generic validation code for clock skew.
+		// Preserve retryability during rolling upgrades; current servers return
+		// the stable agent_clock_ahead code instead.
+		return !strings.Contains(strings.ToLower(controlError.Message), "too far in the future")
+	case "invalid_json", "snapshot_inventory_too_large", "conflict", "not_found":
+		return true
+	default:
+		return false
+	}
+}
+
 type Client struct {
 	baseURL string
 	client  *http.Client
@@ -81,6 +124,22 @@ func (c *Client) Heartbeat(ctx context.Context, token string, heartbeat domain.H
 	return c.doJSON(ctx, http.MethodPost, "/api/v1/agent/heartbeat", token, heartbeat, nil)
 }
 
+// Sync sends a heartbeat and receives the desired configuration in the same
+// request whenever the agent lags behind the control-plane revision. The
+// returned flag reports whether the response carried a configuration.
+func (c *Client) Sync(ctx context.Context, token string, heartbeat domain.Heartbeat) (domain.AgentConfig, bool, error) {
+	var payload struct {
+		Config *domain.AgentConfig `json:"config"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, "/api/v1/agent/heartbeat", token, heartbeat, &payload); err != nil {
+		return domain.AgentConfig{}, false, err
+	}
+	if payload.Config == nil {
+		return domain.AgentConfig{}, false, nil
+	}
+	return *payload.Config, true, nil
+}
+
 func (c *Client) Config(ctx context.Context, token string, revision int64) (domain.AgentConfig, error) {
 	path := "/api/v1/agent/config?after=" + strconv.FormatInt(revision, 10)
 	var config domain.AgentConfig
@@ -93,6 +152,14 @@ func (c *Client) Config(ctx context.Context, token string, revision int64) (doma
 
 func (c *Client) Report(ctx context.Context, token string, report domain.RunReport) error {
 	return c.doJSON(ctx, http.MethodPost, "/api/v1/agent/runs", token, report, nil)
+}
+
+func (c *Client) ReportSnapshots(ctx context.Context, token string, projectID string, snapshots []domain.Snapshot) error {
+	payload := struct {
+		ProjectID string            `json:"project_id"`
+		Snapshots []domain.Snapshot `json:"snapshots"`
+	}{ProjectID: projectID, Snapshots: snapshots}
+	return c.doJSON(ctx, http.MethodPut, "/api/v1/agent/snapshots", token, payload, nil)
 }
 
 func (c *Client) Commands(ctx context.Context, token string) ([]domain.Command, error) {
@@ -143,9 +210,13 @@ func (c *Client) doJSON(ctx context.Context, method, path, token string, input, 
 			} `json:"error"`
 		}
 		if json.Unmarshal(limited, &envelope) == nil && envelope.Error.Message != "" {
-			return fmt.Errorf("control plane returned %s: %s", envelope.Error.Code, envelope.Error.Message)
+			return &ControlPlaneError{
+				StatusCode: response.StatusCode,
+				Code:       envelope.Error.Code,
+				Message:    envelope.Error.Message,
+			}
 		}
-		return fmt.Errorf("control plane returned HTTP %d", response.StatusCode)
+		return &ControlPlaneError{StatusCode: response.StatusCode}
 	}
 	if output == nil || response.StatusCode == http.StatusNoContent {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxDiscardResponse))
