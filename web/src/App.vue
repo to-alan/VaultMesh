@@ -56,6 +56,11 @@ import {
 } from './forms/project'
 import { controlPlane } from './services'
 import type { NotificationChannelWriteInput } from './services'
+import { useAuditFilters } from './composables/auditFilters'
+import { useProjectFilters, useRunFilters } from './composables/filters'
+import { useSnapshotExplorer } from './composables/snapshotExplorer'
+import AuditView from './views/AuditView.vue'
+import RunsView from './views/RunsView.vue'
 import type { AlertIncident, AuditEvent, Dashboard, EnrollmentResult, NotificationChannel, NotificationDelivery, Passkey, Profile, Project, ProjectHealth, Repository, Run, Server, Snapshot, SnapshotEntry } from './types'
 import { friendlyPasskeyError, parseCreationOptions, parseRequestOptions, serializeAssertion, serializeRegistration, suggestedPasskeyName } from './webauthn'
 
@@ -120,14 +125,35 @@ const projectStateFilter = ref<'all' | 'enabled' | 'paused' | 'at_risk'>('all')
 const runSearch = ref('')
 const runStatusFilter = ref<RunStatusFilter>('all')
 const runOperationFilter = ref<RunOperationFilter>('all')
-const snapshots = ref<Snapshot[]>([])
-const snapshotProjectFilter = ref('')
-const selectedSnapshotID = ref('')
-const selectedSnapshotProjectID = ref('')
-const snapshotBrowsePath = ref('/')
-const pendingRestorePath = ref<string | null>(null)
-const snapshotBrowseCommandID = ref('')
-const snapshotRestoreCommandID = ref('')
+const explorer = useSnapshotExplorer({
+  runs,
+  browse: async (projectID, snapshotID, path) => {
+    const command = await perform(async () => {
+      const command = await controlPlane.projects.browseSnapshot(projectID, snapshotID, path)
+      success.value = `目录读取已发送给 ${serverName(explorer.selected.value?.server_id ?? '')}，Agent 返回后会自动展示。`
+      queueSnapshotPolls()
+      return command
+    })
+    return command ?? null
+  },
+  restore: async (projectID, snapshotID, path) => {
+    const command = await perform(async () => {
+      const command = await controlPlane.projects.restoreSnapshot(projectID, snapshotID, path)
+      success.value = '安全恢复已排队：Agent 只会写入新的隔离目录，并强制禁止覆盖已有文件。'
+      queueSnapshotPolls()
+      return command
+    })
+    return command ?? null
+  },
+})
+const snapshots = explorer.snapshots
+const snapshotProjectFilter = explorer.projectFilter
+const selectedSnapshotID = explorer.selectedID
+const selectedSnapshotProjectID = explorer.selectedProjectID
+const snapshotBrowsePath = explorer.browsePath
+const pendingRestorePath = explorer.pendingRestorePath
+const snapshotBrowseCommandID = explorer.browseCommandID
+const snapshotRestoreCommandID = explorer.restoreCommandID
 const enrollment = ref<EnrollmentResult | null>(null)
 const editingProjectID = ref('')
 const profile = ref<Profile>({ username: '', totp_enabled: false, recovery_codes_remaining: 0, passkeys: [], webauthn_available: false, webauthn_rp_id: '' })
@@ -186,13 +212,8 @@ watch(() => repositoryForm.provider, (provider) => {
 })
 
 watch(snapshotProjectFilter, (projectID) => {
-  if (!projectID || selectedSnapshotProjectID.value === projectID) return
-  selectedSnapshotID.value = ''
-  selectedSnapshotProjectID.value = ''
-  snapshotBrowsePath.value = '/'
-  snapshotBrowseCommandID.value = ''
-  snapshotRestoreCommandID.value = ''
-  pendingRestorePath.value = null
+  if (!projectID || explorer.selectedProjectID.value === projectID) return
+  explorer.resetSelection()
 })
 
 watch(activeTab, (tab) => {
@@ -233,18 +254,8 @@ const nextBackupCountdown = computed(() => {
   if (!nextScheduledProject.value) return '--:--:--'
   return formatCountdown(Math.max(0, nextScheduledProject.value.at - nowEpoch.value))
 })
-const filteredAuditEvents = computed(() => auditEvents.value.filter((event) => (
-  (auditOutcomeFilter.value === 'all' || event.outcome === auditOutcomeFilter.value)
-  && (auditCategoryFilter.value === 'all' || auditActionCategory(event.action) === auditCategoryFilter.value)
-)))
-const auditEventsLast24Hours = computed(() => {
-  const cutoff = nowEpoch.value - 24 * 60 * 60 * 1000
-  return auditEvents.value.filter((event) => new Date(event.created_at).getTime() >= cutoff).length
-})
-const failedAuditEvents = computed(() => auditEvents.value.filter((event) => event.outcome === 'failed').length)
-const securityAuditEvents = computed(() => auditEvents.value.filter((event) => (
-  ['authentication', 'security'].includes(auditActionCategory(event.action))
-)).length)
+const audit = useAuditFilters(auditEvents, nowEpoch)
+const failedAuditEvents = audit.failed
 
 const runTrend = computed(() => {
   const points = Array.from({ length: 7 }, (_, index) => {
@@ -335,79 +346,21 @@ const filteredProjectGroups = computed(() => {
 })
 const filteredProjectCount = computed(() => filteredProjectGroups.value.reduce((total, group) => total + group.projects.length, 0))
 
-const activeRunCount = computed(() => runs.value.filter((run) => ['pending', 'running'].includes(run.status)).length)
-const attentionRunCount = computed(() => runs.value.filter((run) => ['partial', 'failed', 'timed_out', 'canceled', 'unknown'].includes(run.status)).length)
-const filteredRuns = computed(() => {
-  const query = runSearch.value.trim().toLocaleLowerCase('zh-CN')
-  return runs.value.filter((run) => {
-    const statusMatches = runStatusFilter.value === 'all'
-      || (runStatusFilter.value === 'active' && ['pending', 'running'].includes(run.status))
-      || (runStatusFilter.value === 'succeeded' && run.status === 'succeeded')
-      || (runStatusFilter.value === 'attention' && ['partial', 'failed', 'timed_out', 'canceled', 'unknown'].includes(run.status))
-    const operation = runOperationGroup(run)
-    const operationMatches = runOperationFilter.value === 'all' || runOperationFilter.value === operation
-    const textMatches = !query || [
-      run.id,
-      run.snapshot_id,
-      run.error_code,
-      run.error_message,
-      run.status,
-      projectNames.value.get(run.project_id),
-      serverName(run.server_id),
-      runOperationLabel(run),
-    ].some((value) => String(value || '').toLocaleLowerCase('zh-CN').includes(query))
-    return statusMatches && operationMatches && textMatches
-  })
-})
+function projectNameLabel(projectID: string): string {
+  return projectNames.value.get(projectID) ?? projectID
+}
+const runFilterState = useRunFilters(runs, { projectName: projectNameLabel, serverName })
 
-const filteredSnapshots = computed(() => snapshots.value.filter((snapshot) => (
-  !snapshotProjectFilter.value || snapshot.project_id === snapshotProjectFilter.value
-)))
-const selectedSnapshot = computed(() => snapshots.value.find((snapshot) => (
-  snapshot.id === selectedSnapshotID.value && snapshot.project_id === selectedSnapshotProjectID.value
-)))
-const protectedSnapshotCount = computed(() => snapshots.value.filter((snapshot) => snapshot.protected).length)
-const snapshotStorageBytes = computed(() => snapshots.value.reduce((total, snapshot) => total + Number(snapshot.total_bytes || 0), 0))
-const currentBrowseRun = computed(() => {
-  if (snapshotBrowseCommandID.value) {
-    return runs.value.find((run) => run.idempotency_key === `manual:${snapshotBrowseCommandID.value}`)
-  }
-  if (!selectedSnapshot.value) return undefined
-  return runs.value.find((run) => run.project_id === selectedSnapshot.value?.project_id
-    && run.stats?.operation === 'snapshot_browse'
-    && run.stats?.snapshot_id === selectedSnapshot.value?.id
-    && run.stats?.path === snapshotBrowsePath.value)
-})
-const currentRestoreRun = computed(() => {
-  if (snapshotRestoreCommandID.value) {
-    return runs.value.find((run) => run.idempotency_key === `manual:${snapshotRestoreCommandID.value}`)
-  }
-  if (!selectedSnapshot.value) return undefined
-  return runs.value.find((run) => run.project_id === selectedSnapshot.value?.project_id
-    && run.stats?.operation === 'snapshot_restore'
-    && run.stats?.snapshot_id === selectedSnapshot.value?.id)
-})
-const snapshotEntries = computed<SnapshotEntry[]>(() => {
-  if (currentBrowseRun.value?.status !== 'succeeded') return []
-  const value = currentBrowseRun.value.stats?.entries
-  if (!Array.isArray(value)) return []
-  return value.filter((entry): entry is SnapshotEntry => Boolean(
-    entry && typeof entry === 'object' && typeof entry.path === 'string' && typeof entry.type === 'string',
-  )).sort((left, right) => {
-    if (left.type === 'dir' && right.type !== 'dir') return -1
-    if (right.type === 'dir' && left.type !== 'dir') return 1
-    return left.name.localeCompare(right.name, 'zh-CN')
-  })
-})
-const snapshotBreadcrumbs = computed(() => {
-  const segments = snapshotBrowsePath.value.split('/').filter(Boolean)
-  return [
-    { label: '/', path: '/' },
-    ...segments.map((segment, index) => ({ label: segment, path: `/${segments.slice(0, index + 1).join('/')}` })),
-  ]
-})
-const snapshotBrowsePending = computed(() => Boolean(snapshotBrowseCommandID.value && !currentBrowseRun.value))
-const snapshotRestorePending = computed(() => Boolean(snapshotRestoreCommandID.value && !currentRestoreRun.value))
+const filteredSnapshots = explorer.filtered
+const selectedSnapshot = explorer.selected
+const protectedSnapshotCount = explorer.protectedCount
+const snapshotStorageBytes = explorer.storageBytes
+const currentBrowseRun = explorer.currentBrowseRun
+const currentRestoreRun = explorer.currentRestoreRun
+const snapshotEntries = explorer.entries
+const snapshotBreadcrumbs = explorer.breadcrumbs
+const snapshotBrowsePending = explorer.browsePending
+const snapshotRestorePending = explorer.restorePending
 
 async function login() {
   error.value = ''
@@ -487,7 +440,7 @@ async function logout() {
     pageError.value = ''
     loadedTabs.clear()
     loadingTabs.clear()
-    snapshots.value = []
+    explorer.clear()
     auditEvents.value = []
     notificationChannels.value = []
     alertIncidents.value = []
@@ -523,7 +476,7 @@ async function loadCoreData() {
 
 async function loadSnapshotsData() {
   const result = await controlPlane.snapshots.list(1000)
-  snapshots.value = result.map((snapshot) => ({
+  explorer.snapshots.value = result.map((snapshot) => ({
     ...snapshot,
     paths: snapshot.paths ?? [],
     tags: snapshot.tags ?? [],
@@ -749,19 +702,7 @@ function selectDefaults() {
   if (!repositories.value.some((repository) => repository.id === projectForm.repository_id)) {
     projectForm.repository_id = repositories.value[0]?.id ?? ''
   }
-  if (snapshotProjectFilter.value && !projects.value.some((project) => project.id === snapshotProjectFilter.value)) {
-    snapshotProjectFilter.value = ''
-  }
-  if (selectedSnapshotID.value && !snapshots.value.some((snapshot) => (
-    snapshot.id === selectedSnapshotID.value && snapshot.project_id === selectedSnapshotProjectID.value
-  ))) {
-    selectedSnapshotID.value = ''
-    selectedSnapshotProjectID.value = ''
-    snapshotBrowsePath.value = '/'
-    snapshotBrowseCommandID.value = ''
-    snapshotRestoreCommandID.value = ''
-    pendingRestorePath.value = null
-  }
+  explorer.pruneInvalidSelection(projects.value.map((project) => project.id))
 }
 
 async function createServer() {
@@ -997,25 +938,11 @@ async function refreshSnapshotInventory() {
 }
 
 async function selectSnapshot(snapshot: Snapshot) {
-  selectedSnapshotID.value = snapshot.id
-  selectedSnapshotProjectID.value = snapshot.project_id
-  snapshotProjectFilter.value = snapshot.project_id
-  pendingRestorePath.value = null
-  snapshotRestoreCommandID.value = ''
-  await browseSnapshotPath('/')
+  await explorer.select(snapshot)
 }
 
 async function browseSnapshotPath(path: string) {
-  const snapshot = selectedSnapshot.value
-  if (!snapshot) return
-  await perform(async () => {
-    const command = await controlPlane.projects.browseSnapshot(snapshot.project_id, snapshot.id, path)
-    snapshotBrowsePath.value = path
-    snapshotBrowseCommandID.value = command.id
-    pendingRestorePath.value = null
-    success.value = `目录读取已发送给 ${serverName(snapshot.server_id)}，Agent 返回后会自动展示。`
-    queueSnapshotPolls()
-  })
+  await explorer.browse(path)
 }
 
 async function toggleSnapshotProtection(snapshot: Snapshot) {
@@ -1029,21 +956,11 @@ async function toggleSnapshotProtection(snapshot: Snapshot) {
 }
 
 function requestSnapshotRestore(path: string) {
-  pendingRestorePath.value = path
-  snapshotRestoreCommandID.value = ''
+  explorer.requestRestore(path)
 }
 
 async function confirmSnapshotRestore() {
-  const snapshot = selectedSnapshot.value
-  const path = pendingRestorePath.value
-  if (!snapshot || !path) return
-  await perform(async () => {
-    const command = await controlPlane.projects.restoreSnapshot(snapshot.project_id, snapshot.id, path)
-    snapshotRestoreCommandID.value = command.id
-    pendingRestorePath.value = null
-    success.value = '安全恢复已排队：Agent 只会写入新的隔离目录，并强制禁止覆盖已有文件。'
-    queueSnapshotPolls()
-  })
+  await explorer.confirmRestore()
 }
 
 function queueSnapshotPolls() {
@@ -1114,12 +1031,14 @@ async function refreshData(silent = false) {
   }
 }
 
-async function perform(operation: () => Promise<void>) {
+// perform runs an operation with the shared loading/error banner handling.
+// It returns the operation result, or undefined when the error was shown.
+async function perform<T>(operation: () => Promise<T>): Promise<T | undefined> {
   loading.value = true
   error.value = ''
   success.value = ''
   try {
-    await operation()
+    return await operation()
   } catch (cause) {
     showError(cause)
   } finally {
@@ -1674,27 +1593,7 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-else-if="activeTab === 'runs'">
-        <div class="run-kpi-grid" role="group" aria-label="按运行状态筛选">
-          <button type="button" :class="{ active: runStatusFilter === 'all' }" @click="runStatusFilter = 'all'"><span>ALL RUNS</span><strong>{{ runs.length }}</strong><small>当前样本</small></button>
-          <button type="button" :class="{ active: runStatusFilter === 'succeeded' }" @click="runStatusFilter = 'succeeded'"><span>SUCCEEDED</span><strong>{{ runs.filter((run) => run.status === 'succeeded').length }}</strong><small>成功完成</small></button>
-          <button type="button" :class="{ active: runStatusFilter === 'active' }" @click="runStatusFilter = 'active'"><span>IN PROGRESS</span><strong>{{ activeRunCount }}</strong><small>等待或执行中</small></button>
-          <button type="button" class="attention" :class="{ active: runStatusFilter === 'attention' }" @click="runStatusFilter = 'attention'"><span>NEEDS ATTENTION</span><strong>{{ attentionRunCount }}</strong><small>部分成功、失败或超时</small></button>
-        </div>
-        <section class="panel run-history-panel">
-          <div class="panel-heading filter-heading">
-            <div><p class="eyebrow">RUN HISTORY</p><h2>最近 100 次运行</h2></div>
-            <div class="data-toolbar run-toolbar">
-              <label class="search-field"><span>搜索</span><input v-model.trim="runSearch" type="search" placeholder="项目、Agent、运行 ID 或错误" /></label>
-              <label><span>任务类型</span><select v-model="runOperationFilter"><option value="all">全部任务</option><option value="backup">备份与索引</option><option value="maintenance">维护与校验</option><option value="recovery">浏览与恢复</option></select></label>
-              <strong>{{ filteredRuns.length }} 条</strong>
-            </div>
-          </div>
-          <div v-if="!runs.length" class="empty-state">尚无运行记录。</div>
-          <div v-else-if="!filteredRuns.length" class="empty-state">没有匹配当前筛选条件的运行记录。</div>
-          <div v-else class="table-wrap run-table-wrap"><table><thead><tr><th>项目 / Agent</th><th>类型</th><th>状态</th><th>开始 / 耗时</th><th>快照 / 预览结果</th><th>错误</th></tr></thead><tbody>
-            <tr v-for="run in filteredRuns" :key="run.id"><td><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ serverName(run.server_id) }} · {{ run.id }}</small></td><td><span class="source-chip">{{ runOperationLabel(run) }}</span></td><td><span class="status-pill" :class="run.status">{{ statusLabel(run.status) }}</span></td><td><strong>{{ formatDate(run.started_at) }}</strong><small>{{ formatDuration(run) }}</small></td><td><template v-if="run.snapshot_id"><code>{{ run.snapshot_id.slice(0, 16) }}</code><small v-if="Number(run.stats?.optional_source_count || 0)">跳过 {{ Number(run.stats?.optional_source_count) }} 个可选源</small></template><span v-else-if="run.stats?.operation === 'retention_preview'">保留 {{ Number(run.stats?.snapshots_kept || 0) }} · 删除 {{ Number(run.stats?.snapshots_removed || 0) }}</span><span v-else-if="run.stats?.operation === 'snapshot_restore'">{{ run.stats?.restore_target || run.stats?.path }}</span><span v-else-if="run.stats?.snapshot_id"><code>{{ String(run.stats.snapshot_id).slice(0, 16) }}</code></span><span v-else>—</span></td><td class="error-cell" :title="run.error_message">{{ run.error_message || '—' }}</td></tr>
-          </tbody></table></div>
-        </section>
+        <RunsView :runs="runs" :project-name="projectNameLabel" :server-name="serverName" />
       </template>
 
       <template v-else-if="activeTab === 'notifications'">
@@ -1767,34 +1666,7 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-else-if="activeTab === 'audit'">
-        <div class="metric-grid audit-metrics">
-          <article class="metric"><header><span>LOADED EVENTS</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ auditEvents.length }}</strong><em>latest 200</em></div><footer>已加载审计事件 <span>追加写入</span></footer></article>
-          <article class="metric"><header><span>LAST 24 HOURS</span><i class="metric-signal"></i></header><div class="metric-value"><strong>{{ auditEventsLast24Hours }}</strong><em>events</em></div><footer>最近 24 小时 <span>所有类别</span></footer></article>
-          <article class="metric" :class="{ alert: failedAuditEvents > 0 }"><header><span>FAILED ACTIONS</span><i class="metric-signal" :class="failedAuditEvents ? 'bad' : 'good'"></i></header><div class="metric-value"><strong>{{ failedAuditEvents }}</strong><em>HTTP ≥ 400</em></div><footer>失败或被拒绝 <span>{{ failedAuditEvents ? '需要复核' : '状态正常' }}</span></footer></article>
-          <article class="metric"><header><span>SECURITY EVENTS</span><i class="metric-signal warn"></i></header><div class="metric-value"><strong>{{ securityAuditEvents }}</strong><em>auth + security</em></div><footer>认证与账号安全 <span>不记录凭据</span></footer></article>
-        </div>
-
-        <section class="panel audit-panel">
-          <div class="panel-heading audit-heading">
-            <div><p class="eyebrow">APPEND-ONLY AUDIT TRAIL</p><h2>最近操作证据</h2><p>记录操作类型、结果、资源、来源地址和 HTTP 状态；请求正文与 Secret 永不进入审计表。</p></div>
-            <div class="audit-filters">
-              <label>类别<select v-model="auditCategoryFilter"><option value="all">全部类别</option><option value="authentication">认证</option><option value="security">安全</option><option value="configuration">配置</option><option value="backup">备份与恢复</option></select></label>
-              <label>结果<select v-model="auditOutcomeFilter"><option value="all">全部结果</option><option value="succeeded">成功</option><option value="failed">失败</option></select></label>
-            </div>
-          </div>
-          <div v-if="!filteredAuditEvents.length" class="empty-state">当前筛选条件下没有审计事件。</div>
-          <div v-else class="table-wrap"><table class="audit-table"><thead><tr><th>时间</th><th>类别</th><th>操作</th><th>结果</th><th>目标资源</th><th>操作者 / 来源</th><th>HTTP</th></tr></thead><tbody>
-            <tr v-for="event in filteredAuditEvents" :key="event.id">
-              <td><strong>{{ formatDate(event.created_at) }}</strong><small>{{ event.id }}</small></td>
-              <td><span class="source-chip">{{ auditCategoryLabel(auditActionCategory(event.action)) }}</span></td>
-              <td><strong>{{ auditActionLabel(event.action) }}</strong><small>{{ event.action }}</small></td>
-              <td><span class="status-pill" :class="event.outcome === 'succeeded' ? 'succeeded' : 'failed'">{{ event.outcome === 'succeeded' ? '成功' : '失败' }}</span></td>
-              <td class="audit-resource">{{ auditResourceLabel(event) }}</td>
-              <td><strong>{{ event.actor }}</strong><small>{{ event.client_ip || 'unknown' }}</small></td>
-              <td><code>{{ event.status_code }}</code></td>
-            </tr>
-          </tbody></table></div>
-        </section>
+        <AuditView :events="auditEvents" />
       </template>
 
       <template v-else>

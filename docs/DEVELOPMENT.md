@@ -30,7 +30,9 @@ cmd/*
 | `internal/control/admin_security.go` | 个人资料、重新认证和密码修改 |
 | `internal/control/admin_totp.go` | TOTP 设置、验证和恢复码生命周期 |
 | `internal/control/admin_passkey.go` | WebAuthn 注册、登录和 Ceremony 生命周期 |
-| `web/src/App.vue` | 页面状态编排和模板；不放通用转换算法 |
+| `web/src/App.vue` | 页面壳层：登录、导航、跨 Tab 共享数据加载；Tab 专属 UI 状态应下沉到 View 组件或 Composable |
+| `web/src/views` | 单个 Tab 的模板与 Tab 内部 UI 状态（筛选、选中项）；数据经 props 进入，不直接调用控制面服务 |
+| `web/src/composables` | 可独立测试的前端状态机与筛选逻辑；网络动作经回调注入，不持有模板 |
 | `web/src/services` | 唯一允许声明版本化 API 路径的类型化服务层 |
 | `web/scripts/check-architecture.mjs` | 阻止页面直接调用 `fetch`、`requestJSON` 或声明 API 路径 |
 | `web/src/forms` | 页面草稿、服务端 DTO 与编辑回填之间的纯转换；不发起网络请求 |
@@ -38,6 +40,21 @@ cmd/*
 | `web/src/webauthn.ts` | 浏览器 WebAuthn 数据转换和错误翻译 |
 | `web/src/repositories.ts` | 仓库表单元数据和 Restic URL 构建 |
 | `web/src/notifications.ts` | 通知渠道表单元数据 |
+
+## Web 前端测试
+
+前端使用 Vitest + jsdom（`npm --prefix web test`，组件挂载用 @vue/test-utils）。三层测试约定：
+
+1. **纯函数**（`display.ts`、`forms/`、`repositories.ts`、`notifications.ts`）：直接断言输入输出，不挂载组件；
+2. **Composables**（`web/src/composables/*.spec.ts`）：用 `ref()` 注入数据，断言状态机迁移；网络回调返回 `null` 表示失败已被上层展示，状态机必须跳过更新；
+3. **View 组件**（`web/src/views/*.spec.ts`）：`mount()` 后断言渲染与筛选交互，props 注入数据。
+
+拆分 App.vue 的既定模式（新增 View 时遵循）：
+
+- View 通过 `defineProps` 接收数据（数组 + 名称解析函数），**不**导入 `services/` 或访问全局状态；
+- Tab 专属的筛选、选中项、轮询状态优先提取为同目录 Composable，View 与 App.vue 都可复用；
+- 需要网络动作的 Composable（如 `useSnapshotExplorer`）把请求经 deps 回调注入，App.vue 负责包 `perform()`、成功提示和轮询调度；
+- `App.vue` 保留：登录/导航、`loadCoreData`/`loadTabData`、跨 Tab 共享引用（`projectNames`、`serverName`）、成功/错误横幅。
 
 ## 新增通知 Provider
 

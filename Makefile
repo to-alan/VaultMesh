@@ -1,4 +1,4 @@
-.PHONY: all build test check fmt web-build web-install clean
+.PHONY: all build test check fmt web-build web-test web-install clean
 
 GOCACHE ?= /tmp/vaultmesh-go-cache
 VERSION ?= dev
@@ -13,7 +13,7 @@ build: web-build
 	GOCACHE=$(GOCACHE) CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/vaultmesh-server ./cmd/vaultmesh-server
 	GOCACHE=$(GOCACHE) CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/vaultmesh-agent ./cmd/vaultmesh-agent
 
-test:
+test: web-test
 	GOCACHE=$(GOCACHE) go test ./...
 
 check: test web-build
@@ -27,6 +27,9 @@ web-install:
 
 web-build:
 	npm --prefix web run build
+
+web-test:
+	npm --prefix web test
 
 clean:
 	rm -rf bin web/dist
