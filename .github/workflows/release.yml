@@ -108,9 +108,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: [agent-binaries, container-images]
     steps:
+      # Only the agent artifacts are wanted here; the buildx cache artifacts
+      # (*.dockerbuild) stay out of the release bundle.
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: vaultmesh-agent-*
           merge-multiple: true
       - name: Generate checksums
         run: |
