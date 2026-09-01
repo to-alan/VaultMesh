@@ -130,8 +130,17 @@ func LoadServer() (Server, error) {
 			return Server{}, fmt.Errorf("VAULTMESH_WEBAUTHN_RP_ORIGINS contains %q: %w", origin, err)
 		}
 	}
-	if strings.Contains(config.WebAuthnRPID, "://") || strings.ContainsAny(config.WebAuthnRPID, "/:") || net.ParseIP(config.WebAuthnRPID) != nil {
-		return Server{}, fmt.Errorf("VAULTMESH_WEBAUTHN_RP_ID must be a domain name without scheme, path, or port; IP addresses are not valid WebAuthn RP IDs")
+	// A WebAuthn RP ID must be a registrable domain (browsers refuse
+	// credentials bound to an IP). Treat an invalid RP ID as a passkey-only
+	// misconfiguration instead of refusing to start the control plane:
+	// WebAuthn is disabled (profile reports webauthn_available=false) and
+	// every other feature keeps working.
+	if config.WebAuthnRPID != "" {
+		if strings.Contains(config.WebAuthnRPID, "://") || strings.ContainsAny(config.WebAuthnRPID, "/:") || net.ParseIP(config.WebAuthnRPID) != nil {
+			fmt.Fprintf(os.Stderr, "VAULTMESH_WEBAUTHN_RP_ID=%q is not a registrable domain name; passkeys are disabled until a valid domain is configured\n", config.WebAuthnRPID)
+			config.WebAuthnRPID = ""
+			config.WebAuthnRPOrigins = nil
+		}
 	}
 	return config, nil
 }

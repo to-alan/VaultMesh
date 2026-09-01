@@ -50,14 +50,23 @@ func TestSplitListAndValidateOrigin(t *testing.T) {
 	}
 }
 
-func TestLoadServerRejectsIPAddressWebAuthnRPID(t *testing.T) {
+func TestLoadServerDisablesPasskeysForIPAddressWebAuthnRPID(t *testing.T) {
 	t.Setenv("VAULTMESH_ADMIN_USERNAME", "admin")
 	t.Setenv("VAULTMESH_ADMIN_PASSWORD", "correct-horse-battery-staple")
 	t.Setenv("VAULTMESH_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	t.Setenv("VAULTMESH_ALLOWED_ORIGINS", "http://127.0.0.1:5173")
+	t.Setenv("VAULTMESH_WEBAUTHN_RP_ID", "113.20.13.253")
+	t.Setenv("VAULTMESH_WEBAUTHN_RP_ORIGINS", "http://113.20.13.253:3000")
 
-	if _, err := LoadServer(); err == nil || !strings.Contains(err.Error(), "IP addresses are not valid") {
-		t.Fatalf("expected an IP-address RP ID error, got %v", err)
+	// An IP RP ID cannot support passkeys, but it must not keep the whole
+	// control plane offline: the invalid configuration is dropped, WebAuthn
+	// is disabled, and every other feature keeps working.
+	config, err := LoadServer()
+	if err != nil {
+		t.Fatalf("expected degraded configuration instead of a fatal error, got %v", err)
+	}
+	if config.WebAuthnRPID != "" || len(config.WebAuthnRPOrigins) != 0 {
+		t.Fatalf("invalid WebAuthn configuration was not cleared: %#v", config)
 	}
 }
 
