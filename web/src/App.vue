@@ -693,8 +693,11 @@ const detectionReport = ref<DetectionReport | null>(null)
 const detectionSelection = reactive({ apps: [] as number[], databases: [] as number[], containers: [] as number[] })
 const detectionAttempts = ref(0)
 const detectionExhausted = ref(false)
+// dispatched is true ONLY after the control plane accepted a detect POST.
+// Merely selecting a server must never disable the button.
+const detectionDispatched = ref(false)
 let detectionPollTimer: number | undefined
-const detectionRunning = computed(() => Boolean(detectionServerID.value) && !detectionReport.value && !detectionExhausted.value)
+const detectionRunning = computed(() => detectionDispatched.value && !detectionReport.value && !detectionExhausted.value)
 const detectionHasSelection = computed(() =>
   detectionSelection.apps.length + detectionSelection.databases.length + detectionSelection.containers.length > 0)
 const detectionWarning = ref('')
@@ -805,6 +808,7 @@ async function startDetection(serverIDInput: string) {
       error.value = dispatch.warning
       return
     }
+    detectionDispatched.value = true
     success.value = `已向 ${server.name} 发送只读探测任务，完成后自动展示结果。`
     pollDetection(server.id, DETECTION_POLL_TOTAL)
   })
@@ -814,6 +818,7 @@ function pollDetection(serverID: string, remainingAttempts: number) {
   window.clearTimeout(detectionPollTimer)
   if (remainingAttempts <= 0) {
     detectionExhausted.value = true
+    detectionDispatched.value = false
     return
   }
   detectionPollTimer = window.setTimeout(async () => {
@@ -827,18 +832,21 @@ function pollDetection(serverID: string, remainingAttempts: number) {
       }
       if (status.available && status.report) {
         detectionReport.value = status.report
+        detectionDispatched.value = false
         success.value = '探测完成。勾选要备份的内容并生成项目草稿。'
         return
       }
       // 派发过的命令消失（数据库清理/服务重置）时不能假装还在等待
       if (seenCommand === false && detectionAttempts.value === 0 && remainingAttempts < DETECTION_POLL_TOTAL - 4) {
         detectionExhausted.value = true
+        detectionDispatched.value = false
         error.value = '探测命令已不存在（可能被清理）。请重新点击「开始探测」。'
         return
       }
       const target = servers.value.find((item) => item.id === serverID)
       if (!target || target.status !== 'online') {
         detectionExhausted.value = true
+        detectionDispatched.value = false
         error.value = `探测中止：${target ? `Agent「${target.name}」已离线` : '目标服务器已不存在'}。请确认 Agent 运行后重新探测。`
         return
       }
