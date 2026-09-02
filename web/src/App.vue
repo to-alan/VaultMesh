@@ -696,6 +696,7 @@ const detectionExhausted = ref(false)
 // dispatched is true ONLY after the control plane accepted a detect POST.
 // Merely selecting a server must never disable the button.
 const detectionDispatched = ref(false)
+const detectionDispatchedAt = ref<number | null>(null)
 let detectionPollTimer: number | undefined
 const detectionRunning = computed(() => detectionDispatched.value && !detectionReport.value && !detectionExhausted.value)
 const detectionHasSelection = computed(() =>
@@ -812,6 +813,7 @@ async function startDetection(serverIDInput: string, force = false) {
       return
     }
     detectionDispatched.value = true
+    detectionDispatchedAt.value = Date.now()
     success.value = `已向 ${server.name} 发送只读探测任务，完成后自动展示结果。`
     pollDetection(server.id, DETECTION_POLL_TOTAL)
   })
@@ -833,13 +835,14 @@ function pollDetection(serverID: string, remainingAttempts: number) {
         detectionAttempts.value = (status.command as { attempts?: number }).attempts ?? 0
         seenCommand = true
       }
-      if (status.available && status.report) {
+      const reportIsFresh = status.report && status.report.generated_at &&
+        new Date(status.report.generated_at).getTime() >= (detectionDispatchedAt.value ?? 0) - 3000
+      if (status.available && status.report && reportIsFresh) {
         detectionReport.value = status.report
         detectionDispatched.value = false
         success.value = '探测完成。勾选要备份的内容并生成项目草稿。'
         return
       }
-      // 派发过的命令消失（数据库清理/服务重置）时不能假装还在等待
       if (seenCommand === false && detectionAttempts.value === 0 && remainingAttempts < DETECTION_POLL_TOTAL - 4) {
         detectionExhausted.value = true
         detectionDispatched.value = false
@@ -1580,6 +1583,37 @@ onBeforeUnmount(() => {
           <p v-else-if="detectionExhausted" class="detection-status stale">两分钟内没有收到回传，请查看下方诊断。</p>
         </section>
 
+        <section id="detection-diagnosis" v-if="detectionWarning" class="panel detection-diagnosis">
+          <div class="panel-heading"><div><p class="eyebrow">VERSION MISMATCH</p><h2>探测命令无法被该 Agent 执行</h2></div></div>
+          <p>{{ detectionWarning }}</p>
+        </section>
+
+        <section id="detection-diagnosis" v-if="detectionExhausted" class="panel detection-diagnosis">
+          <div class="panel-heading"><div><p class="eyebrow">DIAGNOSIS</p><h2>Agent 没有回传探测结果</h2></div></div>
+          <ol>
+            <li v-if="detectionAgentVersion && detectionAgentVersion.startsWith('v0.1.')">Agent 版本是 <code>{{ detectionAgentVersion }}</code>，<strong>不支持探测命令</strong>。重新运行 install-agent 并设置 <code>VAULTMESH_AGENT_VERSION=edge</code> 升级。</li>
+            <li>查看 Agent 日志：<code>journalctl -u vaultmesh-agent -n 50</code>，关注 <code>detection</code> 或 <code>reject unsupported command</code> 关键字。</li>
+            <li>确认 Agent 在线（服务器页状态为「在线」），并且与控制面的地址可达。</li>
+          </ol>
+        </section>
+        </div>
+
+          <ProjectListView
+            :projects="projects"
+            :servers="servers"
+            :health="projectHealthByID"
+            :now-epoch="nowEpoch"
+            :repository-name="repositoryName"
+            :latest-preview="latestRetentionPreview"
+            :queued-project-ids="queuedProjectIDs"
+            :queued-preview-project-ids="queuedPreviewProjectIDs"
+            :loading="loading"
+            @edit="openProjectEditor"
+            @toggle="toggleProject"
+            @preview="previewRetention"
+            @run="runNow"
+            @archive="archiveProject"
+          />
         <section id="detection-wizard" v-if="detectionReport && detectionServerID" class="panel detection-wizard">
           <div class="panel-heading"><div><p class="eyebrow">DETECTION</p><h2>探测结果</h2><p>勾选要纳入备份的内容，生成项目草稿后在下方表单确认。数据库密码需要你手动填写，探测不会读取任何密钥。</p></div><button type="button" class="ghost compact" @click="closeDetection">关闭</button></div>
 
@@ -1618,37 +1652,6 @@ onBeforeUnmount(() => {
           </footer>
         </section>
 
-        <section id="detection-diagnosis" v-if="detectionWarning" class="panel detection-diagnosis">
-          <div class="panel-heading"><div><p class="eyebrow">VERSION MISMATCH</p><h2>探测命令无法被该 Agent 执行</h2></div></div>
-          <p>{{ detectionWarning }}</p>
-        </section>
-
-        <section id="detection-diagnosis" v-if="detectionExhausted" class="panel detection-diagnosis">
-          <div class="panel-heading"><div><p class="eyebrow">DIAGNOSIS</p><h2>Agent 没有回传探测结果</h2></div></div>
-          <ol>
-            <li v-if="detectionAgentVersion && detectionAgentVersion.startsWith('v0.1.')">Agent 版本是 <code>{{ detectionAgentVersion }}</code>，<strong>不支持探测命令</strong>。重新运行 install-agent 并设置 <code>VAULTMESH_AGENT_VERSION=edge</code> 升级。</li>
-            <li>查看 Agent 日志：<code>journalctl -u vaultmesh-agent -n 50</code>，关注 <code>detection</code> 或 <code>reject unsupported command</code> 关键字。</li>
-            <li>确认 Agent 在线（服务器页状态为「在线」），并且与控制面的地址可达。</li>
-          </ol>
-        </section>
-        </div>
-
-          <ProjectListView
-            :projects="projects"
-            :servers="servers"
-            :health="projectHealthByID"
-            :now-epoch="nowEpoch"
-            :repository-name="repositoryName"
-            :latest-preview="latestRetentionPreview"
-            :queued-project-ids="queuedProjectIDs"
-            :queued-preview-project-ids="queuedPreviewProjectIDs"
-            :loading="loading"
-            @edit="openProjectEditor"
-            @toggle="toggleProject"
-            @preview="previewRetention"
-            @run="runNow"
-            @archive="archiveProject"
-          />
 <aside id="project-builder" class="panel form-panel project-builder" :class="{ editing: editingProjectID }">
             <div class="builder-heading"><div><p class="eyebrow">{{ editingProjectID ? 'EDIT DESIRED STATE' : 'NEW PROJECT' }}</p><h2>{{ editingProjectID ? `编辑 ${editingProject?.name || '备份项目'}` : '创建备份项目' }}</h2></div><button v-if="editingProjectID" type="button" class="ghost compact" @click="resetProjectForm">取消编辑</button></div>
             <p class="form-intro">一个项目可以组合文件、Docker、MySQL 和 PostgreSQL 数据源，并在同一个 Restic 快照中归档。</p>
