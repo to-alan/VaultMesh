@@ -739,6 +739,21 @@ function revealDetectionPanel(id: string) {
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   })
 }
+watch(detectionServerID, (serverID) => {
+  if (!serverID || detectionRunning.value) return
+  void (async () => {
+    try {
+      const status = await controlPlane.servers.detection(serverID)
+      if (status.available && status.report) {
+        detectionReport.value = status.report
+        detectionExhausted.value = false
+        detectionWarning.value = ''
+      }
+    } catch {
+      // ignore: the wizard stays empty until the user starts a detection
+    }
+  })()
+})
 watch(detectionReport, (report) => { if (report) revealDetectionPanel('detection-wizard') })
 watch(detectionExhausted, (exhausted) => { if (exhausted) revealDetectionPanel('detection-diagnosis') })
 watch(detectionWarning, (warning) => { if (warning) revealDetectionPanel('detection-diagnosis') })
@@ -761,6 +776,15 @@ async function startDetection(serverInput: Server) {
   detectionSelection.databases = []
   detectionSelection.containers = []
   await perform(async () => {
+    // Surface any previously stored report immediately — a fresh page load
+    // must not hide a detection that already succeeded.
+    const status = await controlPlane.servers.detection(server.id)
+    if (status.available && status.report) {
+      detectionReport.value = status.report
+      detectionAttempts.value = (status.command as { attempts?: number } | undefined)?.attempts ?? 0
+      success.value = '已加载上次探测结果。数据有变化时可重新探测。'
+      return
+    }
     const dispatch = await controlPlane.servers.detect(server.id)
     if (dispatch.warning) {
       // Fail fast: an agent that cannot understand the command will never
