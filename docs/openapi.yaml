@@ -375,6 +375,109 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Project' }
         '422': { $ref: '#/components/responses/Error' }
+  /api/v1/servers/{serverID}/detect:
+    post:
+      tags: [Servers]
+      operationId: detectServerBackups
+      description: |
+        Queues a read-only detection scan on one agent: running containers,
+        database signals (ports, dump tools), and application directories
+        found by marker files. The report never contains secrets.
+      parameters:
+        - name: serverID
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '202':
+          description: Detection command queued for the agent
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Command' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /api/v1/servers/{serverID}/detection:
+    get:
+      tags: [Servers]
+      operationId: getServerDetection
+      parameters:
+        - name: serverID
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Latest detection report, or available=false when none exists
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [available]
+                properties:
+                  available: { type: boolean }
+                  report:
+                    type: object
+                    properties:
+                      generated_at: { type: string, format: date-time }
+                      command_id: { type: string }
+                      containers:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            name: { type: string }
+                            image: { type: string }
+                            running: { type: boolean }
+                            ports: { type: array, items: { type: string } }
+                            mounts: { type: array, items: { type: string } }
+                      databases:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            kind: { type: string, enum: [mysql, postgresql] }
+                            source: { type: string }
+                            container: { type: string }
+                            host: { type: string }
+                            port: { type: integer }
+                            reachable: { type: boolean }
+                            dump_tool: { type: string }
+                      apps:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            path: { type: string }
+                            name: { type: string }
+                            kind: { type: string }
+                            markers: { type: array, items: { type: string } }
+                      tools:
+                        type: object
+                        additionalProperties: { type: string }
+        '404': { $ref: '#/components/responses/Error' }
+  /api/v1/agent/detection:
+    put:
+      tags: [Agent]
+      operationId: reportAgentDetection
+      security: [{ agentBearer: [] }]
+      description: |
+        Delivers the read-only detection inventory for the authenticated
+        server; the originating detect command is closed in the same
+        transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generated_at, command_id]
+              properties:
+                generated_at: { type: string, format: date-time }
+                command_id: { type: string }
+      responses:
+        '204': { $ref: '#/components/responses/NoContent' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/servers/{serverID}:
     delete:
       tags: [Servers]

@@ -515,6 +515,45 @@ func (s *Service) reconcileConfigDegradation(ctx context.Context, serverID strin
 	return s.reconcileAlert(ctx, "config:"+serverID, condition)
 }
 
+// CreateDetectionCommand queues a read-only inventory scan on one server.
+// The report is delivered through the dedicated detection endpoint and
+// surfaced to the wizard; it never starts a backup by itself.
+func (s *Service) CreateDetectionCommand(ctx context.Context, serverID string) (domain.Command, error) {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" {
+		return domain.Command{}, validationError("server_id", "is required")
+	}
+	id, err := randomValue("cmd", 10)
+	if err != nil {
+		return domain.Command{}, err
+	}
+	return s.store.CreateCommand(ctx, domain.Command{
+		ID:        id,
+		ServerID:  serverID,
+		Type:      "detect",
+		CreatedAt: s.now(),
+	})
+}
+
+func (s *Service) SaveDetectionReport(ctx context.Context, serverID, commandID string, report domain.DetectionReport) error {
+	serverID = strings.TrimSpace(serverID)
+	commandID = strings.TrimSpace(commandID)
+	if commandID == "" {
+		return validationError("command_id", "is required")
+	}
+	if len(report.Containers) == 0 && len(report.Databases) == 0 && len(report.Apps) == 0 {
+		return validationError("report", "detection report is empty")
+	}
+	now := s.now()
+	report.GeneratedAt = now
+	report.CommandID = commandID
+	return s.store.SaveDetectionReport(ctx, serverID, commandID, report, now)
+}
+
+func (s *Service) GetDetectionReport(ctx context.Context, serverID string) (domain.DetectionReport, bool, error) {
+	return s.store.GetDetectionReport(ctx, strings.TrimSpace(serverID))
+}
+
 func (s *Service) CreateManualRun(ctx context.Context, projectID string) (domain.Command, error) {
 	return s.createProjectCommand(ctx, projectID, "backup", nil)
 }

@@ -163,6 +163,21 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// agentDetection receives the read-only inventory report produced by the
+// agent's detect command and closes the originating server-scoped command.
+func (s *HTTPServer) agentDetection(w http.ResponseWriter, r *http.Request) {
+	server := agentFromContext(r.Context())
+	var report domain.DetectionReport
+	if !s.decodeJSON(w, r, &report) {
+		return
+	}
+	if err := s.service.SaveDetectionReport(r.Context(), server.ID, report.CommandID, report); err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // agentSnapshots receives the Restic snapshot index through a dedicated,
 // idempotent channel so an unbounded inventory can never reject or bloat an
 // otherwise immutable run report.

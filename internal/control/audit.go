@@ -67,6 +67,7 @@ var adminAuditSpecs = map[string]auditSpec{
 	"POST /api/v1/profile/passkeys/register/finish":                    {Action: "security.passkey.register", ResourceType: "account"},
 	"POST /api/v1/profile/passkeys/{passkeyID}/delete":                 {Action: "security.passkey.delete", ResourceType: "passkey", PathValue: "passkeyID"},
 	"POST /api/v1/servers":                                             {Action: "server.create", ResourceType: "server"},
+	"POST /api/v1/servers/{serverID}/detect":                           {Action: "server.detect", ResourceType: "server", PathValue: "serverID"},
 	"DELETE /api/v1/servers/{serverID}":                                {Action: "server.archive", ResourceType: "server", PathValue: "serverID"},
 	"POST /api/v1/repositories":                                        {Action: "repository.create", ResourceType: "repository"},
 	"DELETE /api/v1/repositories/{repositoryID}":                       {Action: "repository.archive", ResourceType: "repository", PathValue: "repositoryID"},

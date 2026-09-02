@@ -56,6 +56,15 @@ cmd/*
 - 需要网络动作的 Composable（如 `useSnapshotExplorer`）把请求经 deps 回调注入，App.vue 负责包 `perform()`、成功提示和轮询调度；
 - `App.vue` 保留：登录/导航、`loadCoreData`/`loadTabData`、跨 Tab 共享引用（`projectNames`、`serverName`）、成功/错误横幅。
 
+## 可备份项探测（detect）
+
+服务器级只读探测遵循"探测 → 提案 → 人工确认"边界：
+
+- Agent 的 `detect` 命令（`internal/agent/detect.go`）只读运行：Docker `ps/inspect`、端口连接测试、受限深度的标记文件扫描（`composer.json`、`go.mod` 等）。**不读取任何文件内容，不收集任何密钥**；
+- 报告经 `PUT /api/v1/agent/detection` 幂等上报，控制面在保存报告的同一事务中关闭来源命令（`SaveDetectionReport`）；
+- 控制台在服务器页展示结果并允许勾选，勾选项仅**预填**项目表单草稿——数据库密码必须人工填写，保存仍走标准 `CreateProject` 校验；
+- 扩展新的应用签名：在 `appMarkers` 注册表加一行即可；扩展数据库信号：在 `databaseSignals` 加端口。两者都必须保持只读边界，不得添加配置文件解析或凭据提取。
+
 ## 新增通知 Provider
 
 后端 Provider 使用单一注册表 `notificationProviderDefinitions`。一条定义必须同时声明：

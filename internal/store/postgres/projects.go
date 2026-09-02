@@ -281,19 +281,35 @@ func (s *Store) CreateCommand(ctx context.Context, command domain.Command) (doma
 	if err != nil {
 		return domain.Command{}, err
 	}
-	err = s.pool.QueryRow(ctx, `
-		INSERT INTO commands (id, server_id, project_id, type, payload, created_at)
-		SELECT $1, server_id, id, $3, $4, $5
-		FROM projects
-		WHERE id = $2 AND enabled = TRUE
-		RETURNING server_id`, command.ID, command.ProjectID, command.Type, payload, command.CreatedAt).Scan(&command.ServerID)
+	var created domain.Command
+	if command.ProjectID == "" {
+		// Server-scoped commands (detection) are not bound to a project.
+		err = s.pool.QueryRow(ctx, `
+			INSERT INTO commands (id, server_id, type, payload, created_at)
+			SELECT $1, id, $3, $4, $5
+			FROM servers
+			WHERE id = $2 AND archived_at IS NULL
+			RETURNING server_id`, command.ID, command.ServerID, command.Type, payload, command.CreatedAt).Scan(&created.ServerID)
+	} else {
+		err = s.pool.QueryRow(ctx, `
+			INSERT INTO commands (id, server_id, project_id, type, payload, created_at)
+			SELECT $1, server_id, id, $3, $4, $5
+			FROM projects
+			WHERE id = $2 AND enabled = TRUE
+			RETURNING server_id`, command.ID, command.ProjectID, command.Type, payload, command.CreatedAt).Scan(&created.ServerID)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Command{}, store.ErrNotFound
 	}
 	if err != nil {
 		return domain.Command{}, mapError(err)
 	}
-	return command, nil
+	created.ID = command.ID
+	created.ProjectID = command.ProjectID
+	created.Type = command.Type
+	created.Payload = command.Payload
+	created.CreatedAt = command.CreatedAt
+	return created, nil
 }
 
 func (s *Store) ClaimCommands(ctx context.Context, serverID string, now, leaseUntil time.Time, limit int) ([]domain.Command, error) {
@@ -315,7 +331,7 @@ func (s *Store) ClaimCommands(ctx context.Context, serverID string, now, leaseUn
 		SET leased_until = $3, attempts = c.attempts + 1
 		FROM picked
 		WHERE c.id = picked.id
-		RETURNING c.id, c.server_id, c.project_id, c.type, c.payload, c.leased_until, c.attempts, c.created_at`,
+		RETURNING c.id, c.server_id, COALESCE(c.project_id, ''), c.type, c.payload, c.leased_until, c.attempts, c.created_at`,
 		serverID, now, leaseUntil, limit)
 	if err != nil {
 		return nil, err
@@ -335,6 +351,54 @@ func (s *Store) ClaimCommands(ctx context.Context, serverID string, now, leaseUn
 		result = append(result, command)
 	}
 	return result, rows.Err()
+}
+
+// SaveDetectionReport stores the latest detection inventory for a server and
+// closes the originating server-scoped command in the same transaction.
+func (s *Store) SaveDetectionReport(ctx context.Context, serverID, commandID string, report domain.DetectionReport, at time.Time) error {
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO detection_reports (server_id, command_id, report, detected_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (server_id) DO UPDATE SET
+		    command_id = EXCLUDED.command_id,
+		    report = EXCLUDED.report,
+		    detected_at = EXCLUDED.detected_at`, serverID, commandID, encoded, at); err != nil {
+		return mapError(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE commands
+		SET accepted_at = COALESCE(accepted_at, $3), completed_at = $3
+		WHERE id = $1 AND server_id = $2`, commandID, serverID, at); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) GetDetectionReport(ctx context.Context, serverID string) (domain.DetectionReport, bool, error) {
+	var encoded []byte
+	var detectedAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		SELECT report, detected_at FROM detection_reports WHERE server_id = $1`, serverID).Scan(&encoded, &detectedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.DetectionReport{}, false, nil
+	}
+	if err != nil {
+		return domain.DetectionReport{}, false, mapError(err)
+	}
+	var report domain.DetectionReport
+	if err := json.Unmarshal(encoded, &report); err != nil {
+		return domain.DetectionReport{}, false, err
+	}
+	return report, true, nil
 }
 
 func (s *Store) ReplaceProjectSnapshots(ctx context.Context, projectID, serverID string, snapshots []domain.Snapshot, syncedAt time.Time) error {

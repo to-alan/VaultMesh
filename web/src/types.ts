@@ -243,3 +243,37 @@ export interface Profile {
   webauthn_available: boolean
   webauthn_rp_id: string
 }
+
+export interface DetectedContainer {
+  name: string
+  image: string
+  running: boolean
+  ports?: string[]
+  mounts?: string[]
+}
+
+export interface DetectedDatabase {
+  kind: 'mysql' | 'postgresql'
+  source: string
+  container?: string
+  host: string
+  port: number
+  reachable: boolean
+  dump_tool?: string
+}
+
+export interface DetectedApp {
+  path: string
+  name: string
+  kind: string
+  markers: string[]
+}
+
+export interface DetectionReport {
+  generated_at: string
+  command_id?: string
+  containers?: DetectedContainer[]
+  databases?: DetectedDatabase[]
+  apps?: DetectedApp[]
+  tools?: Record<string, string>
+}

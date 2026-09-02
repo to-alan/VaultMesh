@@ -1084,6 +1084,81 @@ func TestAgentRunMarksDroppedLegacyInventory(t *testing.T) {
 	}
 }
 
+// TestDetectionCommandRoundTrip verifies the server-scoped detect command
+// flows to the agent and the returned report closes the command and becomes
+// readable by the wizard endpoint.
+func TestDetectionCommandRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	service := NewService(dataStore, mustSealer(t, 29))
+	enrollment, err := service.CreateServer(ctx, "Detect host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "detect-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, service, slog.New(slog.NewTextHandler(io.Discard, nil)), false, nil)
+	adminCookie := loginAdmin(t, handler)
+
+	var command domain.Command
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/servers/"+identity.AgentID+"/detect", adminCookie,
+		nil, http.StatusAccepted, &command)
+	if command.ID == "" || command.ProjectID != "" {
+		t.Fatalf("detection command must be server-scoped: %#v", command)
+	}
+
+	// The wizard reports "not available" before the agent answers.
+	var absent struct {
+		Available bool `json:"available"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/servers/"+identity.AgentID+"/detection", adminCookie,
+		nil, http.StatusOK, &absent)
+	if absent.Available {
+		t.Fatal("detection should be unavailable before the report arrives")
+	}
+
+	// Agent claims the command via the normal channel.
+	var commands struct {
+		Items []domain.Command `json:"items"`
+	}
+	requestJSON(t, handler, http.MethodGet, "/api/v1/agent/commands", identity.Token, nil, http.StatusOK, &commands)
+	if len(commands.Items) != 1 || commands.Items[0].Type != "detect" {
+		t.Fatalf("detect command was not leased: %#v", commands.Items)
+	}
+
+	// Agent posts the report; the command closes in the same transaction.
+	report := domain.DetectionReport{
+		CommandID:   command.ID,
+		GeneratedAt: time.Now().UTC(),
+		Containers:  []domain.DetectedContainer{{Name: "mysql-main", Image: "mysql:8.4", Running: true, Ports: []string{"3306/tcp"}}},
+		Databases:   []domain.DetectedDatabase{{Kind: "mysql", Source: "docker", Container: "mysql-main", Host: "127.0.0.1", Port: 3306, Reachable: true}},
+		Apps:        []domain.DetectedApp{{Path: "/var/www/site", Name: "PHP (Composer)", Kind: "php", Markers: []string{"composer.json"}}},
+	}
+	requestJSON(t, handler, http.MethodPut, "/api/v1/agent/detection", identity.Token, report, http.StatusNoContent, nil)
+
+	var available struct {
+		Available bool                   `json:"available"`
+		Report    domain.DetectionReport `json:"report"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/servers/"+identity.AgentID+"/detection", adminCookie,
+		nil, http.StatusOK, &available)
+	if !available.Available || len(available.Report.Apps) != 1 || len(available.Report.Containers) != 1 {
+		t.Fatalf("detection report was not stored: %#v", available)
+	}
+
+	// A manual command is a run-scoped fact; the detect command must have
+	// been completed so it is not leased again.
+	commands.Items = nil
+	requestJSON(t, handler, http.MethodGet, "/api/v1/agent/commands", identity.Token, nil, http.StatusOK, &commands)
+	for _, item := range commands.Items {
+		if item.ID == command.ID {
+			t.Fatalf("completed detection command was leased again: %#v", commands.Items)
+		}
+	}
+}
+
 func TestControlPlaneRejectsAgentStateDirectory(t *testing.T) {
 	service := NewService(memory.New(), mustSealer(t, 26))
 	for _, path := range []string{"/var/lib/vaultmesh-agent", "/var/lib/vaultmesh-agent/state.json"} {

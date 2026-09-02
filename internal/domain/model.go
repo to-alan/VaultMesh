@@ -356,14 +356,53 @@ type ProjectHealth struct {
 }
 
 type Command struct {
-	ID         string         `json:"id"`
-	ServerID   string         `json:"server_id"`
-	ProjectID  string         `json:"project_id"`
-	Type       string         `json:"type"`
-	Payload    map[string]any `json:"payload,omitempty"`
-	LeaseUntil *time.Time     `json:"lease_until,omitempty"`
-	Attempts   int            `json:"attempts"`
-	CreatedAt  time.Time      `json:"created_at"`
+	ID        string         `json:"id"`
+	ServerID  string         `json:"server_id"`
+	ProjectID string         `json:"project_id,omitempty"`
+	Type      string         `json:"type"`
+	Payload   map[string]any `json:"payload,omitempty"`
+	// ProjectID is empty for server-scoped commands such as "detect".
+	LeaseUntil *time.Time `json:"lease_until,omitempty"`
+	Attempts   int        `json:"attempts"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+// DetectionReport is a read-only inventory of backup-worthy facts on one
+// agent host: running containers, database signals, and application roots
+// discovered by marker files. It never contains secrets; the control-plane
+// wizard turns selected findings into a project draft for human review.
+type DetectionReport struct {
+	GeneratedAt time.Time           `json:"generated_at"`
+	CommandID   string              `json:"command_id,omitempty"`
+	Containers  []DetectedContainer `json:"containers,omitempty"`
+	Databases   []DetectedDatabase  `json:"databases,omitempty"`
+	Apps        []DetectedApp       `json:"apps,omitempty"`
+	Tools       map[string]string   `json:"tools,omitempty"`
+}
+
+type DetectedContainer struct {
+	Name    string   `json:"name"`
+	Image   string   `json:"image"`
+	Running bool     `json:"running"`
+	Ports   []string `json:"ports,omitempty"`
+	Mounts  []string `json:"mounts,omitempty"`
+}
+
+type DetectedDatabase struct {
+	Kind      string `json:"kind"` // mysql | postgresql
+	Source    string `json:"source"`
+	Container string `json:"container,omitempty"`
+	Host      string `json:"host"`
+	Port      int    `json:"port"`
+	Reachable bool   `json:"reachable"`
+	DumpTool  string `json:"dump_tool,omitempty"`
+}
+
+type DetectedApp struct {
+	Path    string   `json:"path"`
+	Name    string   `json:"name"`
+	Kind    string   `json:"kind"`
+	Markers []string `json:"markers"`
 }
 
 // AuditEvent is an append-only record of a security-sensitive control-plane

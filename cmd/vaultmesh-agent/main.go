@@ -115,6 +115,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Detection scans need the tool paths but never touch repositories or
+	// the protected state directories.
+	detectionRunner := agent.NewRunnerWithTools(*resticPath, *mysqlDumpPath, *pgDumpPath, *dockerPath, "")
+
 	// One merged round trip per interval: the heartbeat carries the applied
 	// revision and the response delivers a new configuration when the agent
 	// lags behind. Each loop adds per-cycle jitter so a fleet of agents never
@@ -122,7 +126,7 @@ func main() {
 	sync := func() { syncAgent(ctx, client, state, manager, identity, logger) }
 	reports := func() { flushReports(ctx, client, state, identity, logger) }
 	inventories := func() { flushSnapshotInventories(ctx, client, state, identity, logger) }
-	commands := func() { fetchCommands(ctx, client, manager, identity, logger) }
+	commands := func() { fetchCommands(ctx, client, manager, detectionRunner, identity, logger) }
 
 	logger.Info("VaultMesh agent started", "agent_id", identity.AgentID, "version", version.Version)
 	go loop(ctx, syncInterval, sync)
@@ -202,7 +206,7 @@ func flushSnapshotInventories(ctx context.Context, client *agent.Client, state *
 	}
 }
 
-func fetchCommands(ctx context.Context, client *agent.Client, manager *agent.Manager, identity domain.AgentIdentity, logger *slog.Logger) {
+func fetchCommands(ctx context.Context, client *agent.Client, manager *agent.Manager, detectionRunner *agent.Runner, identity domain.AgentIdentity, logger *slog.Logger) {
 	commands, err := client.Commands(ctx, identity.Token)
 	if err != nil {
 		logger.Warn("fetch manual commands", "error", err)
@@ -210,6 +214,9 @@ func fetchCommands(ctx context.Context, client *agent.Client, manager *agent.Man
 	}
 	for _, command := range commands {
 		switch command.Type {
+		case "detect":
+			runDetection(ctx, client, identity, command, detectionRunner, logger)
+			continue
 		case "backup", "retention_preview", "snapshot_sync", "snapshot_protect", "snapshot_browse", "snapshot_restore":
 		default:
 			logger.Error("reject unsupported command", "command_id", command.ID, "type", command.Type)
@@ -219,6 +226,27 @@ func fetchCommands(ctx context.Context, client *agent.Client, manager *agent.Man
 			logger.Warn("defer manual command", "command_id", command.ID, "type", command.Type, "error", err)
 		}
 	}
+}
+
+// runDetection executes the read-only inventory scan and posts the report.
+// Detection is idempotent and stateless: a crashed run is simply re-leased
+// and re-run by the control plane.
+func runDetection(ctx context.Context, client *agent.Client, identity domain.AgentIdentity, command domain.Command, runner *agent.Runner, logger *slog.Logger) {
+	detectCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	result := runner.Detect(detectCtx, command.ID)
+	if result.Status != domain.RunSucceeded || result.DetectionReport == nil {
+		logger.Warn("detection scan failed", "command_id", command.ID, "error", result.ErrorMessage)
+		return
+	}
+	if err := client.ReportDetection(ctx, identity.Token, *result.DetectionReport); err != nil {
+		logger.Warn("report detection", "command_id", command.ID, "error", err)
+		return
+	}
+	logger.Info("detection report delivered", "command_id", command.ID,
+		"containers", len(result.DetectionReport.Containers),
+		"databases", len(result.DetectionReport.Databases),
+		"apps", len(result.DetectionReport.Apps))
 }
 
 func flushReports(ctx context.Context, client *agent.Client, state *agent.StateStore, identity domain.AgentIdentity, logger *slog.Logger) {

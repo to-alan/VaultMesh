@@ -70,6 +70,8 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("GET /api/v1/dashboard", s.admin(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /api/v1/servers", s.admin(http.HandlerFunc(s.listServers)))
 	mux.Handle("POST /api/v1/servers", s.admin(http.HandlerFunc(s.createServer)))
+	mux.Handle("POST /api/v1/servers/{serverID}/detect", s.admin(http.HandlerFunc(s.createDetection)))
+	mux.Handle("GET /api/v1/servers/{serverID}/detection", s.admin(http.HandlerFunc(s.getDetection)))
 	mux.Handle("DELETE /api/v1/servers/{serverID}", s.admin(http.HandlerFunc(s.archiveServer)))
 	mux.Handle("GET /api/v1/repositories", s.admin(http.HandlerFunc(s.listRepositories)))
 	mux.Handle("POST /api/v1/repositories", s.admin(http.HandlerFunc(s.createRepository)))
@@ -103,6 +105,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("GET /api/v1/agent/config", s.agent(http.HandlerFunc(s.agentConfig)))
 	mux.Handle("GET /api/v1/agent/commands", s.agent(http.HandlerFunc(s.agentCommands)))
 	mux.Handle("POST /api/v1/agent/runs", s.agent(http.HandlerFunc(s.agentRun)))
+	mux.Handle("PUT /api/v1/agent/detection", s.agent(http.HandlerFunc(s.agentDetection)))
 	mux.Handle("PUT /api/v1/agent/snapshots", s.agent(http.HandlerFunc(s.agentSnapshots)))
 
 	mux.HandleFunc("/", s.notFound)

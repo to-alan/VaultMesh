@@ -57,6 +57,8 @@ type Store interface {
 	DesiredConfig(context.Context, string) (domain.AgentConfig, error)
 	CreateCommand(context.Context, domain.Command) (domain.Command, error)
 	ClaimCommands(context.Context, string, time.Time, time.Time, int) ([]domain.Command, error)
+	SaveDetectionReport(context.Context, string, string, domain.DetectionReport, time.Time) error
+	GetDetectionReport(context.Context, string) (domain.DetectionReport, bool, error)
 	ReplaceProjectSnapshots(context.Context, string, string, []domain.Snapshot, time.Time) error
 	ListSnapshots(context.Context, string, int) ([]domain.Snapshot, error)
 	GetSnapshot(context.Context, string, string) (domain.Snapshot, error)

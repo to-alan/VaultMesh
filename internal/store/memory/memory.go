@@ -42,10 +42,18 @@ type Store struct {
 	deliveryKeys map[string]string
 	auditEvents  []domain.AuditEvent
 	auditIDs     map[string]struct{}
+	detections   map[string]detectionEntry
+}
+
+type detectionEntry struct {
+	commandID  string
+	report     domain.DetectionReport
+	detectedAt time.Time
 }
 
 func New() *Store {
 	return &Store{
+		detections:   make(map[string]detectionEntry),
 		servers:      make(map[string]domain.Server),
 		enrollments:  make(map[string]enrollment),
 		credentials:  make(map[string]string),
@@ -385,14 +393,22 @@ func (s *Store) DesiredConfig(_ context.Context, serverID string) (domain.AgentC
 func (s *Store) CreateCommand(_ context.Context, command domain.Command) (domain.Command, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	project, ok := s.projects[command.ProjectID]
-	if !ok || !project.Enabled {
-		return domain.Command{}, store.ErrNotFound
+	if command.ProjectID == "" {
+		// Server-scoped commands (detection) are not bound to a project.
+		server, ok := s.servers[command.ServerID]
+		if !ok || server.ArchivedAt != nil {
+			return domain.Command{}, store.ErrNotFound
+		}
+	} else {
+		project, ok := s.projects[command.ProjectID]
+		if !ok || !project.Enabled {
+			return domain.Command{}, store.ErrNotFound
+		}
+		command.ServerID = project.ServerID
 	}
 	if _, exists := s.commands[command.ID]; exists {
 		return domain.Command{}, store.ErrConflict
 	}
-	command.ServerID = project.ServerID
 	command.Payload = cloneAnyMap(command.Payload)
 	s.commands[command.ID] = command
 	return cloneCommand(command), nil
@@ -409,8 +425,10 @@ func (s *Store) ClaimCommands(_ context.Context, serverID string, now, leaseUnti
 		if command.ServerID != serverID {
 			continue
 		}
-		if project, ok := s.projects[command.ProjectID]; ok && project.ArchivedAt != nil {
-			continue
+		if command.ProjectID != "" {
+			if project, ok := s.projects[command.ProjectID]; ok && project.ArchivedAt != nil {
+				continue
+			}
 		}
 		if _, accepted := s.accepted[id]; accepted {
 			continue
@@ -589,6 +607,28 @@ func (s *Store) ListProjectBackupActivity(_ context.Context) ([]domain.ProjectBa
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].ProjectID < result[j].ProjectID })
 	return result, nil
+}
+
+func (s *Store) SaveDetectionReport(_ context.Context, serverID, commandID string, report domain.DetectionReport, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.servers[serverID]; !ok {
+		return store.ErrNotFound
+	}
+	s.detections[serverID] = detectionEntry{commandID: commandID, report: report, detectedAt: at}
+	s.completed[commandID] = at
+	s.accepted[commandID] = at
+	return nil
+}
+
+func (s *Store) GetDetectionReport(_ context.Context, serverID string) (domain.DetectionReport, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, ok := s.detections[serverID]
+	if !ok {
+		return domain.DetectionReport{}, false, nil
+	}
+	return entry.report, true, nil
 }
 
 func (s *Store) PruneBefore(_ context.Context, scope store.RetentionScope, before time.Time) (int64, error) {

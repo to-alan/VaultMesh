@@ -24,6 +24,9 @@ type RunResult struct {
 	ErrorCode    string
 	ErrorMessage string
 	Stats        map[string]any
+	// DetectionReport carries the read-only inventory for detect runs; nil
+	// for every other operation.
+	DetectionReport *domain.DetectionReport
 }
 
 type sourcePreparationWarning struct {

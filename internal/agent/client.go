@@ -156,6 +156,13 @@ func (c *Client) Report(ctx context.Context, token string, report domain.RunRepo
 	return c.doJSON(ctx, http.MethodPost, "/api/v1/agent/runs", token, report, nil)
 }
 
+// ReportDetection delivers the read-only detection inventory through the
+// dedicated idempotent channel; the control plane closes the originating
+// command in the same transaction.
+func (c *Client) ReportDetection(ctx context.Context, token string, report domain.DetectionReport) error {
+	return c.doJSON(ctx, http.MethodPut, "/api/v1/agent/detection", token, report, nil)
+}
+
 func (c *Client) ReportSnapshots(ctx context.Context, token string, projectID string, snapshots []domain.Snapshot) error {
 	payload := struct {
 		ProjectID string            `json:"project_id"`

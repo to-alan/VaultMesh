@@ -3,6 +3,7 @@ import type {
   AlertIncident,
   AuditEvent,
   Dashboard,
+  DetectionReport,
   EnrollmentResult,
   NotificationChannel,
   NotificationDelivery,
@@ -168,6 +169,11 @@ export const controlPlane = {
     list: () => list<Server>('/api/v1/servers'),
     create: (name: string) => requestJSON<EnrollmentResult>('/api/v1/servers', { method: 'POST', body: { name } }),
     archive: (serverID: string) => requestJSON<void>(`/api/v1/servers/${resourceID(serverID)}`, { method: 'DELETE' }),
+    detect: (serverID: string) => requestJSON<CommandAccepted>(`/api/v1/servers/${resourceID(serverID)}/detect`, { method: 'POST' }),
+    detection: async (serverID: string) => {
+      const result = await requestJSON<{ available: boolean; report?: DetectionReport }>(`/api/v1/servers/${resourceID(serverID)}/detection`)
+      return result.available && result.report ? result.report : null
+    },
   },
 
   repositories: {

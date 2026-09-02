@@ -52,6 +52,7 @@ import {
   createProjectSourceDraft,
   projectFormDraftFromProject,
   projectWriteInput,
+  type ProjectSourceDraft,
 } from './forms/project'
 import { controlPlane } from './services'
 import type { NotificationChannelWriteInput } from './services'
@@ -60,7 +61,7 @@ import { useProjectFilters, useRunFilters } from './composables/filters'
 import { useSnapshotExplorer } from './composables/snapshotExplorer'
 import AuditView from './views/AuditView.vue'
 import RunsView from './views/RunsView.vue'
-import type { AlertIncident, AuditEvent, Dashboard, EnrollmentResult, NotificationChannel, NotificationDelivery, Passkey, Profile, Project, ProjectHealth, Repository, Run, Server, Snapshot, SnapshotEntry } from './types'
+import type { AlertIncident, AuditEvent, Dashboard, DetectionReport, EnrollmentResult, NotificationChannel, NotificationDelivery, Passkey, Profile, Project, ProjectHealth, Repository, Run, Server, Snapshot, SnapshotEntry } from './types'
 import { friendlyPasskeyError, parseCreationOptions, parseRequestOptions, serializeAssertion, serializeRegistration, suggestedPasskeyName } from './webauthn'
 
 type RunStatusFilter = 'all' | 'active' | 'succeeded' | 'attention'
@@ -691,6 +692,106 @@ function selectDefaults() {
   explorer.pruneInvalidSelection(projects.value.map((project) => project.id))
 }
 
+// ---- Detection wizard -------------------------------------------------
+const detectionServerID = ref('')
+const detectionReport = ref<DetectionReport | null>(null)
+const detectionSelection = reactive({ apps: [] as number[], databases: [] as number[], containers: [] as number[] })
+let detectionPollTimer: number | undefined
+const detectionHasSelection = computed(() =>
+  detectionSelection.apps.length + detectionSelection.databases.length + detectionSelection.containers.length > 0)
+
+async function startDetection(server: Server) {
+  detectionServerID.value = server.id
+  detectionReport.value = null
+  detectionSelection.apps = []
+  detectionSelection.databases = []
+  detectionSelection.containers = []
+  await perform(async () => {
+    await controlPlane.servers.detect(server.id)
+    success.value = `已向 ${server.name} 发送只读探测任务，Agent 完成后自动展示结果。`
+    pollDetection(server.id, 12)
+  })
+}
+
+function pollDetection(serverID: string, remainingAttempts: number) {
+  window.clearTimeout(detectionPollTimer)
+  if (remainingAttempts <= 0) return
+  detectionPollTimer = window.setTimeout(async () => {
+    try {
+      const report = await controlPlane.servers.detection(serverID)
+      if (report && report.command_id) {
+        detectionReport.value = report
+        success.value = '探测完成。勾选要备份的内容并生成项目草稿。'
+        return
+      }
+    } catch {
+      // keep polling; transient errors are surfaced by the next tick
+    }
+    pollDetection(serverID, remainingAttempts - 1)
+  }, 10000)
+}
+
+function closeDetection() {
+  window.clearTimeout(detectionPollTimer)
+  detectionServerID.value = ''
+  detectionReport.value = null
+}
+
+async function runDetectionAgain() {
+  const server = servers.value.find((item) => item.id === detectionServerID.value)
+  if (server) await startDetection(server)
+}
+
+// Convert selected findings into a project draft; the user confirms in the
+// existing builder, including entering database passwords by hand.
+function applyDetectionDraft() {
+  const report = detectionReport.value
+  const serverID = detectionServerID.value
+  if (!report) return
+  Object.assign(projectForm, createProjectFormDraft())
+  projectForm.server_id = serverID
+  const drafts: ProjectSourceDraft[] = []
+
+  for (const index of detectionSelection.apps) {
+    const app = report.apps?.[index]
+    if (!app) continue
+    const draft = createProjectSourceDraft('files')
+    draft.paths = app.path
+    drafts.push(draft)
+  }
+  for (const index of detectionSelection.databases) {
+    const db = report.databases?.[index]
+    if (!db || !db.reachable) continue
+    const draft = createProjectSourceDraft(db.kind === 'mysql' ? 'mysql' : 'postgresql')
+    draft.host = db.host || '127.0.0.1'
+    draft.port = db.port || (db.kind === 'mysql' ? 3306 : 5432)
+    drafts.push(draft)
+  }
+  for (const index of detectionSelection.containers) {
+    const container = report.containers?.[index]
+    if (!container || !container.running || !container.mounts?.length) continue
+    const draft = createProjectSourceDraft('docker')
+    draft.containers = container.name
+    draft.include_volumes = true
+    drafts.push(draft)
+  }
+  if (!drafts.length) {
+    error.value = '所选内容没有可备份的数据（例如容器未发布端口）。'
+    return
+  }
+  projectForm.sources = drafts
+  projectForm.name = `探测草稿 · ${servers.value.find((item) => item.id === serverID)?.name || serverID}`
+  detectionSelection.apps = []
+  detectionSelection.databases = []
+  detectionSelection.containers = []
+  activeTab.value = 'projects'
+  editingProjectID.value = ''
+  window.requestAnimationFrame(() => {
+    document.getElementById('project-builder')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+  success.value = '已生成项目草稿：请补全数据源密码并确认各项配置后保存。'
+}
+
 async function createServer() {
   await perform(async () => {
     enrollment.value = await controlPlane.servers.create(serverForm.name)
@@ -1269,7 +1370,7 @@ onBeforeUnmount(() => {
             <div class="panel-heading"><div><p class="eyebrow">AGENTS</p><h2>已接入服务器</h2></div></div>
             <div v-if="!servers.length" class="empty-state">还没有服务器。</div>
             <div v-else class="table-wrap"><table><thead><tr><th>名称</th><th>状态</th><th>主机</th><th>版本</th><th>配置</th><th>最后心跳</th><th>操作</th></tr></thead><tbody>
-              <tr v-for="server in servers" :key="server.id"><td><strong>{{ server.name }}</strong><small>{{ server.id }}</small></td><td><span class="status-pill" :class="server.status">{{ statusLabel(server.status) }}</span></td><td>{{ server.hostname || '—' }}<small>{{ server.os }} {{ server.arch }}</small></td><td>{{ server.agent_version || '—' }}</td><td>{{ server.applied_revision }}/{{ server.desired_revision }}</td><td>{{ formatDate(server.last_seen_at) }}</td><td><button type="button" class="text-button danger-text" :disabled="loading" @click="archiveServer(server)">归档</button></td></tr>
+              <tr v-for="server in servers" :key="server.id"><td><strong>{{ server.name }}</strong><small>{{ server.id }}</small></td><td><span class="status-pill" :class="server.status">{{ statusLabel(server.status) }}</span></td><td>{{ server.hostname || '—' }}<small>{{ server.os }} {{ server.arch }}</small></td><td>{{ server.agent_version || '—' }}</td><td>{{ server.applied_revision }}/{{ server.desired_revision }}</td><td>{{ formatDate(server.last_seen_at) }}</td><td><button type="button" class="ghost compact" :disabled="loading || detectionServerID === server.id" @click="startDetection(server)">{{ detectionServerID === server.id ? '探测中…' : '探测可备份项' }}</button><button type="button" class="text-button danger-text" :disabled="loading" @click="archiveServer(server)">归档</button></td></tr>
             </tbody></table></div>
           </section>
           <aside class="panel form-panel">
@@ -1277,6 +1378,44 @@ onBeforeUnmount(() => {
             <form @submit.prevent="createServer"><label>显示名称<input v-model="serverForm.name" required maxlength="100" placeholder="Hong Kong VPS" /></label><button class="primary" :disabled="loading">创建注册码</button></form>
           </aside>
         </div>
+        <section v-if="detectionReport && detectionServerID" class="panel detection-wizard">
+          <div class="panel-heading"><div><p class="eyebrow">DETECTION</p><h2>可备份项探测结果</h2><p>勾选要纳入备份的内容，生成项目草稿后在右侧表单确认。数据库密码需要你手动填写，探测不会读取任何密钥。</p></div><button type="button" class="ghost compact" @click="closeDetection">关闭</button></div>
+
+          <div v-if="detectionReport.databases?.length" class="detection-group">
+            <h3>数据库</h3>
+            <label v-for="(db, index) in detectionReport.databases" :key="'db' + index" class="check-row">
+              <input type="checkbox" v-model="detectionSelection.databases" :value="index" />
+              <span><strong>{{ db.kind === 'mysql' ? 'MySQL' : 'PostgreSQL' }} · {{ db.container || db.source }}</strong>
+              <small>127.0.0.1:{{ db.port || (db.kind === 'mysql' ? 3306 : 5432) }} · {{ db.reachable ? '端口可达' : '端口未发布，暂不可备份' }}{{ db.dump_tool ? ' · ' + db.dump_tool : '' }}</small></span>
+            </label>
+          </div>
+
+          <div v-if="detectionReport.apps?.length" class="detection-group">
+            <h3>应用目录</h3>
+            <label v-for="(app, index) in detectionReport.apps" :key="'app' + index" class="check-row">
+              <input type="checkbox" v-model="detectionSelection.apps" :value="index" />
+              <span><strong>{{ app.name }} · {{ app.path }}</strong><small>{{ app.markers.join('、') }}</small></span>
+            </label>
+          </div>
+
+          <div v-if="detectionReport.containers?.length" class="detection-group">
+            <h3>Docker 容器</h3>
+            <label v-for="(container, index) in detectionReport.containers" :key="'ct' + index" class="check-row">
+              <input type="checkbox" v-model="detectionSelection.containers" :value="index" />
+              <span><strong>{{ container.name }} · {{ container.image }}</strong><small>{{ container.running ? '运行中' : '已停止' }}{{ container.mounts?.length ? ' · 挂载 ' + container.mounts.length + ' 项' : '' }}</small></span>
+            </label>
+          </div>
+
+          <div v-if="!detectionReport.databases?.length && !detectionReport.apps?.length && !detectionReport.containers?.length" class="empty-state">
+            没有探测到明显的可备份项。可以手动创建项目指定任意路径。
+          </div>
+
+          <footer class="form-actions">
+            <button type="button" class="primary" :disabled="loading || !detectionHasSelection" @click="applyDetectionDraft">用所选生成项目草稿</button>
+            <button type="button" class="ghost" @click="runDetectionAgain" :disabled="loading">重新探测</button>
+          </footer>
+        </section>
+
         <section v-if="enrollment" class="panel enrollment-card">
           <div><p class="eyebrow">ONE-TIME TOKEN</p><h2>在 {{ enrollment.server.name }} 上运行</h2></div>
           <code>{{ installCommand(enrollment) }}</code>

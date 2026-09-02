@@ -34,6 +34,29 @@ func (s *HTTPServer) listServers(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
+func (s *HTTPServer) createDetection(w http.ResponseWriter, r *http.Request) {
+	command, err := s.service.CreateDetectionCommand(r.Context(), r.PathValue("serverID"))
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	setAuditResourceID(w, command.ServerID)
+	s.writeJSON(w, http.StatusAccepted, command)
+}
+
+func (s *HTTPServer) getDetection(w http.ResponseWriter, r *http.Request) {
+	report, found, err := s.service.GetDetectionReport(r.Context(), r.PathValue("serverID"))
+	if err != nil {
+		s.handleServiceError(w, err)
+		return
+	}
+	if !found {
+		s.writeJSON(w, http.StatusOK, map[string]any{"available": false})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"available": true, "report": report})
+}
+
 func (s *HTTPServer) archiveServer(w http.ResponseWriter, r *http.Request) {
 	server, err := s.service.ArchiveServer(r.Context(), r.PathValue("serverID"))
 	if err != nil {
