@@ -323,6 +323,7 @@ func (s *Store) ClaimCommands(ctx context.Context, serverID string, now, leaseUn
 		  WHERE server_id = $1
 		    AND accepted_at IS NULL
 		    AND (leased_until IS NULL OR leased_until <= $2)
+		    AND created_at >= $5
 		  ORDER BY created_at
 		  LIMIT $4
 		  FOR UPDATE SKIP LOCKED
@@ -332,7 +333,7 @@ func (s *Store) ClaimCommands(ctx context.Context, serverID string, now, leaseUn
 		FROM picked
 		WHERE c.id = picked.id
 		RETURNING c.id, c.server_id, COALESCE(c.project_id, ''), c.type, c.payload, c.leased_until, c.attempts, c.created_at`,
-		serverID, now, leaseUntil, limit)
+		serverID, now, leaseUntil, limit, now.Add(-store.CommandMaxAge))
 	if err != nil {
 		return nil, err
 	}

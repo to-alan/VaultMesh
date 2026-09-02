@@ -10,6 +10,12 @@ import (
 	"github.com/to-alan/vaultmesh/internal/domain"
 )
 
+// CommandMaxAge bounds how long an unaccepted command keeps being leased.
+// Commands whose agent never accepts them (version skew, decommissioned
+// host) would otherwise be re-leased forever. Accepted commands are exempt:
+// an in-flight run may legitimately outlive this window.
+const CommandMaxAge = 24 * time.Hour
+
 var (
 	ErrNotFound          = errors.New("not found")
 	ErrConflict          = errors.New("conflict")

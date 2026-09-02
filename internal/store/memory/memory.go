@@ -433,6 +433,9 @@ func (s *Store) ClaimCommands(_ context.Context, serverID string, now, leaseUnti
 		if _, accepted := s.accepted[id]; accepted {
 			continue
 		}
+		if command.CreatedAt.Before(now.Add(-store.CommandMaxAge)) {
+			continue
+		}
 		if command.LeaseUntil != nil && command.LeaseUntil.After(now) {
 			continue
 		}
