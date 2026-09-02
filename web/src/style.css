@@ -755,8 +755,10 @@ button.file-name.directory:hover { text-decoration: underline; }
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
 
-.app-version { position: fixed; left: 14px; bottom: 10px; z-index: 20; display: flex; align-items: center; gap: 8px; color: #5c6f78; font-size: 11px; letter-spacing: .02em; user-select: text; }
-.app-version .version-commit { color: #44545e; font-family: ui-monospace, monospace; }
+.sidebar-footer .app-version { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5c6f78; font-size: 11px; user-select: text; }
+.sidebar-footer .app-version strong { color: #6d8189; font-weight: 600; }
 .projects-left { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .projects-left .content-grid { display: block; }
 .projects-left .content-grid > .panel { margin: 0 0 10px; }
+
+.projects-left .projects-list-panel { margin: 0 0 10px; }

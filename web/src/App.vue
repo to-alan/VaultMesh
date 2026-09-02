@@ -1389,10 +1389,6 @@ onBeforeUnmount(() => {
       <p v-if="error" class="message error">{{ error }}</p>
       <p class="security-note">登录成功后使用 HttpOnly 会话 Cookie，前端不会读取或保存密码与会话凭据。</p>
     </section>
-    <footer class="app-version" v-if="authenticated">
-      <span>VaultMesh {{ controlPlaneVersion || '…' }}</span>
-      <span v-if="controlPlaneCommit" class="version-commit">{{ controlPlaneCommit.slice(0, 7) }}</span>
-    </footer>
   </main>
 
   <div v-else class="app-shell">
@@ -1422,6 +1418,7 @@ onBeforeUnmount(() => {
         <span class="account-chevron">›</span>
       </button>
       <div class="sidebar-footer">
+        <span class="app-version" :title="`commit ${controlPlaneCommit || '…'}`"><strong>VaultMesh</strong> {{ controlPlaneVersion.replace(/^edge-/, 'edge ') || '…' }}</span>
         <button type="button" class="ghost" @click="refreshData()" :disabled="loading || backgroundRefreshing">{{ backgroundRefreshing ? '同步中…' : '刷新' }}</button>
         <button type="button" class="ghost" @click="logout">退出</button>
       </div>
