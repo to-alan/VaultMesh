@@ -215,3 +215,68 @@ func TestPostgresVerticalSlice(t *testing.T) {
 		t.Fatalf("server-scoped incident was not persisted: %#v", incident)
 	}
 }
+
+// TestPostgresDetectCommandLifecycle reproduces the field issue: a
+// server-scoped detect command must be creatable, claimable, and its
+// attempts counter must advance as an agent polls.
+func TestPostgresDetectCommandLifecycle(t *testing.T) {
+	databaseURL := os.Getenv("VAULTMESH_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("VAULTMESH_TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dataStore, err := Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dataStore.Close()
+	if err := dataStore.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	serverID := "srv_det_" + suffix
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	if _, err := dataStore.CreateServer(ctx, domain.Server{ID: serverID, Name: "det", Status: domain.ServerPending, CreatedAt: now}, []byte("hash"), now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	command, err := dataStore.CreateCommand(ctx, domain.Command{ID: "cmd_det_" + suffix, ServerID: serverID, Type: "detect", CreatedAt: now})
+	if err != nil {
+		t.Fatalf("create server-scoped command: %v", err)
+	}
+	if command.ServerID != serverID {
+		t.Fatalf("command server id mismatch: %#v", command)
+	}
+
+	// First claim by the agent.
+	claimed, err := dataStore.ClaimCommands(ctx, serverID, now, now.Add(2*time.Minute), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].Type != "detect" || claimed[0].Attempts != 1 {
+		t.Fatalf("first claim unexpected: %#v", claimed)
+	}
+
+	// The latest-command lookup used by the wizard must reflect attempts.
+	latest, found, err := dataStore.GetLatestCommand(ctx, serverID, "detect")
+	if err != nil || !found {
+		t.Fatalf("GetLatestCommand: found=%v err=%v", found, err)
+	}
+	if latest.Attempts != 1 {
+		t.Fatalf("attempts did not advance: %#v", latest)
+	}
+
+	// The report delivery closes the command.
+	if err := dataStore.SaveDetectionReport(ctx, serverID, command.ID, domain.DetectionReport{CommandID: command.ID, GeneratedAt: now}, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	report, found, err := dataStore.GetDetectionReport(ctx, serverID)
+	if err != nil || !found {
+		t.Fatalf("detection report missing: found=%v err=%v", found, err)
+	}
+	if report.CommandID != command.ID {
+		t.Fatalf("unexpected report: %#v", report)
+	}
+}

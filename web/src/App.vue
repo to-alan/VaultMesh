@@ -700,6 +700,22 @@ const detectionHasSelection = computed(() =>
 const detectionWarning = ref('')
 const detectionAgentVersion = computed(() =>
   servers.value.find((item) => item.id === detectionServerID.value)?.agent_version || '')
+const detectionTargetName = computed(() =>
+  servers.value.find((item) => item.id === detectionServerID.value)?.name || detectionServerID.value)
+// A stale selection (server archived/offline from an earlier session) must
+// never silently dispatch into the void.
+watch(() => servers.value.map((item) => item.id + ':' + item.status).join(','), () => {
+  if (!detectionServerID.value) return
+  const target = servers.value.find((item) => item.id === detectionServerID.value)
+  if (!target) {
+    detectionServerID.value = servers.value.find((item) => item.status === 'online')?.id ?? ''
+    if (!detectionReport.value) detectionExhausted.value = false
+    return
+  }
+  if (target.status !== 'online' && !detectionReport.value && !detectionExhausted.value) {
+    detectionServerID.value = servers.value.find((item) => item.status === 'online')?.id ?? ''
+  }
+})
 
 // Results and diagnoses appear below the fold when the report is large;
 // scrolling them into view is the difference between feedback and silence.
@@ -715,7 +731,12 @@ watch(detectionWarning, (warning) => { if (warning) revealDetectionPanel('detect
 const DETECTION_POLL_TOTAL = 24   // 24 × 5s = 2 分钟窗口
 const DETECTION_POLL_INTERVAL = 5000
 
-async function startDetection(server: Server) {
+async function startDetection(serverInput: Server) {
+  const server = servers.value.find((item) => item.id === serverInput.id)
+  if (!server || server.status !== 'online') {
+    error.value = `服务器「${serverInput.name}」当前离线或已归档，无法探测。请确认 Agent 在线后重试。`
+    return
+  }
   detectionServerID.value = server.id
   detectionReport.value = null
   detectionExhausted.value = false
@@ -752,6 +773,12 @@ function pollDetection(serverID: string, remainingAttempts: number) {
       if (status.available && status.report) {
         detectionReport.value = status.report
         success.value = '探测完成。勾选要备份的内容并生成项目草稿。'
+        return
+      }
+      const target = servers.value.find((item) => item.id === serverID)
+      if (!target || target.status !== 'online') {
+        detectionExhausted.value = true
+        error.value = `探测中止：${target ? `Agent「${target.name}」已离线` : '目标服务器已不存在'}。请确认 Agent 运行后重新探测。`
         return
       }
     } catch {
@@ -1459,7 +1486,7 @@ onBeforeUnmount(() => {
             </select>
             <button type="button" class="primary compact-action" :disabled="loading || !detectionServerID || detectionRunning" @click="startDetection(servers.find((item) => item.id === detectionServerID)!)">{{ detectionRunning ? '探测中…' : '开始探测' }}</button>
           </div>
-          <p v-if="detectionRunning" class="detection-status" role="status"><i></i>已派发给 Agent，等待回传（第 {{ detectionAttempts }} 次尝试）…</p>
+          <p v-if="detectionRunning" class="detection-status" role="status"><i></i>已派发给 {{ detectionTargetName }} 的 Agent，等待回传（第 {{ detectionAttempts }} 次尝试）…</p>
           <p v-else-if="detectionExhausted" class="detection-status stale">两分钟内没有收到回传，请查看下方诊断。</p>
         </section>
 
