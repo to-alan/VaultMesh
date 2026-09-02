@@ -1300,6 +1300,7 @@ function retentionPreviewSummary(projectID: string): string {
 }
 
 const controlPlaneVersion = ref('')
+const controlPlaneCommit = ref('')
 
 async function buildInstallCommand(result: EnrollmentResult): Promise<string> {
   // One command must work from a bare host: the installer fetches the agent
@@ -1318,7 +1319,10 @@ onMounted(() => {
   window.addEventListener('vaultmesh-ui-error', (event) => {
     error.value = `界面发生错误：${(event as CustomEvent<string>).detail}`
   })
-  void controlPlane.meta.get().then((meta) => { controlPlaneVersion.value = meta.version }).catch(() => {})
+  void controlPlane.meta.get().then((meta) => {
+    controlPlaneVersion.value = meta.version
+    controlPlaneCommit.value = meta.commit
+  }).catch(() => {})
 })
 
 onMounted(async () => {
@@ -1385,6 +1389,10 @@ onBeforeUnmount(() => {
       <p v-if="error" class="message error">{{ error }}</p>
       <p class="security-note">登录成功后使用 HttpOnly 会话 Cookie，前端不会读取或保存密码与会话凭据。</p>
     </section>
+    <footer class="app-version" v-if="authenticated">
+      <span>VaultMesh {{ controlPlaneVersion || '…' }}</span>
+      <span v-if="controlPlaneCommit" class="version-commit">{{ controlPlaneCommit.slice(0, 7) }}</span>
+    </footer>
   </main>
 
   <div v-else class="app-shell">
@@ -1556,6 +1564,8 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-else-if="activeTab === 'projects'">
+        <div class="content-grid projects-grid">
+        <div class="projects-left">
         <section class="panel detection-toolbar">
           <div><p class="eyebrow">AUTO-DETECT</p><h2>自动发现可备份项</h2><small>只读扫描运行中的容器、数据库信号与应用目录；不读取文件内容，不收集密钥。</small></div>
           <div class="data-toolbar">
@@ -1621,8 +1631,8 @@ onBeforeUnmount(() => {
             <li>确认 Agent 在线（服务器页状态为「在线」），并且与控制面的地址可达。</li>
           </ol>
         </section>
+        </div>
 
-        <div class="content-grid projects-grid">
           <ProjectListView
             :projects="projects"
             :servers="servers"

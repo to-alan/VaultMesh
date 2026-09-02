@@ -85,8 +85,7 @@ function previewSummary(project: Project): string {
 </script>
 
 <template>
-  <div class="content-grid projects-grid">
-    <section class="panel">
+  <section class="panel projects-list-panel">
       <div class="panel-heading filter-heading">
         <div><p class="eyebrow">DESIRED STATE</p><h2>项目列表</h2></div>
         <div class="data-toolbar project-toolbar">
@@ -133,6 +132,5 @@ function previewSummary(project: Project): string {
           </div>
         </section>
       </div>
-    </section>
-  </div>
+  </section>
 </template>
