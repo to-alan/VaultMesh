@@ -65,7 +65,14 @@ install_agent() {
 	# loopback; surface that rule with actionable wording.
 	case "$server_url" in
 		http://localhost:*|http://localhost|http://127.0.0.1:*|http://127.0.0.1) ;;
-		http://*) fail "Agent 拒绝非 localhost 的 http 控制面地址。请为控制面配置 HTTPS（如 https://backup.example.com），或在与控制面同一台机器上使用 http://localhost:8080" ;;
+		http://*)
+			# Same-host deployments are the common trial path: the local
+			# control plane is reachable on loopback, so offer the rewrite.
+			if curl -fsS --max-time 3 http://localhost:8080/healthz >/dev/null 2>&1 && [ "$server_url" = "http://$(hostname -I 2>/dev/null | awk '{print $1}'):8080" ]; then
+				fail "检测到控制面与本机同宿主。请改用：install-agent 'http://localhost:8080' <token>\n长期部署建议为控制面配置 HTTPS 域名。"
+			fi
+			fail "Agent 拒绝非 localhost 的 http 控制面地址（明文凭据不可经公网传输）。\n· 与控制面同机？使用 http://localhost:8080\n· 跨机器？先为控制面配置 HTTPS 域名"
+			;;
 		https://*) ;;
 		*) fail "控制面地址必须是 http(s):// URL" ;;
 	esac

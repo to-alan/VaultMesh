@@ -1167,10 +1167,15 @@ function retentionPreviewSummary(projectID: string): string {
 
 function installCommand(result: EnrollmentResult): string {
   // One command must work from a bare host: the installer fetches the agent
-  // release asset, registers, and starts the systemd service.
-  const quotedURL = `'${apiBaseURL}'`
+  // release asset, registers, and starts the systemd service. The agent
+  // only accepts plain HTTP against loopback, so an http:// public API URL
+  // is rewritten to localhost with a note that cross-host use needs HTTPS.
+  const isPlainHTTP = apiBaseURL.startsWith('http://') && !apiBaseURL.includes('localhost') && !apiBaseURL.includes('127.0.0.1')
+  const agentURL = isPlainHTTP ? 'http://localhost:8080' : apiBaseURL
   const quotedToken = `'${result.enrollment_token}'`
-  return `curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh -s -- install-agent ${quotedURL} ${quotedToken} '${result.server.name}'`
+  const command = `curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh -s -- install-agent '${agentURL}' ${quotedToken} '${result.server.name}'`
+  if (!isPlainHTTP) return command
+  return `# 同机部署：Agent 走 localhost 回环（跨机器需要 HTTPS）\n${command}`
 }
 
 onMounted(async () => {
