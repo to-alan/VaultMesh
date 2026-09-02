@@ -758,6 +758,8 @@ button.file-name.directory:hover { text-decoration: underline; }
 .sidebar-footer .app-version { flex: 1 1 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5c6f78; font-size: 11px; user-select: text; margin-bottom: 2px; }
 .sidebar-footer .app-version strong { color: #6d8189; font-weight: 600; }
 .projects-left { display: flex; flex-direction: column; gap: 10px; min-width: 0; position: sticky; top: 18px; align-self: start; max-height: calc(100vh - 36px); overflow-y: auto; }
+.projects-right { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.projects-right .detection-wizard { max-height: 40vh; overflow-y: auto; }
 .projects-left .content-grid { display: block; }
 .projects-left .content-grid > .panel { margin: 0 0 10px; }
 .detection-wizard { position: sticky; top: 18px; align-self: start; max-height: calc(100vh - 36px); overflow-y: auto; }
