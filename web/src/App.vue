@@ -1502,7 +1502,7 @@ onBeforeUnmount(() => {
             <button type="button" class="primary compact-action" :disabled="loading || !detectionServerID || detectionRunning || detectionVersionBlocked" @click="startDetection(servers.find((item) => item.id === detectionServerID)!)">{{ detectionRunning ? '探测中…' : '开始探测' }}</button>
           </div>
           <p v-if="detectionVersionBlocked" class="detection-status stale">该 Agent 版本为 {{ detectionAgentVersion }}，不支持探测（需要 v0.1.2 或 edge）。重新安装：<code>curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo VAULTMESH_AGENT_VERSION=edge sh -s -- install-agent 'http://localhost:8080' '新令牌' '名称'</code></p>
-          <p v-if="detectionRunning" class="detection-status" role="status"><i></i>已派发给 {{ detectionTargetName }} 的 Agent，等待回传（第 {{ detectionAttempts }} 次尝试）…</p>
+          <p v-if="detectionRunning" class="detection-status" role="status"><i></i>已派发给 {{ detectionTargetName }}（{{ detectionServerID }}）的 Agent，等待回传（第 {{ detectionAttempts }} 次尝试）…</p>
           <p v-else-if="detectionExhausted" class="detection-status stale">两分钟内没有收到回传，请查看下方诊断。</p>
         </section>
 
