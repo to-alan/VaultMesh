@@ -221,7 +221,7 @@ func fetchCommands(ctx context.Context, client *agent.Client, manager *agent.Man
 	for _, command := range commands {
 		switch command.Type {
 		case "detect":
-			runDetection(ctx, client, identity, command, detectionRunner, logger)
+			agent.RunDetection(ctx, client, detectionRunner, identity, command, logger)
 			continue
 		case "backup", "retention_preview", "snapshot_sync", "snapshot_protect", "snapshot_browse", "snapshot_restore":
 		default:
@@ -232,27 +232,6 @@ func fetchCommands(ctx context.Context, client *agent.Client, manager *agent.Man
 			logger.Warn("defer manual command", "command_id", command.ID, "type", command.Type, "error", err)
 		}
 	}
-}
-
-// runDetection executes the read-only inventory scan and posts the report.
-// Detection is idempotent and stateless: a crashed run is simply re-leased
-// and re-run by the control plane.
-func runDetection(ctx context.Context, client *agent.Client, identity domain.AgentIdentity, command domain.Command, runner *agent.Runner, logger *slog.Logger) {
-	detectCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	result := runner.Detect(detectCtx, command.ID)
-	if result.Status != domain.RunSucceeded || result.DetectionReport == nil {
-		logger.Warn("detection scan failed", "command_id", command.ID, "error", result.ErrorMessage)
-		return
-	}
-	if err := client.ReportDetection(ctx, identity.Token, *result.DetectionReport); err != nil {
-		logger.Warn("report detection", "command_id", command.ID, "error", err)
-		return
-	}
-	logger.Info("detection report delivered", "command_id", command.ID,
-		"containers", len(result.DetectionReport.Containers),
-		"databases", len(result.DetectionReport.Databases),
-		"apps", len(result.DetectionReport.Apps))
 }
 
 func flushReports(ctx context.Context, client *agent.Client, state *agent.StateStore, identity domain.AgentIdentity, logger *slog.Logger) {

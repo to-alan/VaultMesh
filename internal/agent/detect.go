@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -359,4 +360,25 @@ func safePath(value string) (string, error) {
 		}
 	}
 	return cleaned, nil
+}
+
+// RunDetection executes the read-only inventory scan and posts the report
+// through the dedicated channel. Detection is idempotent and stateless: a
+// crashed attempt is simply re-leased and re-run by the control plane.
+func RunDetection(ctx context.Context, client *Client, runner *Runner, identity domain.AgentIdentity, command domain.Command, logger *slog.Logger) {
+	detectCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	result := runner.Detect(detectCtx, command.ID)
+	if result.Status != domain.RunSucceeded || result.DetectionReport == nil {
+		logger.Warn("detection scan failed", "command_id", command.ID, "error", result.ErrorMessage)
+		return
+	}
+	if err := client.ReportDetection(ctx, identity.Token, *result.DetectionReport); err != nil {
+		logger.Warn("report detection", "command_id", command.ID, "error", err)
+		return
+	}
+	logger.Info("detection report delivered", "command_id", command.ID,
+		"containers", len(result.DetectionReport.Containers),
+		"databases", len(result.DetectionReport.Databases),
+		"apps", len(result.DetectionReport.Apps))
 }
