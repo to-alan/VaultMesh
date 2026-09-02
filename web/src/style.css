@@ -255,6 +255,14 @@ textarea { resize: vertical; line-height: 1.5; }
 .page-load-state.failed { justify-content: space-between; color: #ffb2b7; border-color: #61343a; background: #271419; }
 .page-load-state.failed .text-button { color: #ffc0c4; white-space: nowrap; }
 .page-load-state.warning-banner { justify-content: flex-start; color: #f6c85f; border-color: #665327; background: #261f0c; text-align: left; }
+.detection-wizard .detection-group { margin: 0 0 14px; }
+.detection-wizard .detection-group h3 { margin: 0 0 8px; font-size: 12px; letter-spacing: .08em; color: #7d939c; text-transform: uppercase; }
+.detection-wizard .detection-group .check-row { display: flex; align-items: flex-start; gap: 9px; margin: 0 0 6px; padding: 8px 10px; border: 1px solid #2a3a44; border-radius: 8px; background: #0c161d; cursor: pointer; }
+.detection-wizard .detection-group .check-row:hover { border-color: #3c5563; }
+.detection-wizard .detection-group .check-row input { margin-top: 3px; }
+.detection-wizard .detection-group .check-row span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.detection-wizard .detection-group .check-row strong { font-size: 13px; color: #d8e4e0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detection-wizard .detection-group .check-row small { color: #7d939c; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detection-toolbar .detection-status { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; color: #94b8d0; font-size: 12px; }
 .detection-toolbar .detection-status i { width: 7px; height: 7px; border-radius: 50%; background: var(--blue); box-shadow: 0 0 9px rgba(101,184,255,.7); animation: operation-pulse 1.1s infinite alternate; }
 .detection-toolbar .detection-status.stale { color: #f6c85f; }

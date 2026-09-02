@@ -1184,6 +1184,10 @@ async function refreshData(silent = false) {
 
 // perform runs an operation with the shared loading/error banner handling.
 // It returns the operation result, or undefined when the error was shown.
+function appPathName(path: string): string {
+  return path.split('/').filter(Boolean).at(-1) || path
+}
+
 async function perform<T>(operation: () => Promise<T>): Promise<T | undefined> {
   loading.value = true
   error.value = ''
@@ -1582,7 +1586,7 @@ onBeforeUnmount(() => {
             <h3>应用目录</h3>
             <label v-for="(app, index) in detectionReport.apps" :key="'app' + index" class="check-row">
               <input type="checkbox" v-model="detectionSelection.apps" :value="index" />
-              <span><strong>{{ app.name }} · {{ app.path }}</strong><small>{{ app.markers.join('、') }}</small></span>
+              <span><strong>{{ appPathName(app.path) }} · {{ app.name }}</strong><small>{{ app.path }} · {{ app.markers.join('、') }}</small></span>
             </label>
           </div>
 

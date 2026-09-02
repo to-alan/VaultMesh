@@ -126,6 +126,9 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 		if len(parts) != 3 {
 			continue
 		}
+		if isInfrastructureContainer(parts[0], parts[1]) {
+			continue
+		}
 		containers = append(containers, domain.DetectedContainer{
 			Name:    parts[0],
 			Image:   parts[1],
@@ -152,6 +155,44 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 		}
 	}
 	return containers
+}
+
+// infrastructurePatterns match containers and runtime directories that are
+// supporting infrastructure rather than user data worth backing up: the
+// VaultMesh deployment itself, shared runtimes, admin panels, and build
+// tooling. Their content is either reproducible or already covered by the
+// applications that use them.
+var infrastructurePatterns = []string{
+	"vaultmesh", "grafana", "prometheus", "portainer",
+	"phpmyadmin", "adminer", "redis", "memcached", "nginx-proxy",
+	"runtime/php", "runtime/node", "runtime/python", "runtime/java",
+	"openresty/openresty",
+}
+
+func isInfrastructureContainer(name, image string) bool {
+	haystack := strings.ToLower(name + " " + image)
+	for _, pattern := range infrastructurePatterns {
+		if strings.Contains(haystack, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// isInfrastructurePath filters app directories that are runtimes or tooling
+// rather than a deployable project.
+func isInfrastructurePath(path string) bool {
+	lower := strings.ToLower(path)
+	for _, pattern := range infrastructurePatterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	// Shared runtime directories (1Panel keeps per-version runtimes here).
+	if strings.Contains(lower, "/runtime/") {
+		return true
+	}
+	return false
 }
 
 // databaseSignals are probed on loopback and via listening docker ports.
@@ -302,9 +343,11 @@ func scanMarkers(ctx context.Context, root string, depth int) []domain.DetectedA
 			continue
 		}
 		child := filepath.Join(root, name)
-		if cleaned, err := safePath(child); err == nil {
-			found = append(found, scanMarkers(ctx, cleaned, depth-1)...)
+		cleaned, pathErr := safePath(child)
+		if pathErr != nil || isInfrastructurePath(cleaned) {
+			continue
 		}
+		found = append(found, scanMarkers(ctx, cleaned, depth-1)...)
 	}
 	if len(found) > detectMaxMarkers {
 		found = found[:detectMaxMarkers]
