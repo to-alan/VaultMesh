@@ -401,6 +401,34 @@ func (s *Store) GetDetectionReport(ctx context.Context, serverID string) (domain
 	return report, true, nil
 }
 
+// GetLatestCommand returns the most recent command of one type for a
+// server, used to surface dispatch/attempts state to the console.
+func (s *Store) GetLatestCommand(ctx context.Context, serverID, commandType string) (domain.Command, bool, error) {
+	var command domain.Command
+	var payload []byte
+	var leasedUntil *time.Time
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, server_id, COALESCE(project_id, ''), type, payload, leased_until, attempts, created_at
+		FROM commands
+		WHERE server_id = $1 AND type = $2
+		ORDER BY created_at DESC LIMIT 1`, serverID, commandType).Scan(
+		&command.ID, &command.ServerID, &command.ProjectID, &command.Type,
+		&payload, &leasedUntil, &command.Attempts, &command.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Command{}, false, nil
+	}
+	if err != nil {
+		return domain.Command{}, false, mapError(err)
+	}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &command.Payload); err != nil {
+			return domain.Command{}, false, err
+		}
+	}
+	command.LeaseUntil = leasedUntil
+	return command, true, nil
+}
+
 func (s *Store) ReplaceProjectSnapshots(ctx context.Context, projectID, serverID string, snapshots []domain.Snapshot, syncedAt time.Time) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

@@ -1109,14 +1109,23 @@ func TestDetectionCommandRoundTrip(t *testing.T) {
 		t.Fatalf("detection command must be server-scoped: %#v", command)
 	}
 
-	// The wizard reports "not available" before the agent answers.
+	// The wizard reports "not available" before the agent answers, and the
+	// dispatch state lets it diagnose a non-answering agent.
 	var absent struct {
-		Available bool `json:"available"`
+		Available  bool `json:"available"`
+		HasCommand bool `json:"has_command"`
+		Command    struct {
+			ID       string `json:"id"`
+			Attempts int    `json:"attempts"`
+		} `json:"command"`
 	}
 	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/servers/"+identity.AgentID+"/detection", adminCookie,
 		nil, http.StatusOK, &absent)
 	if absent.Available {
 		t.Fatal("detection should be unavailable before the report arrives")
+	}
+	if !absent.HasCommand || absent.Command.ID != command.ID {
+		t.Fatalf("dispatch state was not surfaced: %#v", absent)
 	}
 
 	// Agent claims the command via the normal channel.

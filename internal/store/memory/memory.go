@@ -631,6 +631,25 @@ func (s *Store) GetDetectionReport(_ context.Context, serverID string) (domain.D
 	return entry.report, true, nil
 }
 
+func (s *Store) GetLatestCommand(_ context.Context, serverID, commandType string) (domain.Command, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var latest *domain.Command
+	for _, command := range s.commands {
+		if command.ServerID != serverID || command.Type != commandType {
+			continue
+		}
+		if latest == nil || command.CreatedAt.After(latest.CreatedAt) {
+			clone := cloneCommand(command)
+			latest = &clone
+		}
+	}
+	if latest == nil {
+		return domain.Command{}, false, nil
+	}
+	return *latest, true, nil
+}
+
 func (s *Store) PruneBefore(_ context.Context, scope store.RetentionScope, before time.Time) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

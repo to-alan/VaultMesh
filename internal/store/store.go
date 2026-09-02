@@ -59,6 +59,7 @@ type Store interface {
 	ClaimCommands(context.Context, string, time.Time, time.Time, int) ([]domain.Command, error)
 	SaveDetectionReport(context.Context, string, string, domain.DetectionReport, time.Time) error
 	GetDetectionReport(context.Context, string) (domain.DetectionReport, bool, error)
+	GetLatestCommand(context.Context, string, string) (domain.Command, bool, error)
 	ReplaceProjectSnapshots(context.Context, string, string, []domain.Snapshot, time.Time) error
 	ListSnapshots(context.Context, string, int) ([]domain.Snapshot, error)
 	GetSnapshot(context.Context, string, string) (domain.Snapshot, error)

@@ -277,3 +277,10 @@ export interface DetectionReport {
   apps?: DetectedApp[]
   tools?: Record<string, string>
 }
+
+export interface DetectionStatus {
+  available: boolean
+  report?: DetectionReport
+  command?: { id: string; attempts?: number; created_at?: string; lease_until?: string | null }
+  has_command?: boolean
+}

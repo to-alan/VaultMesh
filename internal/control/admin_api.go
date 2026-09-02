@@ -50,11 +50,16 @@ func (s *HTTPServer) getDetection(w http.ResponseWriter, r *http.Request) {
 		s.handleServiceError(w, err)
 		return
 	}
-	if !found {
-		s.writeJSON(w, http.StatusOK, map[string]any{"available": false})
+	command, hasCommand, err := s.service.GetLatestDetectionCommand(r.Context(), r.PathValue("serverID"))
+	if err != nil {
+		s.handleServiceError(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"available": true, "report": report})
+	if !found {
+		s.writeJSON(w, http.StatusOK, map[string]any{"available": false, "command": command, "has_command": hasCommand})
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"available": true, "report": report, "command": command, "has_command": hasCommand})
 }
 
 func (s *HTTPServer) archiveServer(w http.ResponseWriter, r *http.Request) {

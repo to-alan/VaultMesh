@@ -541,9 +541,8 @@ func (s *Service) SaveDetectionReport(ctx context.Context, serverID, commandID s
 	if commandID == "" {
 		return validationError("command_id", "is required")
 	}
-	if len(report.Containers) == 0 && len(report.Databases) == 0 && len(report.Apps) == 0 {
-		return validationError("report", "detection report is empty")
-	}
+	// An empty report is a valid result ("nothing detectable on this
+	// host") — rejecting it would leave the command looping forever.
 	now := s.now()
 	report.GeneratedAt = now
 	report.CommandID = commandID
@@ -552,6 +551,13 @@ func (s *Service) SaveDetectionReport(ctx context.Context, serverID, commandID s
 
 func (s *Service) GetDetectionReport(ctx context.Context, serverID string) (domain.DetectionReport, bool, error) {
 	return s.store.GetDetectionReport(ctx, strings.TrimSpace(serverID))
+}
+
+// GetLatestDetectionCommand surfaces the dispatch state (attempts, lease)
+// so the console can tell "agent has not answered yet" apart from "the
+// command was never delivered" — the primary diagnosis for version skew.
+func (s *Service) GetLatestDetectionCommand(ctx context.Context, serverID string) (domain.Command, bool, error) {
+	return s.store.GetLatestCommand(ctx, strings.TrimSpace(serverID), "detect")
 }
 
 func (s *Service) CreateManualRun(ctx context.Context, projectID string) (domain.Command, error) {

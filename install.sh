@@ -60,6 +60,7 @@ install_agent() {
 	[ "$(id -u)" -eq 0 ] || fail "请使用 root 运行：curl -fsSL $GITHUB_RAW_BASE/main/install.sh | sudo sh -s -- install-agent <server-url> <token>"
 	require_command curl
 	require_command systemctl
+	require_command docker
 
 	# The agent client refuses plain HTTP unless the control plane is on
 	# loopback; surface that rule with actionable wording.
@@ -88,17 +89,29 @@ install_agent() {
 		asset_version=$(curl -fsSL --max-time 10 https://api.github.com/repos/to-alan/VaultMesh/releases/latest | grep '"tag_name"' | cut -d'"' -f4) || true
 	fi
 	asset_version=${asset_version:-$VAULTMESH_AGENT_VERSION}
-	[ -n "$asset_version" ] || fail "无法确定 Agent 版本；请设置 VAULTMESH_AGENT_VERSION（如 v0.1.1）"
-	asset_url="https://github.com/to-alan/VaultMesh/releases/download/${asset_version}/vaultmesh-agent-linux-${asset_arch}"
+	[ -n "$asset_version" ] || fail "无法确定 Agent 版本；请设置 VAULTMESH_AGENT_VERSION（如 v0.1.1 或 edge）"
 
-	printf '下载 Agent %s（linux/%s）…\n' "$asset_version" "$asset_arch"
-	curl -fsSL --max-time 120 -o /tmp/vaultmesh-agent "$asset_url" || fail "下载失败：$asset_url"
-	curl -fsSL --max-time 30 -o /tmp/vaultmesh-agent.sha256 "${asset_url}.sha256" || true
-	if [ -f /tmp/vaultmesh-agent.sha256 ]; then
-		expected=$(cut -d' ' -f1 /tmp/vaultmesh-agent.sha256)
-		actual=$(sha256sum /tmp/vaultmesh-agent | cut -d' ' -f1)
-		[ "$expected" = "$actual" ] || fail "SHA256 校验不匹配"
-		printf 'SHA256 校验通过。\n'
+	if [ "$asset_version" = "edge" ]; then
+		# Edge tracks main and contains unreleased features (e.g. detection).
+		# The binary is extracted from the prebuilt GHCR image.
+		image="ghcr.io/to-alan/vaultmesh/vaultmesh-agent:edge"
+		printf '从 edge 镜像提取 Agent（跟踪 main 分支）…\n'
+		docker pull "$image" || fail "拉取 $image 失败"
+		docker rm -f vaultmesh-agent-extract >/dev/null 2>&1 || true
+		docker create --name vaultmesh-agent-extract "$image" >/dev/null || fail "创建提取容器失败"
+		docker cp vaultmesh-agent-extract:/vaultmesh-agent /tmp/vaultmesh-agent || fail "提取二进制失败"
+		docker rm vaultmesh-agent-extract >/dev/null
+	else
+		asset_url="https://github.com/to-alan/VaultMesh/releases/download/${asset_version}/vaultmesh-agent-linux-${asset_arch}"
+		printf '下载 Agent %s（linux/%s）…\n' "$asset_version" "$asset_arch"
+		curl -fsSL --max-time 120 -o /tmp/vaultmesh-agent "$asset_url" || fail "下载失败：$asset_url"
+		curl -fsSL --max-time 30 -o /tmp/vaultmesh-agent.sha256 "${asset_url}.sha256" || true
+		if [ -f /tmp/vaultmesh-agent.sha256 ]; then
+			expected=$(cut -d' ' -f1 /tmp/vaultmesh-agent.sha256)
+			actual=$(sha256sum /tmp/vaultmesh-agent | cut -d' ' -f1)
+			[ "$expected" = "$actual" ] || fail "SHA256 校验不匹配"
+			printf 'SHA256 校验通过。\n'
+		fi
 	fi
 
 	printf '设置 systemd 服务…\n'

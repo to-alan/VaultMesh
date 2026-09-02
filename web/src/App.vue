@@ -691,45 +691,61 @@ function selectDefaults() {
 const detectionServerID = ref('')
 const detectionReport = ref<DetectionReport | null>(null)
 const detectionSelection = reactive({ apps: [] as number[], databases: [] as number[], containers: [] as number[] })
+const detectionAttempts = ref(0)
+const detectionExhausted = ref(false)
 let detectionPollTimer: number | undefined
+const detectionRunning = computed(() => Boolean(detectionServerID.value) && !detectionReport.value && !detectionExhausted.value)
 const detectionHasSelection = computed(() =>
   detectionSelection.apps.length + detectionSelection.databases.length + detectionSelection.containers.length > 0)
+const detectionAgentVersion = computed(() =>
+  servers.value.find((item) => item.id === detectionServerID.value)?.agent_version || '')
+
+const DETECTION_POLL_TOTAL = 24   // 24 × 5s = 2 分钟窗口
+const DETECTION_POLL_INTERVAL = 5000
 
 async function startDetection(server: Server) {
   detectionServerID.value = server.id
   detectionReport.value = null
+  detectionExhausted.value = false
+  detectionAttempts.value = 0
   detectionSelection.apps = []
   detectionSelection.databases = []
   detectionSelection.containers = []
   await perform(async () => {
     await controlPlane.servers.detect(server.id)
-    success.value = `已向 ${server.name} 发送只读探测任务，Agent 完成后自动展示结果。`
-    pollDetection(server.id, 12)
+    success.value = `已向 ${server.name} 发送只读探测任务，完成后自动展示结果。`
+    pollDetection(server.id, DETECTION_POLL_TOTAL)
   })
 }
 
 function pollDetection(serverID: string, remainingAttempts: number) {
   window.clearTimeout(detectionPollTimer)
-  if (remainingAttempts <= 0) return
+  if (remainingAttempts <= 0) {
+    detectionExhausted.value = true
+    return
+  }
   detectionPollTimer = window.setTimeout(async () => {
     try {
-      const report = await controlPlane.servers.detection(serverID)
-      if (report && report.command_id) {
-        detectionReport.value = report
+      const status = await controlPlane.servers.detection(serverID)
+      // 命令派发状态随每次轮询刷新，让用户看到"系统确实在等 Agent"
+      if ('command' in status && status.command) detectionAttempts.value = (status.command as { attempts?: number }).attempts ?? 0
+      if (status.available && status.report) {
+        detectionReport.value = status.report
         success.value = '探测完成。勾选要备份的内容并生成项目草稿。'
         return
       }
     } catch {
-      // keep polling; transient errors are surfaced by the next tick
+      // transient errors: keep polling
     }
     pollDetection(serverID, remainingAttempts - 1)
-  }, 10000)
+  }, DETECTION_POLL_INTERVAL)
 }
 
 function closeDetection() {
   window.clearTimeout(detectionPollTimer)
   detectionServerID.value = ''
   detectionReport.value = null
+  detectionExhausted.value = false
 }
 
 async function runDetectionAgain() {
@@ -1364,7 +1380,7 @@ onBeforeUnmount(() => {
             <div class="panel-heading"><div><p class="eyebrow">AGENTS</p><h2>已接入服务器</h2></div></div>
             <div v-if="!servers.length" class="empty-state">还没有服务器。</div>
             <div v-else class="table-wrap"><table><thead><tr><th>名称</th><th>状态</th><th>主机</th><th>版本</th><th>配置</th><th>最后心跳</th><th>操作</th></tr></thead><tbody>
-              <tr v-for="server in servers" :key="server.id"><td><strong>{{ server.name }}</strong><small>{{ server.id }}</small></td><td><span class="status-pill" :class="server.status">{{ statusLabel(server.status) }}</span></td><td>{{ server.hostname || '—' }}<small>{{ server.os }} {{ server.arch }}</small></td><td>{{ server.agent_version || '—' }}</td><td>{{ server.applied_revision }}/{{ server.desired_revision }}</td><td>{{ formatDate(server.last_seen_at) }}</td><td><button type="button" class="ghost compact" :disabled="loading || detectionServerID === server.id" @click="startDetection(server)">{{ detectionServerID === server.id ? '探测中…' : '探测可备份项' }}</button><button type="button" class="text-button danger-text" :disabled="loading" @click="archiveServer(server)">归档</button></td></tr>
+              <tr v-for="server in servers" :key="server.id"><td><strong>{{ server.name }}</strong><small>{{ server.id }}</small></td><td><span class="status-pill" :class="server.status">{{ statusLabel(server.status) }}</span></td><td>{{ server.hostname || '—' }}<small>{{ server.os }} {{ server.arch }}</small></td><td>{{ server.agent_version || '—' }}</td><td>{{ server.applied_revision }}/{{ server.desired_revision }}</td><td>{{ formatDate(server.last_seen_at) }}</td><td><button type="button" class="text-button danger-text" :disabled="loading" @click="archiveServer(server)">归档</button></td></tr>
             </tbody></table></div>
           </section>
           <aside class="panel form-panel">
@@ -1372,44 +1388,6 @@ onBeforeUnmount(() => {
             <form @submit.prevent="createServer"><label>显示名称<input v-model="serverForm.name" required maxlength="100" placeholder="Hong Kong VPS" /></label><button class="primary" :disabled="loading">创建注册码</button></form>
           </aside>
         </div>
-        <section v-if="detectionReport && detectionServerID" class="panel detection-wizard">
-          <div class="panel-heading"><div><p class="eyebrow">DETECTION</p><h2>可备份项探测结果</h2><p>勾选要纳入备份的内容，生成项目草稿后在右侧表单确认。数据库密码需要你手动填写，探测不会读取任何密钥。</p></div><button type="button" class="ghost compact" @click="closeDetection">关闭</button></div>
-
-          <div v-if="detectionReport.databases?.length" class="detection-group">
-            <h3>数据库</h3>
-            <label v-for="(db, index) in detectionReport.databases" :key="'db' + index" class="check-row">
-              <input type="checkbox" v-model="detectionSelection.databases" :value="index" />
-              <span><strong>{{ db.kind === 'mysql' ? 'MySQL' : 'PostgreSQL' }} · {{ db.container || db.source }}</strong>
-              <small>127.0.0.1:{{ db.port || (db.kind === 'mysql' ? 3306 : 5432) }} · {{ db.reachable ? '端口可达' : '端口未发布，暂不可备份' }}{{ db.dump_tool ? ' · ' + db.dump_tool : '' }}</small></span>
-            </label>
-          </div>
-
-          <div v-if="detectionReport.apps?.length" class="detection-group">
-            <h3>应用目录</h3>
-            <label v-for="(app, index) in detectionReport.apps" :key="'app' + index" class="check-row">
-              <input type="checkbox" v-model="detectionSelection.apps" :value="index" />
-              <span><strong>{{ app.name }} · {{ app.path }}</strong><small>{{ app.markers.join('、') }}</small></span>
-            </label>
-          </div>
-
-          <div v-if="detectionReport.containers?.length" class="detection-group">
-            <h3>Docker 容器</h3>
-            <label v-for="(container, index) in detectionReport.containers" :key="'ct' + index" class="check-row">
-              <input type="checkbox" v-model="detectionSelection.containers" :value="index" />
-              <span><strong>{{ container.name }} · {{ container.image }}</strong><small>{{ container.running ? '运行中' : '已停止' }}{{ container.mounts?.length ? ' · 挂载 ' + container.mounts.length + ' 项' : '' }}</small></span>
-            </label>
-          </div>
-
-          <div v-if="!detectionReport.databases?.length && !detectionReport.apps?.length && !detectionReport.containers?.length" class="empty-state">
-            没有探测到明显的可备份项。可以手动创建项目指定任意路径。
-          </div>
-
-          <footer class="form-actions">
-            <button type="button" class="primary" :disabled="loading || !detectionHasSelection" @click="applyDetectionDraft">用所选生成项目草稿</button>
-            <button type="button" class="ghost" @click="runDetectionAgain" :disabled="loading">重新探测</button>
-          </footer>
-        </section>
-
         <section v-if="enrollment" class="panel enrollment-card">
           <div><p class="eyebrow">ONE-TIME TOKEN</p><h2>在 {{ enrollment.server.name }} 上运行</h2></div>
           <code>{{ installCommand(enrollment) }}</code>
@@ -1451,6 +1429,64 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-else-if="activeTab === 'projects'">
+        <section class="panel detection-toolbar">
+          <div><p class="eyebrow">AUTO-DETECT</p><h2>自动发现可备份项</h2><small>只读扫描运行中的容器、数据库信号与应用目录；不读取文件内容，不收集密钥。</small></div>
+          <div class="data-toolbar">
+            <select v-model="detectionServerID" :disabled="detectionRunning">
+              <option value="" disabled>选择服务器</option>
+              <option v-for="server in servers.filter((item) => item.status === 'online')" :key="server.id" :value="server.id">{{ server.name }}（{{ server.agent_version || '未知版本' }}）</option>
+            </select>
+            <button type="button" class="primary compact-action" :disabled="loading || !detectionServerID || detectionRunning" @click="startDetection(servers.find((item) => item.id === detectionServerID)!)">{{ detectionRunning ? '探测中…' : '开始探测' }}</button>
+          </div>
+        </section>
+
+        <section v-if="detectionReport && detectionServerID" class="panel detection-wizard">
+          <div class="panel-heading"><div><p class="eyebrow">DETECTION</p><h2>探测结果</h2><p>勾选要纳入备份的内容，生成项目草稿后在下方表单确认。数据库密码需要你手动填写，探测不会读取任何密钥。</p></div><button type="button" class="ghost compact" @click="closeDetection">关闭</button></div>
+
+          <div v-if="detectionReport.databases?.length" class="detection-group">
+            <h3>数据库</h3>
+            <label v-for="(db, index) in detectionReport.databases" :key="'db' + index" class="check-row">
+              <input type="checkbox" v-model="detectionSelection.databases" :value="index" />
+              <span><strong>{{ db.kind === 'mysql' ? 'MySQL' : 'PostgreSQL' }} · {{ db.container || db.source }}</strong>
+              <small>127.0.0.1:{{ db.port || (db.kind === 'mysql' ? 3306 : 5432) }} · {{ db.reachable ? '端口可达' : '端口未发布，暂不可备份' }}{{ db.dump_tool ? ' · ' + db.dump_tool : '' }}</small></span>
+            </label>
+          </div>
+
+          <div v-if="detectionReport.apps?.length" class="detection-group">
+            <h3>应用目录</h3>
+            <label v-for="(app, index) in detectionReport.apps" :key="'app' + index" class="check-row">
+              <input type="checkbox" v-model="detectionSelection.apps" :value="index" />
+              <span><strong>{{ app.name }} · {{ app.path }}</strong><small>{{ app.markers.join('、') }}</small></span>
+            </label>
+          </div>
+
+          <div v-if="detectionReport.containers?.length" class="detection-group">
+            <h3>Docker 容器</h3>
+            <label v-for="(container, index) in detectionReport.containers" :key="'ct' + index" class="check-row">
+              <input type="checkbox" v-model="detectionSelection.containers" :value="index" />
+              <span><strong>{{ container.name }} · {{ container.image }}</strong><small>{{ container.running ? '运行中' : '已停止' }}{{ container.mounts?.length ? ' · 挂载 ' + container.mounts.length + ' 项' : '' }}</small></span>
+            </label>
+          </div>
+
+          <div v-if="!detectionReport.databases?.length && !detectionReport.apps?.length && !detectionReport.containers?.length" class="empty-state">
+            探测完成：这台服务器上没有发现明显的可备份项。可以手动创建项目指定任意路径。
+          </div>
+
+          <footer class="form-actions">
+            <button type="button" class="primary" :disabled="loading || !detectionHasSelection" @click="applyDetectionDraft">用所选生成项目草稿</button>
+            <button type="button" class="ghost" @click="runDetectionAgain" :disabled="loading">重新探测</button>
+          </footer>
+        </section>
+
+        <section v-if="detectionExhausted" class="panel detection-diagnosis">
+          <div class="panel-heading"><div><p class="eyebrow">DIAGNOSIS</p><h2>Agent 没有回传探测结果</h2></div></div>
+          <ol>
+            <li v-if="detectionAgentVersion && detectionAgentVersion.startsWith('v0.1.')">Agent 版本是 <code>{{ detectionAgentVersion }}</code>，<strong>不支持探测命令</strong>。重新运行 install-agent 并设置 <code>VAULTMESH_AGENT_VERSION=edge</code> 升级。</li>
+            <li>查看 Agent 日志：<code>journalctl -u vaultmesh-agent -n 50</code>，关注 <code>detection</code> 或 <code>reject unsupported command</code> 关键字。</li>
+            <li>确认 Agent 在线（服务器页状态为「在线」），并且与控制面的地址可达。</li>
+          </ol>
+        </section>
+
         <div class="content-grid projects-grid">
           <ProjectListView
             :projects="projects"
