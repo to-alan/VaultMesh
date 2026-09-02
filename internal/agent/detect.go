@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,15 +16,6 @@ import (
 
 	"github.com/to-alan/vaultmesh/internal/domain"
 )
-
-func jsonUnmarshalStrict(data []byte, output any) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(output); err != nil {
-		return err
-	}
-	return nil
-}
 
 func dialTCP(ctx context.Context, host string, port int) (net.Conn, error) {
 	dialer := net.Dialer{Timeout: 800 * time.Millisecond}
@@ -141,8 +131,11 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 		if err != nil || len(inspect) > 4<<20 {
 			continue
 		}
+		// Docker inspect emits dozens of fields beyond this struct; a strict
+		// decode would fail on every container and silently strip all port
+		// and mount enrichment.
 		var parsed []detectDocker
-		if jsonUnmarshalStrict(inspect, &parsed) != nil || len(parsed) != 1 {
+		if json.Unmarshal(inspect, &parsed) != nil || len(parsed) != 1 {
 			continue
 		}
 		for port := range parsed[0].NetworkSettings.Ports {

@@ -882,6 +882,7 @@ function applyDetectionDraft() {
   Object.assign(projectForm, createProjectFormDraft())
   projectForm.server_id = serverID
   const drafts: ProjectSourceDraft[] = []
+  const skipped: string[] = []
 
   for (const index of detectionSelection.apps) {
     const app = report.apps?.[index]
@@ -892,7 +893,10 @@ function applyDetectionDraft() {
   }
   for (const index of detectionSelection.databases) {
     const db = report.databases?.[index]
-    if (!db || !db.reachable) continue
+    if (!db || !db.reachable) {
+      skipped.push(`${db?.kind === 'postgresql' ? 'PostgreSQL' : 'MySQL'}（端口未发布）`)
+      continue
+    }
     const draft = createProjectSourceDraft(db.kind === 'mysql' ? 'mysql' : 'postgresql')
     draft.host = db.host || '127.0.0.1'
     draft.port = db.port || (db.kind === 'mysql' ? 3306 : 5432)
@@ -900,14 +904,19 @@ function applyDetectionDraft() {
   }
   for (const index of detectionSelection.containers) {
     const container = report.containers?.[index]
-    if (!container || !container.running || !container.mounts?.length) continue
+    if (!container || !container.running) continue
+    if (!container.mounts?.length) {
+      skipped.push(`${container.name}（无挂载卷，容器内数据不持久化）`)
+      continue
+    }
     const draft = createProjectSourceDraft('docker')
     draft.containers = container.name
     draft.include_volumes = true
     drafts.push(draft)
   }
   if (!drafts.length) {
-    error.value = '所选内容没有可备份的数据（例如容器未发布端口）。'
+    const reason = skipped.length ? `（${skipped.join('、')}）` : ''
+    error.value = `所选内容没有可备份的数据${reason}。容器需要挂载卷才有持久化数据。`
     return
   }
   projectForm.sources = drafts
