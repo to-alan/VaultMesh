@@ -21,6 +21,11 @@ const (
 	// 10000 entries require roughly 6 MiB of JSON; the extra headroom absorbs
 	// tags and paths while staying far below any realistic DoS surface.
 	maxSnapshotInventoryBody = 16 << 20
+	// Legacy agents embed the inventory inline in the run report. The limit
+	// must comfortably exceed the inventory cap, otherwise an oversized body
+	// fails as invalid_json (a permanent rejection) and poisons the whole
+	// run instead of triggering the graceful inventory drop below.
+	maxRunReportBody = 4 << 20
 )
 
 type reportClockSkewError struct {

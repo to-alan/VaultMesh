@@ -113,9 +113,9 @@ func (s *Store) Dashboard(ctx context.Context, since time.Time) (domain.Dashboar
 	var dashboard domain.Dashboard
 	err := s.pool.QueryRow(ctx, `
 		SELECT
-		  (SELECT COUNT(*) FROM servers),
-		  (SELECT COUNT(*) FROM servers WHERE last_seen_at >= NOW() - $2::interval),
-		  (SELECT COUNT(*) FROM projects),
+		  (SELECT COUNT(*) FROM servers WHERE archived_at IS NULL),
+		  (SELECT COUNT(*) FROM servers WHERE archived_at IS NULL AND last_seen_at >= NOW() - $2::interval),
+		  (SELECT COUNT(*) FROM projects WHERE archived_at IS NULL),
 		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $3),
 		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status IN ($4, $5, $6)),
 		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $7)`,

@@ -21,6 +21,14 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 必需数据源的路径缺失/断链在准备阶段即失败并给出精确原因，不再依赖 Restic 退出码 3 降级为 partial 快照（可选源保持跳过+警告语义）
+- Dashboard 总量排除已归档的服务器与项目，归档后指标不再虚高
+- Agent 拒绝把自身状态目录（含明文凭据）与恢复目录作为备份源，并向 Restic 追加无条件排除，父目录扫掠（如 /var/lib）不再泄露凭据；控制面在保存时拒绝默认状态目录 `/var/lib/vaultmesh-agent`
+- 多数据源项目的排除规则按声明它的源路径锚定（`P/pattern` 与 `P/**/pattern`），单一源的相对规则不再污染其他源；以 `/`、`**/`、`*`、`!` 开头的模式保持原义
+- 遗留内嵌清单通道：运行报告 body 上限提升至 4 MiB 并为超限丢弃的清单写入 `snapshot_inventory_dropped` 标记，修复约 7000 条快照即触发 invalid_json 永久拒绝、成功备份被隔离的问题
+
 ### 新增
 
 - HTTPS 门控：`VAULTMESH_PUBLIC_API_URL` 非 https 且未设置 `VAULTMESH_HTTPS_ENABLED=true` 时，控制台可浏览但备份/同步类操作返回 403 `https_required`，控制台显示解锁指引横幅

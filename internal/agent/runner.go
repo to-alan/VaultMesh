@@ -39,6 +39,22 @@ type Runner struct {
 	dockerPath    string
 	stagingRoot   string
 	restoreRoot   string
+	// protectedPaths are agent-local directories that must never enter a
+	// snapshot: the state file holds plaintext repository and database
+	// credentials, and staging/restore directories hold decrypted dumps.
+	protectedPaths []string
+}
+
+// SetProtectedPaths registers agent-local directories that are rejected as
+// backup sources and always excluded from Restic invocations.
+func (r *Runner) SetProtectedPaths(paths ...string) *Runner {
+	for _, path := range paths {
+		cleaned := filepath.Clean(path)
+		if filepath.IsAbs(cleaned) {
+			r.protectedPaths = append(r.protectedPaths, cleaned)
+		}
+	}
+	return r
 }
 
 func (r *Runner) SetRestoreRoot(path string) *Runner {
@@ -84,6 +100,11 @@ func (r *Runner) Execute(ctx context.Context, agentID string, project domain.Age
 	}
 	for _, pattern := range excludes {
 		args = append(args, "--exclude", pattern)
+	}
+	// Parent-directory sources such as /var/lib would sweep the agent state
+	// directory into the snapshot; exclude protected paths unconditionally.
+	for _, protected := range r.protectedPaths {
+		args = append(args, "--exclude", protected)
 	}
 	args = append(args, paths...)
 	args = resticArguments(project.Repository, args...)
@@ -474,7 +495,12 @@ func (r *Runner) prepareSources(ctx context.Context, sources []domain.Source) ([
 			continue
 		}
 		paths = append(paths, sourcePaths...)
-		excludes = append(excludes, sourceExcludes...)
+		// Restic --exclude patterns are global to the invocation. Without
+		// anchoring, one source's rule (e.g. "cache") would also drop
+		// matching data from every other source. Only unanchored, unescaped
+		// patterns are rewritten; patterns already anchored by "/" or "*",
+		// or negated, keep their explicit author intent.
+		excludes = append(excludes, anchorExcludes(sourcePaths, sourceExcludes)...)
 	}
 	if len(paths) == 0 {
 		cleanup()
@@ -483,14 +509,55 @@ func (r *Runner) prepareSources(ctx context.Context, sources []domain.Source) ([
 	return paths, excludes, warnings, cleanup, nil
 }
 
+// anchorExcludes expands plain relative exclude patterns against the source
+// paths that declared them. A pattern "cache" for source /srv/a becomes
+// "/srv/a/cache" and "/srv/a/**/cache", keeping other sources unaffected.
+func anchorExcludes(sourcePaths, patterns []string) []string {
+	result := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		if pattern == "" {
+			continue
+		}
+		anchored := strings.HasPrefix(pattern, "/") ||
+			strings.HasPrefix(pattern, "**/") ||
+			strings.HasPrefix(pattern, "*") ||
+			strings.HasPrefix(pattern, "!")
+		if anchored || len(sourcePaths) == 0 {
+			result = append(result, pattern)
+			continue
+		}
+		for _, path := range sourcePaths {
+			result = append(result, path+"/"+pattern)
+			result = append(result, path+"/**/"+pattern)
+		}
+	}
+	return result
+}
+
 func (r *Runner) prepareSource(ctx context.Context, source domain.Source, ensureStaging func() (string, error)) ([]string, []string, error) {
 	switch source.Type {
 	case "files":
 		paths := make([]string, 0, len(source.Paths))
 		for _, value := range source.Paths {
-			cleaned, err := safeBackupPath(value)
+			cleaned, err := r.safeBackupPath(value)
 			if err != nil {
 				return nil, nil, err
+			}
+			// A missing path would otherwise surface as a generic Restic exit
+			// code 3 partial snapshot. Checking here lets required sources
+			// fail the whole backup with a precise reason while optional
+			// sources are skipped with an explicit warning by the caller.
+			if info, statErr := os.Lstat(cleaned); statErr != nil {
+				if errors.Is(statErr, os.ErrNotExist) {
+					return nil, nil, fmt.Errorf("path %q does not exist", cleaned)
+				}
+				return nil, nil, fmt.Errorf("stat path %q: %w", cleaned, statErr)
+			} else if info.Mode()&os.ModeSymlink != 0 {
+				// Broken symlinks report "exists" here and fail later inside
+				// Restic; resolve the target check instead.
+				if _, linkErr := filepath.EvalSymlinks(cleaned); linkErr != nil {
+					return nil, nil, fmt.Errorf("path %q is a broken symlink", cleaned)
+				}
 			}
 			paths = append(paths, cleaned)
 		}
@@ -611,7 +678,7 @@ func (r *Runner) prepareDockerSource(ctx context.Context, source domain.DockerSo
 			if mount.Type != "bind" && mount.Type != "volume" {
 				continue
 			}
-			cleaned, err := safeBackupPath(mount.Source)
+			cleaned, err := r.safeBackupPath(mount.Source)
 			if err != nil {
 				return nil, nil, fmt.Errorf("container %q mount %q: %w", container, mount.Destination, err)
 			}
@@ -631,7 +698,7 @@ func (r *Runner) prepareDockerSource(ctx context.Context, source domain.DockerSo
 	return paths, encoded, nil
 }
 
-func safeBackupPath(value string) (string, error) {
+func (r *Runner) safeBackupPath(value string) (string, error) {
 	cleaned := filepath.Clean(value)
 	if !filepath.IsAbs(cleaned) {
 		return "", fmt.Errorf("source path %q is not absolute", value)
@@ -640,6 +707,11 @@ func safeBackupPath(value string) (string, error) {
 		cleaned == "/sys" || strings.HasPrefix(cleaned, "/sys/") ||
 		cleaned == "/dev" || strings.HasPrefix(cleaned, "/dev/") {
 		return "", fmt.Errorf("source path %q is blocked by the agent safety policy", cleaned)
+	}
+	for _, protected := range r.protectedPaths {
+		if cleaned == protected || strings.HasPrefix(cleaned, protected+string(filepath.Separator)) {
+			return "", fmt.Errorf("source path %q overlaps a protected agent directory; backing it up would leak plaintext credentials into the repository", cleaned)
+		}
 	}
 	return cleaned, nil
 }

@@ -97,7 +97,12 @@ func main() {
 		state.AcceptRollback()
 		logger.Warn("configuration rollback accepted once; pass this flag only while recovering a restored control plane")
 	}
-	runner := agent.NewRunnerWithTools(*resticPath, *mysqlDumpPath, *pgDumpPath, *dockerPath, *stagingRoot).SetRestoreRoot(*restoreRoot)
+	// The state directory holds plaintext credentials and the staging/
+	// restore directories hold decrypted dumps; none of them may ever be
+	// included in a snapshot.
+	runner := agent.NewRunnerWithTools(*resticPath, *mysqlDumpPath, *pgDumpPath, *dockerPath, *stagingRoot).
+		SetRestoreRoot(*restoreRoot).
+		SetProtectedPaths(filepath.Dir(*statePath), *restoreRoot)
 	manager := agent.NewManager(state, runner, identity, logger)
 	if cached := state.Config(); cached.Revision > 0 || len(cached.Projects) > 0 {
 		if err := manager.Apply(cached); err != nil {

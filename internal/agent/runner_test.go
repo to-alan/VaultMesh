@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -11,6 +12,113 @@ import (
 
 	"github.com/to-alan/vaultmesh/internal/domain"
 )
+
+// writeSucceedingResticScript installs a fake Restic that reports a healthy
+// repository and a minimal successful backup summary.
+func writeSucceedingResticScript(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX shell script")
+	}
+	script := filepath.Join(t.TempDir(), "fake-restic")
+	contents := "#!/bin/sh\n" +
+		"if [ \"$1\" = snapshots ]; then printf '%s\\n' '[]'; exit 0; fi\n" +
+		"printf '%s\\n' '{\"message_type\":\"summary\",\"total_files_processed\":1,\"total_bytes_processed\":1,\"data_added\":1,\"total_duration\":0.1,\"snapshot_id\":\"snap_test\"}'\n"
+	if err := os.WriteFile(script, []byte(contents), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+// TestRunnerRejectsMissingRequiredPath verifies a typo'd required source
+// fails at preparation instead of silently producing a partial snapshot.
+func TestRunnerRejectsMissingRequiredPath(t *testing.T) {
+	runner := NewRunner(writeSucceedingResticScript(t))
+	project := domain.AgentProject{
+		Project: domain.Project{
+			ID: "prj_missing",
+			Sources: []domain.Source{
+				{ID: "src_ok", Type: "files", Paths: []string{t.TempDir()}, Required: false},
+				{ID: "src_missing", Type: "files", Paths: []string{"/nonexistent/vaultmesh-path"}, Required: true},
+			},
+		},
+		Repository: domain.Repository{ID: "repo", URL: "/tmp/repo", Password: "pw"},
+	}
+	result := runner.Execute(context.Background(), "srv_test", project)
+	if result.Status != domain.RunFailed || result.ErrorCode != "source_preparation_failed" {
+		t.Fatalf("missing required path did not fail preparation: %#v", result)
+	}
+	if !strings.Contains(result.ErrorMessage, "does not exist") {
+		t.Fatalf("error message lacks the missing-path reason: %s", result.ErrorMessage)
+	}
+}
+
+// TestRunnerOptionalMissingPathIsSkippedWithWarning verifies the optional
+// counterpart keeps the skip-with-warning partial semantics.
+func TestRunnerOptionalMissingPathIsSkippedWithWarning(t *testing.T) {
+	runner := NewRunner(writeSucceedingResticScript(t))
+	project := domain.AgentProject{
+		Project: domain.Project{
+			ID: "prj_optional",
+			Sources: []domain.Source{
+				{ID: "src_ok", Type: "files", Paths: []string{t.TempDir()}, Required: true},
+				{ID: "src_missing", Type: "files", Paths: []string{"/nonexistent/vaultmesh-path"}, Required: false},
+			},
+		},
+		Repository: domain.Repository{ID: "repo", URL: "/tmp/repo", Password: "pw"},
+	}
+	result := runner.Execute(context.Background(), "srv_test", project)
+	if result.Status != domain.RunPartial || result.ErrorCode != "optional_source_failed" || result.SnapshotID != "snap_test" {
+		t.Fatalf("optional missing path did not produce the expected partial run: %#v", result)
+	}
+	if result.Stats["optional_source_count"] != 1 {
+		t.Fatalf("optional skip was not recorded: %#v", result.Stats)
+	}
+}
+
+// TestRunnerProtectsAgentDirectories verifies the agent refuses backup
+// sources that overlap its own state directories and always excludes them.
+func TestRunnerProtectsAgentDirectories(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(writeSucceedingResticScript(t)).SetProtectedPaths(stateDir, "/var/lib/vaultmesh-agent/restores")
+	project := domain.AgentProject{
+		Project: domain.Project{
+			ID:      "prj_state",
+			Sources: []domain.Source{{ID: "src", Type: "files", Paths: []string{filepath.Join(stateDir, "nested")}, Required: true}},
+		},
+		Repository: domain.Repository{ID: "repo", URL: "/tmp/repo", Password: "pw"},
+	}
+	result := runner.Execute(context.Background(), "srv_test", project)
+	if result.Status != domain.RunFailed || !strings.Contains(result.ErrorMessage, "protected agent directory") {
+		t.Fatalf("protected directory was not rejected: %#v", result)
+	}
+}
+
+// TestRunnerAnchorsExcludesPerSource verifies multi-source projects keep
+// their exclude rules scoped to the source that declared them.
+func TestRunnerAnchorsExcludesPerSource(t *testing.T) {
+	cases := []struct {
+		name     string
+		excludes []string
+		want     []string
+	}{
+		{"plain", []string{"cache", "logs/"}, []string{"/srv/a/cache", "/srv/a/**/cache", "/srv/a/logs/", "/srv/a/**/logs/"}},
+		{"already anchored", []string{"/etc/secrets", "**/vendor", "!keep"}, []string{"/etc/secrets", "**/vendor", "!keep"}},
+	}
+	for _, tc := range cases {
+		got := anchorExcludes([]string{"/srv/a"}, tc.excludes)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%s: anchorExcludes = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// Single-path source without excludes expands to nothing.
+	if got := anchorExcludes([]string{"/srv/a"}, nil); len(got) != 0 {
+		t.Fatalf("empty excludes expanded to %v", got)
+	}
+}
 
 func TestRunnerParsesSuccessfulResticSummary(t *testing.T) {
 	if runtime.GOOS == "windows" {

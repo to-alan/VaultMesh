@@ -895,10 +895,19 @@ func (s *Store) ListAuditEvents(_ context.Context, limit int) ([]domain.AuditEve
 func (s *Store) Dashboard(_ context.Context, since time.Time) (domain.Dashboard, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	dashboard := domain.Dashboard{ServersTotal: len(s.servers), ProjectsTotal: len(s.projects)}
+	dashboard := domain.Dashboard{}
 	for _, server := range s.servers {
+		if server.ArchivedAt != nil {
+			continue
+		}
+		dashboard.ServersTotal++
 		if server.LastSeenAt != nil && time.Since(*server.LastSeenAt) <= domain.AgentOfflineAfter {
 			dashboard.ServersOnline++
+		}
+	}
+	for _, project := range s.projects {
+		if project.ArchivedAt == nil {
+			dashboard.ProjectsTotal++
 		}
 	}
 	for _, report := range s.runs {

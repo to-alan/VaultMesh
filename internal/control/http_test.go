@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -1014,6 +1015,162 @@ func TestValidateRunReportRejectsMalformedTimelines(t *testing.T) {
 // TestArchiveLifecycleCoversServersProjectsAndRepositories verifies the soft
 // delete flow: guards for referenced resources, removal from DesiredConfig,
 // revision bumps, and agent credential revocation.
+// TestControlPlaneRejectsAgentStateDirectory verifies the control-plane
+// guard against sweeping plaintext agent credentials into snapshots.
+// TestAgentRunMarksDroppedLegacyInventory verifies the legacy inline channel
+// leaves a visible trace when an oversized inventory is discarded instead of
+// silently skipping the index refresh.
+func TestAgentRunMarksDroppedLegacyInventory(t *testing.T) {
+	ctx := context.Background()
+	sealer, err := secret.New(bytes.Repeat([]byte{28}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(memory.New(), sealer)
+	enrollment, err := service.CreateServer(ctx, "Legacy host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "legacy-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Legacy repository", URL: "/tmp/legacy-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Legacy project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, service, slog.New(slog.NewTextHandler(io.Discard, nil)), false, nil)
+	now := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+	finished := now.Add(time.Minute)
+	oversized := make([]domain.Snapshot, maxSnapshotInventoryEntries+1)
+	for index := range oversized {
+		oversized[index] = domain.Snapshot{ID: fmt.Sprintf("%064x", index)}
+	}
+	body := mustJSON(t, domain.RunReport{
+		ID: "run_legacy_oversize", IdempotencyKey: project.ID + ":backup:legacy-oversize", ProjectID: project.ID,
+		ScheduledAt: now, StartedAt: now, FinishedAt: &finished, Status: domain.RunSucceeded,
+		Stats: map[string]any{"operation": "backup", "snapshots": oversized},
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/agent/runs", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+identity.Token)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("legacy run was not accepted: %d %s", recorder.Code, recorder.Body.String())
+	}
+	runs, err := service.Store().ListRuns(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range runs {
+		if run.ID != "run_legacy_oversize" {
+			continue
+		}
+		if run.Stats["snapshot_inventory_dropped"] != true {
+			t.Fatalf("oversized legacy inventory left no marker: %#v", run.Stats)
+		}
+		if _, ok := run.Stats["snapshots"]; ok {
+			t.Fatal("oversized legacy inventory leaked into run history")
+		}
+	}
+}
+
+func TestControlPlaneRejectsAgentStateDirectory(t *testing.T) {
+	service := NewService(memory.New(), mustSealer(t, 26))
+	for _, path := range []string{"/var/lib/vaultmesh-agent", "/var/lib/vaultmesh-agent/state.json"} {
+		_, err := service.CreateProject(context.Background(), domain.Project{
+			ServerID: "srv_test", RepositoryID: "repo_test", Name: "State sweep",
+			Sources:  []domain.Source{{Type: "files", Paths: []string{path}, Required: true}},
+			Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+		})
+		if err == nil || !strings.Contains(err.Error(), "plaintext credentials") {
+			t.Fatalf("agent state directory %q was not rejected: %v", path, err)
+		}
+	}
+}
+
+// TestDashboardExcludesArchivedResources verifies archived servers and
+// projects stop inflating the overview totals.
+func TestDashboardExcludesArchivedResources(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	service := NewService(dataStore, mustSealer(t, 27))
+	enrollment, err := service.CreateServer(ctx, "Dashboard host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "dashboard-host"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := service.CreateRepository(ctx, domain.Repository{Provider: "local", Name: "Dashboard repository", URL: "/tmp/dashboard-repository", Password: "password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.CreateProject(ctx, domain.Project{
+		ServerID: identity.AgentID, RepositoryID: repository.ID, Name: "Dashboard project",
+		Sources:  []domain.Source{{Type: "files", Paths: []string{"/tmp"}, Required: true}},
+		Schedule: domain.Schedule{Cron: "0 2 * * *", Timezone: "UTC"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dashboard, err := service.Dashboard(ctx, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.ServersTotal != 1 || dashboard.ProjectsTotal != 1 {
+		t.Fatalf("pre-archive totals: %#v", dashboard)
+	}
+	if _, err := service.ArchiveProject(ctx, "prj_missing"); err == nil {
+		t.Fatal("archiving a nonexistent project should fail")
+	}
+	projects, err := service.Store().ListProjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projects) != 1 {
+		t.Fatalf("unexpected project list: %#v", projects)
+	}
+	if _, err := service.ArchiveProject(ctx, projects[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	dashboard, err = service.Dashboard(ctx, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.ProjectsTotal != 0 {
+		t.Fatalf("archived project still counted: %#v", dashboard)
+	}
+	if _, err := service.ArchiveServer(ctx, identity.AgentID); err != nil {
+		t.Fatal(err)
+	}
+	dashboard, err = service.Dashboard(ctx, time.Now().Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dashboard.ServersTotal != 0 || dashboard.ProjectsTotal != 0 {
+		t.Fatalf("archived server still counted: %#v", dashboard)
+	}
+}
+
+func mustSealer(t *testing.T, seed byte) *secret.Sealer {
+	t.Helper()
+	sealer, err := secret.New(bytes.Repeat([]byte{seed}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sealer
+}
+
 func TestArchiveLifecycleCoversServersProjectsAndRepositories(t *testing.T) {
 	ctx := context.Background()
 	dataStore := memory.New()

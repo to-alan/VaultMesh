@@ -81,7 +81,7 @@ func (s *HTTPServer) agentCommands(w http.ResponseWriter, r *http.Request) {
 func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 	server := agentFromContext(r.Context())
 	var report domain.RunReport
-	if !s.decodeJSON(w, r, &report) {
+	if !s.decodeJSONLimit(w, r, &report, maxRunReportBody) {
 		return
 	}
 	receivedAt := s.service.now()
@@ -123,6 +123,12 @@ func (s *HTTPServer) agentRun(w http.ResponseWriter, r *http.Request) {
 			}
 			if len(snapshotInventory) > maxSnapshotInventoryEntries {
 				snapshotInventory = nil
+				// Keep a visible trace in the run facts; the new agent
+				// releases produce the same marker before delivering.
+				if report.Stats == nil {
+					report.Stats = map[string]any{}
+				}
+				report.Stats["snapshot_inventory_dropped"] = true
 			} else {
 				for index := range snapshotInventory {
 					snapshot := &snapshotInventory[index]

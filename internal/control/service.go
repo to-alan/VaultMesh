@@ -651,6 +651,12 @@ func validateSourcePath(value string) (string, error) {
 			return "", fmt.Errorf("path %q is a virtual system path and is not allowed", cleaned)
 		}
 	}
+	// The default agent state directory holds plaintext repository and
+	// database credentials; it must never enter a snapshot. The Agent also
+	// enforces this for custom state paths the control plane cannot see.
+	if cleaned == "/var/lib/vaultmesh-agent" || strings.HasPrefix(cleaned, "/var/lib/vaultmesh-agent/") {
+		return "", fmt.Errorf("path %q is the agent state directory and contains plaintext credentials; it cannot be backed up", cleaned)
+	}
 	return cleaned, nil
 }
 
