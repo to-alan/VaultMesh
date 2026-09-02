@@ -59,6 +59,15 @@ Agent 主机依赖：所有备份需要 Restic ≥ 0.17.0；MySQL/PostgreSQL 逻
 
 Agent 与控制面的通信强制 HTTPS（仅 localhost 允许明文）。设备身份保存在 `/var/lib/vaultmesh-agent/state.json`（权限 `0600`）；`vaultmesh-agent --version` 可查看当前版本。
 
+重新注册或卸载：
+
+```bash
+# 卸载（保留恢复测试产物）
+curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh -s -- uninstall-agent
+```
+
+重装时安装器会自动重置旧设备身份；控制台里对应的服务器记录可在页面归档。
+
 ### 创建第一份备份
 
 1. 在“备份仓库”创建独立测试渠道（如 Cloudflare R2 专用 Bucket/Prefix）；

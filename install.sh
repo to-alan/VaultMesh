@@ -124,6 +124,12 @@ install_agent() {
 	curl -fsSL --max-time 30 -o /etc/systemd/system/vaultmesh-agent.service "$GITHUB_RAW_BASE/main/deploy/systemd/vaultmesh-agent.service" \
 		|| fail "下载 systemd unit 失败"
 
+	# A state file from a previous enrollment binds the agent to another
+	# identity and makes the new token unusable; reset it automatically.
+	if [ -f /var/lib/vaultmesh-agent/state.json ]; then
+		printf '检测到旧注册，重置设备身份（控制台里对应的服务器记录可归档）。\n'
+	fi
+
 	# Enrollment data goes into the root-only env file and is stripped after a
 	# successful start, mirroring the documented manual procedure.
 	{
@@ -131,6 +137,12 @@ install_agent() {
 		printf 'VAULTMESH_ENROLLMENT_TOKEN=%s\n' "$token"
 	} >> /etc/vaultmesh-agent.env
 	chmod 600 /etc/vaultmesh-agent.env
+
+	# Stop any running instance and clear the previous device identity so the
+	# new enrollment token can bind cleanly.
+	systemctl disable --now vaultmesh-agent >/dev/null 2>&1 || true
+	rm -rf /var/lib/vaultmesh-agent/state.json
+	# Restore artifacts are user data from recovery tests and are preserved.
 
 	systemctl daemon-reload
 	systemctl enable --now vaultmesh-agent >/dev/null 2>&1 || systemctl restart vaultmesh-agent
@@ -175,9 +187,32 @@ detect_public_host() {
 	esac
 }
 
+# uninstall_agent removes the agent service, binary, config, and device
+# identity. Restore artifacts under /var/lib/vaultmesh-agent/restores are
+# preserved and their location printed.
+uninstall_agent() {
+	[ "$(id -u)" -eq 0 ] || fail "请使用 root 运行"
+	printf '卸载 VaultMesh Agent…\n'
+	systemctl disable --now vaultmesh-agent >/dev/null 2>&1 || true
+	rm -f /etc/systemd/system/vaultmesh-agent.service
+	systemctl daemon-reload
+	rm -f /usr/local/bin/vaultmesh-agent
+	rm -f /etc/vaultmesh-agent.env
+	if [ -d /var/lib/vaultmesh-agent/restores ] && [ -n "$(ls -A /var/lib/vaultmesh-agent/restores 2>/dev/null)" ]; then
+		printf '恢复测试产物保留在 /var/lib/vaultmesh-agent/restores，确认后可手动删除。\n'
+	fi
+	rm -rf /var/lib/vaultmesh-agent
+	printf 'Agent 已卸载（设备身份已清除，控制台对应记录可归档）。\n'
+}
+
 if [ "${1:-}" = "install-agent" ]; then
 	[ $# -ge 3 ] || fail "用法：install-agent <server-url> <enroll-token> [名称]"
 	install_agent "$2" "$3" "${4:-}"
+	exit 0
+fi
+
+if [ "${1:-}" = "uninstall-agent" ]; then
+	uninstall_agent
 	exit 0
 fi
 
