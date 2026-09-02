@@ -162,11 +162,13 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 // VaultMesh deployment itself, shared runtimes, admin panels, and build
 // tooling. Their content is either reproducible or already covered by the
 // applications that use them.
+// Patterns match shared admin panels, caches, queues, and observability
+// agents — not user-deployed projects. A self-built VaultMesh deployment
+// stays visible: users know their own projects best.
 var infrastructurePatterns = []string{
-	"vaultmesh", "grafana", "prometheus", "portainer",
-	"phpmyadmin", "adminer", "redis", "memcached", "nginx-proxy",
-	"runtime/php", "runtime/node", "runtime/python", "runtime/java",
-	"openresty/openresty",
+	"phpmyadmin", "adminer", "redis", "memcached",
+	"rabbitmq", "kafka", "elasticsearch", "minio",
+	"grafana", "prometheus", "portainer",
 }
 
 func isInfrastructureContainer(name, image string) bool {

@@ -1614,6 +1614,37 @@ onBeforeUnmount(() => {
             @run="runNow"
             @archive="archiveProject"
           />
+        <section id="detection-diagnosis" v-if="detectionWarning" class="panel detection-diagnosis">
+          <div class="panel-heading"><div><p class="eyebrow">VERSION MISMATCH</p><h2>探测命令无法被该 Agent 执行</h2></div></div>
+          <p>{{ detectionWarning }}</p>
+        </section>
+
+        <section id="detection-diagnosis" v-if="detectionExhausted" class="panel detection-diagnosis">
+          <div class="panel-heading"><div><p class="eyebrow">DIAGNOSIS</p><h2>Agent 没有回传探测结果</h2></div></div>
+          <ol>
+            <li v-if="detectionAgentVersion && detectionAgentVersion.startsWith('v0.1.')">Agent 版本是 <code>{{ detectionAgentVersion }}</code>，<strong>不支持探测命令</strong>。重新运行 install-agent 并设置 <code>VAULTMESH_AGENT_VERSION=edge</code> 升级。</li>
+            <li>查看 Agent 日志：<code>journalctl -u vaultmesh-agent -n 50</code>，关注 <code>detection</code> 或 <code>reject unsupported command</code> 关键字。</li>
+            <li>确认 Agent 在线（服务器页状态为「在线」），并且与控制面的地址可达。</li>
+          </ol>
+        </section>
+        </div>
+
+          <ProjectListView
+            :projects="projects"
+            :servers="servers"
+            :health="projectHealthByID"
+            :now-epoch="nowEpoch"
+            :repository-name="repositoryName"
+            :latest-preview="latestRetentionPreview"
+            :queued-project-ids="queuedProjectIDs"
+            :queued-preview-project-ids="queuedPreviewProjectIDs"
+            :loading="loading"
+            @edit="openProjectEditor"
+            @toggle="toggleProject"
+            @preview="previewRetention"
+            @run="runNow"
+            @archive="archiveProject"
+          />
         <section id="detection-wizard" v-if="detectionReport && detectionServerID" class="panel detection-wizard">
           <div class="panel-heading"><div><p class="eyebrow">DETECTION</p><h2>探测结果</h2><p>勾选要纳入备份的内容，生成项目草稿后在下方表单确认。数据库密码需要你手动填写，探测不会读取任何密钥。</p></div><button type="button" class="ghost compact" @click="closeDetection">关闭</button></div>
 
