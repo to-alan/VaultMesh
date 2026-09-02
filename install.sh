@@ -216,6 +216,25 @@ if [ "${1:-}" = "uninstall-agent" ]; then
 	exit 0
 fi
 
+# purge-agents wipes ALL server records (and everything cascading from
+# them: projects, runs, snapshots, commands, credentials, detection
+# reports). Repositories, notification channels, and the admin account
+# are preserved. Irreversible.
+if [ "${1:-}" = "purge-agents" ]; then
+	[ "$(id -u)" -eq 0 ] || fail "请使用 root 运行"
+	printf '!! 这将硬删除全部服务器记录及其项目、运行、快照索引、命令。\n'
+	printf '!! 仓库渠道、通知渠道、管理员账号保留。此操作不可恢复。\n'
+	printf '确认请输入 YES：'
+	read -r confirmation
+	[ "$confirmation" = "YES" ] || fail "已取消"
+	docker exec -i $(docker ps --format '{{.Names}}' | grep postgres) psql -U vaultmesh -d vaultmesh \
+		-c "DELETE FROM commands; DELETE FROM detection_reports; DELETE FROM servers;" >/dev/null \
+		|| fail "清理失败"
+	printf '全部服务器记录及关联数据已删除。\n'
+	printf '各备份主机上请运行 uninstall-agent 清理设备身份后重新注册。\n'
+	exit 0
+fi
+
 PUBLIC_HOST=$(detect_public_host)
 PUBLIC_API_URL="http://${PUBLIC_HOST}:8080"
 ALLOWED_ORIGIN="http://${PUBLIC_HOST}:3000"
