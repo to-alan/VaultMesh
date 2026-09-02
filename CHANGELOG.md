@@ -12,7 +12,6 @@
 
 ### 新增
 
-- HTTPS 门控：`VAULTMESH_PUBLIC_API_URL` 非 https 且未设置 `VAULTMESH_HTTPS_ENABLED=true` 时，控制台可浏览但备份/同步类操作返回 403 `https_required`，控制台显示解锁指引横幅
 - 一键安装默认绑定 `0.0.0.0` 并输出服务器实际访问地址；`VAULTMESH_BIND=127.0.0.1` 可恢复回环绑定
 
 ### 变更
@@ -20,6 +19,10 @@
 - 一键安装与 Compose 默认使用 GHCR 预构建镜像（`VAULTMESH_IMAGE_TAG`，默认 `latest`），镜像不可用时自动回退本地构建；升级不再必须在本机编译 Go/Node
 
 ## [Unreleased]
+
+### 变更
+
+- 移除 HTTPS 同步门控：HTTP 部署可以使用全部功能（含备份、同步、恢复）；生产环境仍强烈建议配置 HTTPS
 
 ### 新增
 
@@ -35,7 +38,6 @@
 
 ### 新增
 
-- HTTPS 门控：`VAULTMESH_PUBLIC_API_URL` 非 https 且未设置 `VAULTMESH_HTTPS_ENABLED=true` 时，控制台可浏览但备份/同步类操作返回 403 `https_required`，控制台显示解锁指引横幅
 - 一键安装默认绑定 `0.0.0.0` 并输出服务器实际访问地址；`VAULTMESH_BIND=127.0.0.1` 可恢复回环绑定
 - 一键安装自动探测公网 IP 并写入 `VAULTMESH_PUBLIC_API_URL` / `VAULTMESH_ALLOWED_ORIGINS`（可用 `VAULTMESH_PUBLIC_HOST` 显式指定），升级时自动把 localhost 默认值迁移到探测地址，修复公网部署浏览器 `Failed to fetch`
 

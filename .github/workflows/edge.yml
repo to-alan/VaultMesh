@@ -1,0 +1,60 @@
+name: Edge Images
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  edge-images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # GHCR rejects uppercase repository names; lowercase the full prefix.
+      - id: image-prefix
+        run: echo "prefix=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push edge control image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          build-args: |
+            VERSION=edge-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+          tags: ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-control:edge
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build and push edge web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.web
+          push: true
+          tags: ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-web:edge
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build and push edge agent image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.agent
+          push: true
+          build-args: |
+            VERSION=edge-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+          tags: ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-agent:edge
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

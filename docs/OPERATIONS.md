@@ -68,17 +68,6 @@ sudo systemctl restart vaultmesh-agent
 
 控制面按天清理已完成的事实：运行记录默认保留 90 天、已完成命令 30 天、已完成的投递记录 90 天、已恢复的告警事件 180 天、审计事件 365 天。可用 `VAULTMESH_RETENTION_*_DAYS` 环境变量调整，设置为 `0` 关闭对应范围的清理（完整变量列表见 `.env.example`）。进行中的运行、待投递的通知和 firing 中的告警事件不受保留策略影响。归档的服务器、项目和仓库不会参与保留清理。
 
-## HTTPS 与同步门控
-
-默认部署绑定 `0.0.0.0`（可用 `VAULTMESH_BIND=127.0.0.1` 收回回环），方便公网 VPS 直接访问。但只要 `VAULTMESH_PUBLIC_API_URL` 不是 `https://` 且未显式设置 `VAULTMESH_HTTPS_ENABLED=true`，控制面就处于**浏览模式**：
-
-- 可用：登录、查看仪表盘/项目/运行/快照索引/审计等全部读取操作；
-- 被拒（403 `https_required`）：立即备份、保留策略预览、快照同步/保护/浏览/恢复——所有会向 Agent 排队任务或读取仓库内容的操作。
-
-解锁只需在 `.env` 中把 `VAULTMESH_PUBLIC_API_URL` 改为 `https://` 域名（同步更新 `VAULTMESH_ALLOWED_ORIGINS`、`VAULTMESH_COOKIE_SECURE=true`）并重启；TLS 在反代终止但上游仍是 http 时，设置 `VAULTMESH_HTTPS_ENABLED=true` 亦可。控制台会在未就绪时显示横幅说明原因。
-
-Agent 端本来就拒绝非 HTTPS（localhost 除外）的控制面地址，所以公网明文部署下 Agent 无法注册或上报。
-
 ## 升级
 
 升级前先执行控制面备份并阅读目标版本说明。标准流程：

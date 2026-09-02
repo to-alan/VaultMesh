@@ -80,11 +80,6 @@ const mfaCode = ref('')
 const mfaLoginRequired = ref(false)
 const authenticated = ref(false)
 const authReady = ref(false)
-const serverMeta = ref<{ name: string; version: string; commit: string; https_ready: boolean } | null>(null)
-// Backend gates backup/sync actions until TLS is configured (VAULTMESH_PUBLIC_API_URL
-// is https:// or VAULTMESH_HTTPS_ENABLED=true). Reads keep working; the UI
-// explains the gate instead of surfacing raw 403s everywhere.
-const httpsReady = computed(() => serverMeta.value?.https_ready !== false)
 const activeTab = ref<Tab>(tabFromLocation())
 const loading = ref(false)
 const backgroundRefreshing = ref(false)
@@ -1059,14 +1054,6 @@ async function refreshData(silent = false) {
 
 // perform runs an operation with the shared loading/error banner handling.
 // It returns the operation result, or undefined when the error was shown.
-async function refreshServerMeta() {
-  try {
-    serverMeta.value = await controlPlane.meta.get()
-  } catch {
-    serverMeta.value = null
-  }
-}
-
 async function perform<T>(operation: () => Promise<T>): Promise<T | undefined> {
   loading.value = true
   error.value = ''
@@ -1194,7 +1181,6 @@ onMounted(async () => {
   try {
     await controlPlane.auth.session()
     authenticated.value = true
-    await refreshServerMeta()
     await loadInitialData()
   } catch (cause) {
     authenticated.value = false
@@ -1295,7 +1281,6 @@ onBeforeUnmount(() => {
       <p v-if="success" class="message success" role="status" aria-live="polite">{{ success }}</p>
       <div v-if="loadingTabs.has(activeTab)" class="page-load-state" role="status"><i></i><span>正在加载{{ activeTab === 'snapshots' ? '快照索引' : '审计事件' }}…</span></div>
       <div v-else-if="pageError" class="page-load-state failed" role="alert"><span>{{ pageError }}</span><button type="button" class="text-button" @click="retryActiveTabData">重试当前页面</button></div>
-      <div v-if="authenticated && !httpsReady" class="page-load-state warning-banner" role="status"><span>⚠ HTTPS 未配置：备份与同步操作已禁用，当前仅可浏览。将 .env 中的 VAULTMESH_PUBLIC_API_URL 改为 https:// 域名（或设置 VAULTMESH_HTTPS_ENABLED=true）并重启 Control Plane 后解锁。</span></div>
 
       <template v-if="activeTab === 'overview'">
         <div class="overview-strip">
