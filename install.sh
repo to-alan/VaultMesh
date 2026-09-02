@@ -1,4 +1,17 @@
 #!/bin/sh
+# VaultMesh installer.
+#
+# Control plane (default):
+#   curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh
+#
+# Backup agent (on the machine to be backed up):
+#   curl -fsSL .../install.sh | sudo sh -s -- install-agent <server-url> <enroll-token> [name]
+#
+# Environment overrides:
+#   VAULTMESH_INSTALL_DIR      control-plane directory (default /opt/vaultmesh)
+#   VAULTMESH_PUBLIC_HOST      public host/IP of the control plane
+#   VAULTMESH_IMAGE_TAG        prebuilt image tag (default latest)
+#   VAULTMESH_AGENT_VERSION    agent release tag (default: latest release)
 set -eu
 
 REPOSITORY_URL=${VAULTMESH_REPOSITORY_URL:-https://github.com/to-alan/VaultMesh.git}
@@ -11,6 +24,8 @@ VAULTMESH_PUBLIC_HOST=${VAULTMESH_PUBLIC_HOST:-}
 # Version of the prebuilt GHCR images to deploy. Pin a release tag such as
 # v0.1.0 in production; "latest" follows the most recent release.
 VAULTMESH_IMAGE_TAG=${VAULTMESH_IMAGE_TAG:-latest}
+VAULTMESH_AGENT_VERSION=${VAULTMESH_AGENT_VERSION:-latest}
+GITHUB_RAW_BASE=https://raw.githubusercontent.com/to-alan/VaultMesh
 
 fail() {
 	printf 'VaultMesh 安装失败：%s\n' "$1" >&2
@@ -33,6 +48,84 @@ require_command git
 require_command openssl
 require_command docker
 docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2（docker compose）"
+
+# install_agent <server-url> <enroll-token> [server-name]
+# Installs the agent binary, systemd unit, and environment file, then starts
+# the service. Works on hosts that only see this script (no git checkout).
+install_agent() {
+	server_url=$1
+	token=$2
+	server_name=${3:-}
+
+	[ "$(id -u)" -eq 0 ] || fail "请使用 root 运行：curl -fsSL $GITHUB_RAW_BASE/main/install.sh | sudo sh -s -- install-agent <server-url> <token>"
+	require_command curl
+	require_command systemctl
+
+	# The agent client refuses plain HTTP unless the control plane is on
+	# loopback; surface that rule with actionable wording.
+	case "$server_url" in
+		http://localhost:*|http://localhost|http://127.0.0.1:*|http://127.0.0.1) ;;
+		http://*) fail "Agent 拒绝非 localhost 的 http 控制面地址。请为控制面配置 HTTPS（如 https://backup.example.com），或在与控制面同一台机器上使用 http://localhost:8080" ;;
+		https://*) ;;
+		*) fail "控制面地址必须是 http(s):// URL" ;;
+	esac
+
+	arch=$(uname -m)
+	case "$arch" in
+		x86_64) asset_arch=amd64 ;;
+		aarch64|arm64) asset_arch=arm64 ;;
+		armv7l|armv6l) asset_arch=armv7 ;;
+		*) fail "不支持的架构：$arch" ;;
+	esac
+	if [ "$VAULTMESH_AGENT_VERSION" = "latest" ]; then
+		asset_version=$(curl -fsSL --max-time 10 https://api.github.com/repos/to-alan/VaultMesh/releases/latest | grep '"tag_name"' | cut -d'"' -f4) || true
+	fi
+	asset_version=${asset_version:-$VAULTMESH_AGENT_VERSION}
+	[ -n "$asset_version" ] || fail "无法确定 Agent 版本；请设置 VAULTMESH_AGENT_VERSION（如 v0.1.1）"
+	asset_url="https://github.com/to-alan/VaultMesh/releases/download/${asset_version}/vaultmesh-agent-linux-${asset_arch}"
+
+	printf '下载 Agent %s（linux/%s）…\n' "$asset_version" "$asset_arch"
+	curl -fsSL --max-time 120 -o /tmp/vaultmesh-agent "$asset_url" || fail "下载失败：$asset_url"
+	curl -fsSL --max-time 30 -o /tmp/vaultmesh-agent.sha256 "${asset_url}.sha256" || true
+	if [ -f /tmp/vaultmesh-agent.sha256 ]; then
+		expected=$(cut -d' ' -f1 /tmp/vaultmesh-agent.sha256)
+		actual=$(sha256sum /tmp/vaultmesh-agent | cut -d' ' -f1)
+		[ "$expected" = "$actual" ] || fail "SHA256 校验不匹配"
+		printf 'SHA256 校验通过。\n'
+	fi
+
+	printf '设置 systemd 服务…\n'
+	install -m 0755 /tmp/vaultmesh-agent /usr/local/bin/vaultmesh-agent
+	agent_env_url="$GITHUB_RAW_BASE/${asset_version}/deploy/systemd/vaultmesh-agent.env.example"
+	curl -fsSL --max-time 30 -o /tmp/vaultmesh-agent.env.example "$agent_env_url" \
+		|| curl -fsSL --max-time 30 -o /tmp/vaultmesh-agent.env.example "$GITHUB_RAW_BASE/main/deploy/systemd/vaultmesh-agent.env.example" \
+		|| printf '# VaultMesh Agent environment\nVAULTMESH_SERVER_URL=\n' > /tmp/vaultmesh-agent.env.example
+	install -m 0644 /tmp/vaultmesh-agent.env.example /etc/vaultmesh-agent.env
+	curl -fsSL --max-time 30 -o /etc/systemd/system/vaultmesh-agent.service "$GITHUB_RAW_BASE/main/deploy/systemd/vaultmesh-agent.service" \
+		|| fail "下载 systemd unit 失败"
+
+	# Enrollment data goes into the root-only env file and is stripped after a
+	# successful start, mirroring the documented manual procedure.
+	{
+		printf 'VAULTMESH_SERVER_URL=%s\n' "$server_url"
+		printf 'VAULTMESH_ENROLLMENT_TOKEN=%s\n' "$token"
+	} >> /etc/vaultmesh-agent.env
+	chmod 600 /etc/vaultmesh-agent.env
+
+	systemctl daemon-reload
+	systemctl enable --now vaultmesh-agent >/dev/null 2>&1 || systemctl restart vaultmesh-agent
+	sleep 3
+	if ! systemctl is-active --quiet vaultmesh-agent; then
+		journalctl -u vaultmesh-agent --no-pager -n 30 >&2 || true
+		fail "Agent 启动失败，请检查上方日志（常见原因：令牌过期或已使用、控制面地址不可达）"
+	fi
+
+	# Registration succeeded: the token is single-use and must not linger.
+	sed -i '/^VAULTMESH_ENROLLMENT_TOKEN=/d' /etc/vaultmesh-agent.env
+	printf '\nVaultMesh Agent 已安装并注册成功。\n'
+	printf '版本：%s\n' "$(vaultmesh-agent --version 2>/dev/null | head -1 || echo "$asset_version")"
+	printf '打开控制台，在该服务器下创建备份项目；或使用「探测可备份项」自动发现。\n'
+}
 
 detect_public_host() {
 	if [ -n "$VAULTMESH_PUBLIC_HOST" ]; then
@@ -61,6 +154,12 @@ detect_public_host() {
 		*) printf '%s\n' "$candidate" ;;
 	esac
 }
+
+if [ "${1:-}" = "install-agent" ]; then
+	[ $# -ge 3 ] || fail "用法：install-agent <server-url> <enroll-token> [名称]"
+	install_agent "$2" "$3" "${4:-}"
+	exit 0
+fi
 
 PUBLIC_HOST=$(detect_public_host)
 PUBLIC_API_URL="http://${PUBLIC_HOST}:8080"

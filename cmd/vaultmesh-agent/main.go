@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"os"
@@ -43,7 +44,12 @@ func main() {
 	stagingRoot := flag.String("staging-root", os.Getenv("VAULTMESH_STAGING_ROOT"), "parent directory for protected temporary database dumps")
 	restoreRoot := flag.String("restore-root", envOr("VAULTMESH_RESTORE_ROOT", defaultRestoreRoot()), "directory for isolated restore jobs")
 	acceptRollback := flag.Bool("accept-rollback", os.Getenv("VAULTMESH_ACCEPT_ROLLBACK") == "true", "allow the next configuration to move to a lower revision after a control-plane restore")
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("vaultmesh-agent %s (commit %s, built %s)\n", version.Version, version.Commit, version.Date)
+		return
+	}
 	if strings.TrimSpace(*serverURL) == "" {
 		logger.Error("control plane URL is required", "flag", "--server")
 		os.Exit(2)

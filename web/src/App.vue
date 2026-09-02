@@ -1166,7 +1166,11 @@ function retentionPreviewSummary(projectID: string): string {
 }
 
 function installCommand(result: EnrollmentResult): string {
-  return `sudo vaultmesh-agent --server ${apiBaseURL} --enrollment-token ${result.enrollment_token}`
+  // One command must work from a bare host: the installer fetches the agent
+  // release asset, registers, and starts the systemd service.
+  const quotedURL = `'${apiBaseURL}'`
+  const quotedToken = `'${result.enrollment_token}'`
+  return `curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh -s -- install-agent ${quotedURL} ${quotedToken} '${result.server.name}'`
 }
 
 onMounted(async () => {

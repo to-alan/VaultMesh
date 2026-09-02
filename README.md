@@ -45,26 +45,19 @@ ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 user@your-server
 
 ### 安装 Agent
 
-从 [Releases](https://github.com/to-alan/VaultMesh/releases) 下载对应平台的 `vaultmesh-agent`（linux/amd64、linux/arm64、linux/armv7、darwin/amd64、darwin/arm64，附 SHA256SUMS），或自行构建：
+在 Web 控制台创建“服务器”后，注册卡片会显示一条可直接复制的安装命令（在**要备份的那台机器**上执行）：
 
 ```bash
-make build
-sudo install -m 0755 bin/vaultmesh-agent /usr/local/bin/vaultmesh-agent
-sudo install -m 0644 deploy/systemd/vaultmesh-agent.service /etc/systemd/system/vaultmesh-agent.service
-sudo install -m 0600 deploy/systemd/vaultmesh-agent.env.example /etc/vaultmesh-agent.env
+curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh -s -- install-agent 'https://backup.example.com' 'enroll_xxx' '我的VPS'
 ```
+
+这条命令会自动：下载对应架构的 Agent 二进制并校验 SHA256 → 安装 systemd 服务 → 写入注册信息并启动 → 注册成功后从配置中清除一次性令牌。
+
+也可以从 [Releases](https://github.com/to-alan/VaultMesh/releases) 手动下载（linux/amd64、arm64、armv7、darwin/amd64、arm64，附 SHA256SUMS），或 `make build` 自行构建后按 `deploy/systemd/` 模板手工安装。
 
 Agent 主机依赖：所有备份需要 Restic ≥ 0.17.0；MySQL/PostgreSQL 逻辑备份分别需要 `mysqldump`/`pg_dump`；Docker 挂载需要 Docker CLI；rclone 类存储需要预配置同名 remote。
 
-在 Web 控制台创建“服务器”，把一次性注册令牌和 Control Plane HTTPS 地址写入 `/etc/vaultmesh-agent.env`，然后启动：
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now vaultmesh-agent
-sudo journalctl -u vaultmesh-agent -f
-```
-
-注册成功后从环境文件删除 `VAULTMESH_ENROLLMENT_TOKEN` 并重启 Agent。设备身份保存在 `/var/lib/vaultmesh-agent/state.json`（权限 `0600`）。
+Agent 与控制面的通信强制 HTTPS（仅 localhost 允许明文）。设备身份保存在 `/var/lib/vaultmesh-agent/state.json`（权限 `0600`）；`vaultmesh-agent --version` 可查看当前版本。
 
 ### 创建第一份备份
 
