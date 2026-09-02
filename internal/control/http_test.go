@@ -1095,18 +1095,27 @@ func TestDetectionCommandRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "detect-host"})
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "detect-host", AgentVersion: "v0.1.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	handler := newTestHTTPHandler(t, service, slog.New(slog.NewTextHandler(io.Discard, nil)), false, nil)
 	adminCookie := loginAdmin(t, handler)
 
-	var command domain.Command
+	var dispatch struct {
+		Command domain.Command `json:"command"`
+		Warning string         `json:"warning"`
+	}
 	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/servers/"+identity.AgentID+"/detect", adminCookie,
-		nil, http.StatusAccepted, &command)
+		nil, http.StatusAccepted, &dispatch)
+	command := dispatch.Command
 	if command.ID == "" || command.ProjectID != "" {
 		t.Fatalf("detection command must be server-scoped: %#v", command)
+	}
+	// The enrolled agent (v0.1.1 in this fixture) predates the detect
+	// command; the dispatch must warn immediately instead of after polling.
+	if !strings.Contains(dispatch.Warning, "不支持探测命令") {
+		t.Fatalf("expected a version-mismatch warning: %#v", dispatch)
 	}
 
 	// The wizard reports "not available" before the agent answers, and the

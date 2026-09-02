@@ -35,13 +35,13 @@ func (s *HTTPServer) listServers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) createDetection(w http.ResponseWriter, r *http.Request) {
-	command, err := s.service.CreateDetectionCommand(r.Context(), r.PathValue("serverID"))
+	dispatch, err := s.service.CreateDetectionCommand(r.Context(), r.PathValue("serverID"))
 	if err != nil {
 		s.handleServiceError(w, err)
 		return
 	}
-	setAuditResourceID(w, command.ServerID)
-	s.writeJSON(w, http.StatusAccepted, command)
+	setAuditResourceID(w, dispatch.Command.ServerID)
+	s.writeJSON(w, http.StatusAccepted, dispatch)
 }
 
 func (s *HTTPServer) getDetection(w http.ResponseWriter, r *http.Request) {

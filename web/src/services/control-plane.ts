@@ -3,6 +3,7 @@ import type {
   AlertIncident,
   AuditEvent,
   Dashboard,
+  DetectionDispatch,
   DetectionReport,
   DetectionStatus,
   EnrollmentResult,
@@ -170,7 +171,7 @@ export const controlPlane = {
     list: () => list<Server>('/api/v1/servers'),
     create: (name: string) => requestJSON<EnrollmentResult>('/api/v1/servers', { method: 'POST', body: { name } }),
     archive: (serverID: string) => requestJSON<void>(`/api/v1/servers/${resourceID(serverID)}`, { method: 'DELETE' }),
-    detect: (serverID: string) => requestJSON<CommandAccepted>(`/api/v1/servers/${resourceID(serverID)}/detect`, { method: 'POST' }),
+    detect: (serverID: string) => requestJSON<DetectionDispatch>(`/api/v1/servers/${resourceID(serverID)}/detect`, { method: 'POST' }),
     detection: async (serverID: string) => requestJSON<DetectionStatus>(`/api/v1/servers/${resourceID(serverID)}/detection`),
   },
 

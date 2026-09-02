@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -515,24 +516,69 @@ func (s *Service) reconcileConfigDegradation(ctx context.Context, serverID strin
 	return s.reconcileAlert(ctx, "config:"+serverID, condition)
 }
 
+// detectMinimumVersion is the first release that understands the detect
+// command. Anything older receives an immediate warning.
+const detectMinimumVersion = "v0.1.2"
+
+func detectionWarningFor(agentVersion string) string {
+	version := strings.TrimPrefix(strings.TrimSpace(agentVersion), "v")
+	if version == "" || strings.HasPrefix(version, "edge") || version == "dev" {
+		return ""
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	patch, err3 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return ""
+	}
+	if major == 0 && minor == 1 && patch < 2 {
+		return fmt.Sprintf("Agent 版本 %s 不支持探测命令（需要 %s 或 edge）。请重新运行 install-agent 并设置 VAULTMESH_AGENT_VERSION=edge。", agentVersion, detectMinimumVersion)
+	}
+	return ""
+}
+
 // CreateDetectionCommand queues a read-only inventory scan on one server.
 // The report is delivered through the dedicated detection endpoint and
 // surfaced to the wizard; it never starts a backup by itself.
-func (s *Service) CreateDetectionCommand(ctx context.Context, serverID string) (domain.Command, error) {
+func (s *Service) CreateDetectionCommand(ctx context.Context, serverID string) (domain.DetectionDispatch, error) {
 	serverID = strings.TrimSpace(serverID)
 	if serverID == "" {
-		return domain.Command{}, validationError("server_id", "is required")
+		return domain.DetectionDispatch{}, validationError("server_id", "is required")
+	}
+	servers, err := s.store.ListServers(ctx)
+	if err != nil {
+		return domain.DetectionDispatch{}, err
+	}
+	var agentVersion string
+	found := false
+	for _, server := range servers {
+		if server.ID == serverID {
+			agentVersion = server.AgentVersion
+			found = true
+			break
+		}
+	}
+	if !found {
+		return domain.DetectionDispatch{}, store.ErrNotFound
 	}
 	id, err := randomValue("cmd", 10)
 	if err != nil {
-		return domain.Command{}, err
+		return domain.DetectionDispatch{}, err
 	}
-	return s.store.CreateCommand(ctx, domain.Command{
+	command, err := s.store.CreateCommand(ctx, domain.Command{
 		ID:        id,
 		ServerID:  serverID,
 		Type:      "detect",
 		CreatedAt: s.now(),
 	})
+	if err != nil {
+		return domain.DetectionDispatch{}, err
+	}
+	return domain.DetectionDispatch{Command: command, Warning: detectionWarningFor(agentVersion)}, nil
 }
 
 func (s *Service) SaveDetectionReport(ctx context.Context, serverID, commandID string, report domain.DetectionReport) error {

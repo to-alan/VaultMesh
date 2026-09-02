@@ -703,16 +703,26 @@ const detectionAgentVersion = computed(() =>
 const DETECTION_POLL_TOTAL = 24   // 24 × 5s = 2 分钟窗口
 const DETECTION_POLL_INTERVAL = 5000
 
+const detectionWarning = ref('')
+
 async function startDetection(server: Server) {
   detectionServerID.value = server.id
   detectionReport.value = null
   detectionExhausted.value = false
   detectionAttempts.value = 0
+  detectionWarning.value = ''
   detectionSelection.apps = []
   detectionSelection.databases = []
   detectionSelection.containers = []
   await perform(async () => {
-    await controlPlane.servers.detect(server.id)
+    const dispatch = await controlPlane.servers.detect(server.id)
+    if (dispatch.warning) {
+      // Fail fast: an agent that cannot understand the command will never
+      // answer, so polling would be theater.
+      detectionWarning.value = dispatch.warning
+      error.value = dispatch.warning
+      return
+    }
     success.value = `已向 ${server.name} 发送只读探测任务，完成后自动展示结果。`
     pollDetection(server.id, DETECTION_POLL_TOTAL)
   })
@@ -746,6 +756,7 @@ function closeDetection() {
   detectionServerID.value = ''
   detectionReport.value = null
   detectionExhausted.value = false
+  detectionWarning.value = ''
 }
 
 async function runDetectionAgain() {
@@ -1476,6 +1487,11 @@ onBeforeUnmount(() => {
             <button type="button" class="primary" :disabled="loading || !detectionHasSelection" @click="applyDetectionDraft">用所选生成项目草稿</button>
             <button type="button" class="ghost" @click="runDetectionAgain" :disabled="loading">重新探测</button>
           </footer>
+        </section>
+
+        <section v-if="detectionWarning" class="panel detection-diagnosis">
+          <div class="panel-heading"><div><p class="eyebrow">VERSION MISMATCH</p><h2>探测命令无法被该 Agent 执行</h2></div></div>
+          <p>{{ detectionWarning }}</p>
         </section>
 
         <section v-if="detectionExhausted" class="panel detection-diagnosis">

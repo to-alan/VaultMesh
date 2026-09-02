@@ -367,6 +367,14 @@ type Command struct {
 	CreatedAt  time.Time  `json:"created_at"`
 }
 
+// DetectionDispatch is the create-detection response: the queued command
+// plus an optional compatibility warning for agents that predate the
+// detect command.
+type DetectionDispatch struct {
+	Command Command `json:"command"`
+	Warning string  `json:"warning,omitempty"`
+}
+
 // DetectionReport is a read-only inventory of backup-worthy facts on one
 // agent host: running containers, database signals, and application roots
 // discovered by marker files. It never contains secrets; the control-plane

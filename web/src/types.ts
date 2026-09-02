@@ -284,3 +284,8 @@ export interface DetectionStatus {
   command?: { id: string; attempts?: number; created_at?: string; lease_until?: string | null }
   has_command?: boolean
 }
+
+export interface DetectionDispatch {
+  command: { id: string; project_id?: string; server_id: string; type: string; created_at: string }
+  warning?: string
+}

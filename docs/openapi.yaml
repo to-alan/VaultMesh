@@ -390,10 +390,15 @@ paths:
           schema: { type: string }
       responses:
         '202':
-          description: Detection command queued for the agent
+          description: Detection command queued for the agent; warning is present when the installed agent predates the detect command
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Command' }
+              schema:
+                type: object
+                required: [command]
+                properties:
+                  command: { $ref: '#/components/schemas/Command' }
+                  warning: { type: string }
         '404': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
   /api/v1/servers/{serverID}/detection:
