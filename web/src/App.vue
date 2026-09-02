@@ -715,6 +715,14 @@ function supportsDetection(version: string): boolean {
 }
 const detectionVersionBlocked = computed(() =>
   Boolean(detectionServerID.value) && !supportsDetection(detectionAgentVersion.value))
+const installCommandText = ref('生成中…')
+watch(enrollment, (value) => {
+  if (!value) {
+    installCommandText.value = ''
+    return
+  }
+  void buildInstallCommand(value).then((text) => { installCommandText.value = text })
+})
 const detectionTargetName = computed(() =>
   servers.value.find((item) => item.id === detectionServerID.value)?.name || detectionServerID.value)
 // A stale selection (server archived/offline from an earlier session) must
@@ -1279,23 +1287,26 @@ function retentionPreviewSummary(projectID: string): string {
   return `保留 ${Number(preview.stats?.snapshots_kept || 0)} 份 · 将删除 ${Number(preview.stats?.snapshots_removed || 0)} 份 · 未执行删除`
 }
 
-function installCommand(result: EnrollmentResult): string {
+const controlPlaneVersion = ref('')
+
+async function buildInstallCommand(result: EnrollmentResult): Promise<string> {
   // One command must work from a bare host: the installer fetches the agent
   // release asset, registers, and starts the systemd service. The agent
   // only accepts plain HTTP against loopback, so an http:// public API URL
   // is rewritten to localhost with a note that cross-host use needs HTTPS.
   const isPlainHTTP = apiBaseURL.startsWith('http://') && !apiBaseURL.includes('localhost') && !apiBaseURL.includes('127.0.0.1')
   const agentURL = isPlainHTTP ? 'http://localhost:8080' : apiBaseURL
-  const quotedToken = `'${result.enrollment_token}'`
-  const command = `curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh -s -- install-agent '${agentURL}' ${quotedToken} '${result.server.name}'`
-  if (!isPlainHTTP) return command
-  return `# 同机部署：Agent 走 localhost 回环（跨机器需要 HTTPS）\n${command}`
+  // An edge control plane speaks unreleased commands (e.g. detect); the
+  // agent must track the same channel or the command will be rejected.
+  const channel = controlPlaneVersion.value.startsWith('edge') ? 'VAULTMESH_AGENT_VERSION=edge ' : ''
+  return `curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo ${channel}sh -s -- install-agent '${agentURL}' '${result.enrollment_token}' '${result.server.name}'`
 }
 
 onMounted(() => {
   window.addEventListener('vaultmesh-ui-error', (event) => {
     error.value = `界面发生错误：${(event as CustomEvent<string>).detail}`
   })
+  void controlPlane.meta.get().then((meta) => { controlPlaneVersion.value = meta.version }).catch(() => {})
 })
 
 onMounted(async () => {
@@ -1494,7 +1505,7 @@ onBeforeUnmount(() => {
         </div>
         <section v-if="enrollment" class="panel enrollment-card">
           <div><p class="eyebrow">ONE-TIME TOKEN</p><h2>在 {{ enrollment.server.name }} 上运行</h2></div>
-          <code>{{ installCommand(enrollment) }}</code>
+          <code>{{ installCommandText }}</code>
           <p>令牌将在 {{ formatDate(enrollment.expires_at) }} 过期，并且只能使用一次。关闭本提示后无法再次查看完整令牌。</p>
           <button class="ghost" @click="enrollment = null">我已保存</button>
         </section>
