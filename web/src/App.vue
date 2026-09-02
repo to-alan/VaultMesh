@@ -697,13 +697,23 @@ let detectionPollTimer: number | undefined
 const detectionRunning = computed(() => Boolean(detectionServerID.value) && !detectionReport.value && !detectionExhausted.value)
 const detectionHasSelection = computed(() =>
   detectionSelection.apps.length + detectionSelection.databases.length + detectionSelection.containers.length > 0)
+const detectionWarning = ref('')
 const detectionAgentVersion = computed(() =>
   servers.value.find((item) => item.id === detectionServerID.value)?.agent_version || '')
 
+// Results and diagnoses appear below the fold when the report is large;
+// scrolling them into view is the difference between feedback and silence.
+function revealDetectionPanel(id: string) {
+  window.requestAnimationFrame(() => {
+    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+}
+watch(detectionReport, (report) => { if (report) revealDetectionPanel('detection-wizard') })
+watch(detectionExhausted, (exhausted) => { if (exhausted) revealDetectionPanel('detection-diagnosis') })
+watch(detectionWarning, (warning) => { if (warning) revealDetectionPanel('detection-diagnosis') })
+
 const DETECTION_POLL_TOTAL = 24   // 24 × 5s = 2 分钟窗口
 const DETECTION_POLL_INTERVAL = 5000
-
-const detectionWarning = ref('')
 
 async function startDetection(server: Server) {
   detectionServerID.value = server.id
@@ -1449,9 +1459,11 @@ onBeforeUnmount(() => {
             </select>
             <button type="button" class="primary compact-action" :disabled="loading || !detectionServerID || detectionRunning" @click="startDetection(servers.find((item) => item.id === detectionServerID)!)">{{ detectionRunning ? '探测中…' : '开始探测' }}</button>
           </div>
+          <p v-if="detectionRunning" class="detection-status" role="status"><i></i>已派发给 Agent，等待回传（第 {{ detectionAttempts }} 次尝试）…</p>
+          <p v-else-if="detectionExhausted" class="detection-status stale">两分钟内没有收到回传，请查看下方诊断。</p>
         </section>
 
-        <section v-if="detectionReport && detectionServerID" class="panel detection-wizard">
+        <section id="detection-wizard" v-if="detectionReport && detectionServerID" class="panel detection-wizard">
           <div class="panel-heading"><div><p class="eyebrow">DETECTION</p><h2>探测结果</h2><p>勾选要纳入备份的内容，生成项目草稿后在下方表单确认。数据库密码需要你手动填写，探测不会读取任何密钥。</p></div><button type="button" class="ghost compact" @click="closeDetection">关闭</button></div>
 
           <div v-if="detectionReport.databases?.length" class="detection-group">
@@ -1489,12 +1501,12 @@ onBeforeUnmount(() => {
           </footer>
         </section>
 
-        <section v-if="detectionWarning" class="panel detection-diagnosis">
+        <section id="detection-diagnosis" v-if="detectionWarning" class="panel detection-diagnosis">
           <div class="panel-heading"><div><p class="eyebrow">VERSION MISMATCH</p><h2>探测命令无法被该 Agent 执行</h2></div></div>
           <p>{{ detectionWarning }}</p>
         </section>
 
-        <section v-if="detectionExhausted" class="panel detection-diagnosis">
+        <section id="detection-diagnosis" v-if="detectionExhausted" class="panel detection-diagnosis">
           <div class="panel-heading"><div><p class="eyebrow">DIAGNOSIS</p><h2>Agent 没有回传探测结果</h2></div></div>
           <ol>
             <li v-if="detectionAgentVersion && detectionAgentVersion.startsWith('v0.1.')">Agent 版本是 <code>{{ detectionAgentVersion }}</code>，<strong>不支持探测命令</strong>。重新运行 install-agent 并设置 <code>VAULTMESH_AGENT_VERSION=edge</code> 升级。</li>
