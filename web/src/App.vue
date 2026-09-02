@@ -1582,24 +1582,6 @@ onBeforeUnmount(() => {
           <p v-if="detectionRunning" class="detection-status" role="status"><i></i>已派发给 {{ detectionTargetName }}（{{ detectionServerID }}）的 Agent，等待回传（第 {{ detectionAttempts }} 次尝试）…</p>
           <p v-else-if="detectionExhausted" class="detection-status stale">两分钟内没有收到回传，请查看下方诊断。</p>
         </section>
-          <ProjectListView
-            :projects="projects"
-            :servers="servers"
-            :health="projectHealthByID"
-            :now-epoch="nowEpoch"
-            :repository-name="repositoryName"
-            :latest-preview="latestRetentionPreview"
-            :queued-project-ids="queuedProjectIDs"
-            :queued-preview-project-ids="queuedPreviewProjectIDs"
-            :loading="loading"
-            @edit="openProjectEditor"
-            @toggle="toggleProject"
-            @preview="previewRetention"
-            @run="runNow"
-            @archive="archiveProject"
-          />
-        </div>
-        <div class="projects-right">
         <section id="detection-wizard" v-if="detectionReport && detectionServerID" class="panel detection-wizard">
           <div class="panel-heading"><div><p class="eyebrow">DETECTION</p><h2>探测结果</h2><p>勾选要纳入备份的内容，生成项目草稿后在下方表单确认。数据库密码需要你手动填写，探测不会读取任何密钥。</p></div><button type="button" class="ghost compact" @click="closeDetection">关闭</button></div>
 
@@ -1649,6 +1631,25 @@ onBeforeUnmount(() => {
             <li>确认 Agent 在线（服务器页状态为「在线」），并且与控制面的地址可达。</li>
           </ol>
         </section>
+
+          <ProjectListView
+            :projects="projects"
+            :servers="servers"
+            :health="projectHealthByID"
+            :now-epoch="nowEpoch"
+            :repository-name="repositoryName"
+            :latest-preview="latestRetentionPreview"
+            :queued-project-ids="queuedProjectIDs"
+            :queued-preview-project-ids="queuedPreviewProjectIDs"
+            :loading="loading"
+            @edit="openProjectEditor"
+            @toggle="toggleProject"
+            @preview="previewRetention"
+            @run="runNow"
+            @archive="archiveProject"
+          />
+        </div>
+        <div class="projects-right">
 <aside id="project-builder" class="panel form-panel project-builder" :class="{ editing: editingProjectID }">
             <div class="builder-heading"><div><p class="eyebrow">{{ editingProjectID ? 'EDIT DESIRED STATE' : 'NEW PROJECT' }}</p><h2>{{ editingProjectID ? `编辑 ${editingProject?.name || '备份项目'}` : '创建备份项目' }}</h2></div><button v-if="editingProjectID" type="button" class="ghost compact" @click="resetProjectForm">取消编辑</button></div>
             <p class="form-intro">一个项目可以组合文件、Docker、MySQL 和 PostgreSQL 数据源，并在同一个 Restic 快照中归档。</p>
