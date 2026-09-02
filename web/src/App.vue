@@ -781,13 +781,23 @@ function pollDetection(serverID: string, remainingAttempts: number) {
     return
   }
   detectionPollTimer = window.setTimeout(async () => {
+    let seenCommand = false
     try {
       const status = await controlPlane.servers.detection(serverID)
       // 命令派发状态随每次轮询刷新，让用户看到"系统确实在等 Agent"
-      if ('command' in status && status.command) detectionAttempts.value = (status.command as { attempts?: number }).attempts ?? 0
+      if ('command' in status && status.command) {
+        detectionAttempts.value = (status.command as { attempts?: number }).attempts ?? 0
+        seenCommand = true
+      }
       if (status.available && status.report) {
         detectionReport.value = status.report
         success.value = '探测完成。勾选要备份的内容并生成项目草稿。'
+        return
+      }
+      // 派发过的命令消失（数据库清理/服务重置）时不能假装还在等待
+      if (seenCommand === false && detectionAttempts.value === 0 && remainingAttempts < DETECTION_POLL_TOTAL - 4) {
+        detectionExhausted.value = true
+        error.value = '探测命令已不存在（可能被清理）。请重新点击「开始探测」。'
         return
       }
       const target = servers.value.find((item) => item.id === serverID)
