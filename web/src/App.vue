@@ -772,7 +772,7 @@ watch(detectionWarning, (warning) => { if (warning) revealDetectionPanel('detect
 const DETECTION_POLL_TOTAL = 24   // 24 × 5s = 2 分钟窗口
 const DETECTION_POLL_INTERVAL = 5000
 
-async function startDetection(serverIDInput: string) {
+async function startDetection(serverIDInput: string, force = false) {
   const server = servers.value.find((item) => item.id === serverIDInput)
   if (!server) {
     error.value = '请先在下拉框中选择一台服务器。'
@@ -791,14 +791,17 @@ async function startDetection(serverIDInput: string) {
   detectionSelection.databases = []
   detectionSelection.containers = []
   await perform(async () => {
-    // Surface any previously stored report immediately — a fresh page load
-    // must not hide a detection that already succeeded.
-    const status = await controlPlane.servers.detection(server.id)
-    if (status.available && status.report) {
-      detectionReport.value = status.report
-      detectionAttempts.value = (status.command as { attempts?: number } | undefined)?.attempts ?? 0
-      success.value = '已加载上次探测结果。数据有变化时可重新探测。'
-      return
+    // Selecting a server surfaces the stored report so a fresh page load
+    // never hides a detection that already succeeded. An explicit click
+    // (force) always dispatches a fresh scan instead.
+    if (!force) {
+      const status = await controlPlane.servers.detection(server.id)
+      if (status.available && status.report) {
+        detectionReport.value = status.report
+        detectionAttempts.value = (status.command as { attempts?: number } | undefined)?.attempts ?? 0
+        success.value = '已加载上次探测结果。数据有变化时可重新探测。'
+        return
+      }
     }
     const dispatch = await controlPlane.servers.detect(server.id)
     if (dispatch.warning) {
@@ -1570,7 +1573,7 @@ onBeforeUnmount(() => {
               <option value="" disabled>选择服务器</option>
               <option v-for="server in servers.filter((item) => item.status === 'online')" :key="server.id" :value="server.id">{{ server.name }}（{{ server.agent_version || '未知版本' }}）</option>
             </select>
-            <button type="button" class="primary compact-action" :disabled="loading || !detectionServerID || detectionRunning || detectionVersionBlocked" @click="startDetection(detectionServerID)">{{ detectionRunning ? '探测中…' : '开始探测' }}</button>
+            <button type="button" class="primary compact-action" :disabled="loading || !detectionServerID || detectionRunning || detectionVersionBlocked" @click="startDetection(detectionServerID, true)">{{ detectionRunning ? '探测中…' : '开始探测' }}</button>
           </div>
           <p v-if="detectionVersionBlocked" class="detection-status stale">该 Agent 版本为 {{ detectionAgentVersion }}，不支持探测（需要 v0.1.2 或 edge）。重新安装：<code>curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo VAULTMESH_AGENT_VERSION=edge sh -s -- install-agent 'http://localhost:8080' '新令牌' '名称'</code></p>
           <p v-if="detectionRunning" class="detection-status" role="status"><i></i>已派发给 {{ detectionTargetName }}（{{ detectionServerID }}）的 Agent，等待回传（第 {{ detectionAttempts }} 次尝试）…</p>
@@ -1611,7 +1614,7 @@ onBeforeUnmount(() => {
 
           <footer class="form-actions">
             <button type="button" class="primary" :disabled="loading || !detectionHasSelection" @click="applyDetectionDraft">用所选生成项目草稿</button>
-            <button type="button" class="ghost" @click="startDetection(detectionServerID)" :disabled="loading || !detectionServerID">重新探测</button>
+            <button type="button" class="ghost" @click="startDetection(detectionServerID, true)" :disabled="loading || !detectionServerID">重新探测</button>
           </footer>
         </section>
 
