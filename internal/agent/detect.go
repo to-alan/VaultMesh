@@ -116,6 +116,11 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 		if len(parts) != 3 {
 			continue
 		}
+		// The VaultMesh deployment itself: backing up the control plane from
+		// its own agent is circular (docs cover host-level pg_dump instead).
+		if strings.Contains(strings.ToLower(parts[0]+parts[1]), "vaultmesh") {
+			continue
+		}
 		if isInfrastructureContainer(parts[0], parts[1]) {
 			continue
 		}
@@ -261,14 +266,33 @@ func (r *Runner) detectDatabases(ctx context.Context, containers []domain.Detect
 		})
 	}
 
-	for index := range databases {
-		if databases[index].Kind == "mysql" {
-			databases[index].DumpTool = toolVersion(ctx, r.mysqlDumpPath, "--version")
-		} else {
-			databases[index].DumpTool = toolVersion(ctx, r.pgDumpPath, "--version")
+	// A container database that publishes a port and the loopback listener
+	// on the same port are the same instance. Prefer the container entry:
+	// it carries the container name, which tells the user where the data
+	// lives and which compose project to restart. Two passes, because the
+	// loopback probe appends before the container inspection runs.
+	claimedPort := map[int]bool{}
+	for _, database := range databases {
+		if database.Source == "docker" && database.Reachable {
+			claimedPort[database.Port] = true
 		}
 	}
-	return databases
+	deduped := make([]domain.DetectedDatabase, 0, len(databases))
+	for _, database := range databases {
+		if database.Source == "loopback" && claimedPort[database.Port] {
+			continue
+		}
+		deduped = append(deduped, database)
+	}
+
+	for index := range deduped {
+		if deduped[index].Kind == "mysql" {
+			deduped[index].DumpTool = toolVersion(ctx, r.mysqlDumpPath, "--version")
+		} else {
+			deduped[index].DumpTool = toolVersion(ctx, r.pgDumpPath, "--version")
+		}
+	}
+	return deduped
 }
 
 func detectApps(ctx context.Context) []domain.DetectedApp {
