@@ -12,6 +12,8 @@ func TestLoadServerUsesUsernamePasswordAndStrictBooleanConfiguration(t *testing.
 	t.Setenv("VAULTMESH_COOKIE_SECURE", "true")
 	t.Setenv("VAULTMESH_AUTO_MIGRATE", "false")
 	t.Setenv("VAULTMESH_ALLOWED_ORIGINS", "https://vault.example.com")
+	t.Setenv("VAULTMESH_PUBLIC_API_URL", "https://vault.example.com")
+	t.Setenv("VAULTMESH_HTTPS_ENABLED", "false")
 
 	config, err := LoadServer()
 	if err != nil {
@@ -26,10 +28,50 @@ func TestLoadServerUsesUsernamePasswordAndStrictBooleanConfiguration(t *testing.
 	if config.WebAuthnRPID != "vault.example.com" || len(config.WebAuthnRPOrigins) != 1 {
 		t.Fatalf("WebAuthn defaults were not derived from the trusted origin: %#v", config)
 	}
+	if !config.HTTPSReady {
+		t.Fatal("an https public API URL should enable Agent work")
+	}
 
 	t.Setenv("VAULTMESH_COOKIE_SECURE", "sometimes")
 	if _, err := LoadServer(); err == nil {
 		t.Fatal("expected invalid cookie security boolean to fail")
+	}
+}
+
+func TestLoadServerHTTPSOverrideIsStrict(t *testing.T) {
+	t.Setenv("VAULTMESH_ADMIN_USERNAME", "admin")
+	t.Setenv("VAULTMESH_ADMIN_PASSWORD", "correct-horse-battery-staple")
+	t.Setenv("VAULTMESH_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("VAULTMESH_PUBLIC_API_URL", "http://localhost:8080")
+	t.Setenv("VAULTMESH_HTTPS_ENABLED", "true")
+
+	config, err := LoadServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.HTTPSReady {
+		t.Fatal("explicit HTTPS termination override was ignored")
+	}
+
+	t.Setenv("VAULTMESH_HTTPS_ENABLED", "sometimes")
+	if _, err := LoadServer(); err == nil || !strings.Contains(err.Error(), "VAULTMESH_HTTPS_ENABLED") {
+		t.Fatalf("expected invalid HTTPS boolean to fail, got %v", err)
+	}
+}
+
+func TestLoadServerDoesNotTrustMalformedHTTPSURL(t *testing.T) {
+	t.Setenv("VAULTMESH_ADMIN_USERNAME", "admin")
+	t.Setenv("VAULTMESH_ADMIN_PASSWORD", "correct-horse-battery-staple")
+	t.Setenv("VAULTMESH_MASTER_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	t.Setenv("VAULTMESH_PUBLIC_API_URL", "https://")
+	t.Setenv("VAULTMESH_HTTPS_ENABLED", "false")
+
+	config, err := LoadServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.HTTPSReady {
+		t.Fatal("a malformed public API URL must not enable Agent work")
 	}
 }
 

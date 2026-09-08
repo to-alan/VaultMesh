@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh
 #
 # Backup agent (on the machine to be backed up):
-#   curl -fsSL .../install.sh | sudo sh -s -- install-agent <server-url> <enroll-token> [name]
+#   curl -fsSL .../install.sh | sudo sh -s -- install-agent <server-url> <enroll-token>
 #
 # Environment overrides:
 #   VAULTMESH_INSTALL_DIR      control-plane directory (default /opt/vaultmesh)
@@ -40,27 +40,16 @@ if [ "$(id -u)" -ne 0 ]; then
 	fail "请使用 root 运行，推荐：curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh"
 fi
 
-case "$ADMIN_USERNAME" in
-	""|*[!A-Za-z0-9._-]*) fail "管理员用户名只能包含字母、数字、点、下划线和连字符" ;;
-esac
-
-require_command git
-require_command openssl
-require_command docker
-docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2（docker compose）"
-
-# install_agent <server-url> <enroll-token> [server-name]
+# install_agent <server-url> <enroll-token>
 # Installs the agent binary, systemd unit, and environment file, then starts
 # the service. Works on hosts that only see this script (no git checkout).
 install_agent() {
 	server_url=$1
 	token=$2
-	server_name=${3:-}
 
 	[ "$(id -u)" -eq 0 ] || fail "请使用 root 运行：curl -fsSL $GITHUB_RAW_BASE/main/install.sh | sudo sh -s -- install-agent <server-url> <token>"
 	require_command curl
 	require_command systemctl
-	require_command docker
 
 	# The agent client refuses plain HTTP unless the control plane is on
 	# loopback; surface that rule with actionable wording.
@@ -85,44 +74,124 @@ install_agent() {
 		armv7l|armv6l) asset_arch=armv7 ;;
 		*) fail "不支持的架构：$arch" ;;
 	esac
-	if [ "$VAULTMESH_AGENT_VERSION" = "latest" ]; then
-		asset_version=$(curl -fsSL --max-time 10 https://api.github.com/repos/to-alan/VaultMesh/releases/latest | grep '"tag_name"' | cut -d'"' -f4) || true
+	asset_version=$VAULTMESH_AGENT_VERSION
+	if [ "$asset_version" = "latest" ]; then
+		asset_version=$(curl -fsSL --max-time 10 https://api.github.com/repos/to-alan/VaultMesh/releases/latest | grep '"tag_name"' | cut -d'"' -f4) \
+			|| fail "无法查询最新 Agent 版本；请设置 VAULTMESH_AGENT_VERSION（如 v0.1.2 或 edge）"
 	fi
-	asset_version=${asset_version:-$VAULTMESH_AGENT_VERSION}
-	[ -n "$asset_version" ] || fail "无法确定 Agent 版本；请设置 VAULTMESH_AGENT_VERSION（如 v0.1.1 或 edge）"
+	[ -n "$asset_version" ] || fail "无法确定 Agent 版本；请设置 VAULTMESH_AGENT_VERSION（如 v0.1.2 或 edge）"
+	agent_tmp=$(mktemp -d "${TMPDIR:-/tmp}/vaultmesh-agent.XXXXXX") || fail "无法创建临时目录"
+	agent_binary=$agent_tmp/vaultmesh-agent
+	agent_install_succeeded=false
+	agent_rollback_armed=false
+	old_agent_binary=false
+	old_agent_env=false
+	old_agent_service=false
+	old_agent_state=false
+	old_service_active=false
+	old_service_enabled=false
+	extract_container=
+
+	restore_agent_file() {
+		existed=$1
+		backup=$2
+		target=$3
+		if [ "$existed" = true ]; then
+			cp -p "$backup" "$target" || printf '警告：无法恢复 %s\n' "$target" >&2
+		else
+			rm -f "$target"
+		fi
+	}
+
+	finish_agent_install() {
+		exit_status=$1
+		trap - EXIT HUP INT TERM
+		if [ -n "$extract_container" ]; then
+			docker rm "$extract_container" >/dev/null 2>&1 || true
+		fi
+		if [ "$agent_rollback_armed" = true ] && [ "$agent_install_succeeded" != true ]; then
+			printf 'Agent 安装未完成，正在恢复原有安装与设备身份…\n' >&2
+			systemctl disable --now vaultmesh-agent >/dev/null 2>&1 || true
+			restore_agent_file "$old_agent_binary" "$agent_tmp/old-agent" /usr/local/bin/vaultmesh-agent
+			restore_agent_file "$old_agent_env" "$agent_tmp/old-agent.env" /etc/vaultmesh-agent.env
+			restore_agent_file "$old_agent_service" "$agent_tmp/old-agent.service" /etc/systemd/system/vaultmesh-agent.service
+			restore_agent_file "$old_agent_state" "$agent_tmp/old-state.json" /var/lib/vaultmesh-agent/state.json
+			systemctl daemon-reload >/dev/null 2>&1 || true
+			if [ "$old_service_enabled" = true ]; then
+				systemctl enable vaultmesh-agent >/dev/null 2>&1 || true
+			else
+				systemctl disable vaultmesh-agent >/dev/null 2>&1 || true
+			fi
+			if [ "$old_service_active" = true ]; then
+				systemctl start vaultmesh-agent >/dev/null 2>&1 || printf '警告：原 Agent 未能自动重启，请手动检查 systemctl status vaultmesh-agent\n' >&2
+			fi
+		fi
+		rm -rf "$agent_tmp"
+		exit "$exit_status"
+	}
+
+	trap 'finish_agent_install $?' EXIT
+	trap 'exit 1' HUP INT TERM
 
 	if [ "$asset_version" = "edge" ]; then
 		# Edge tracks main and contains unreleased features (e.g. detection).
 		# The binary is extracted from the prebuilt GHCR image.
+		require_command docker
 		image="ghcr.io/to-alan/vaultmesh/vaultmesh-agent:edge"
 		printf '从 edge 镜像提取 Agent（跟踪 main 分支）…\n'
 		docker pull "$image" || fail "拉取 $image 失败"
-		docker rm -f vaultmesh-agent-extract >/dev/null 2>&1 || true
-		docker create --name vaultmesh-agent-extract "$image" >/dev/null || fail "创建提取容器失败"
-		docker cp vaultmesh-agent-extract:/vaultmesh-agent /tmp/vaultmesh-agent || fail "提取二进制失败"
-		docker rm vaultmesh-agent-extract >/dev/null
+		extract_container=$(docker create "$image") || fail "创建提取容器失败"
+		docker cp "$extract_container:/vaultmesh-agent" "$agent_binary" || {
+			docker rm "$extract_container" >/dev/null 2>&1 || true
+			fail "提取二进制失败"
+		}
+		docker rm "$extract_container" >/dev/null || fail "清理提取容器失败"
+		extract_container=
+		source_ref=main
 	else
+		require_command sha256sum
 		asset_url="https://github.com/to-alan/VaultMesh/releases/download/${asset_version}/vaultmesh-agent-linux-${asset_arch}"
 		printf '下载 Agent %s（linux/%s）…\n' "$asset_version" "$asset_arch"
-		curl -fsSL --max-time 120 -o /tmp/vaultmesh-agent "$asset_url" || fail "下载失败：$asset_url"
-		curl -fsSL --max-time 30 -o /tmp/vaultmesh-agent.sha256 "${asset_url}.sha256" || true
-		if [ -f /tmp/vaultmesh-agent.sha256 ]; then
-			expected=$(cut -d' ' -f1 /tmp/vaultmesh-agent.sha256)
-			actual=$(sha256sum /tmp/vaultmesh-agent | cut -d' ' -f1)
-			[ "$expected" = "$actual" ] || fail "SHA256 校验不匹配"
-			printf 'SHA256 校验通过。\n'
-		fi
+		curl -fsSL --max-time 120 -o "$agent_binary" "$asset_url" || fail "下载失败：$asset_url"
+		curl -fsSL --max-time 30 -o "$agent_tmp/vaultmesh-agent.sha256" "${asset_url}.sha256" || fail "无法下载 Agent SHA256 校验文件"
+		expected=$(cut -d' ' -f1 "$agent_tmp/vaultmesh-agent.sha256")
+		actual=$(sha256sum "$agent_binary" | cut -d' ' -f1)
+		[ -n "$expected" ] && [ "$expected" = "$actual" ] || fail "SHA256 校验不匹配"
+		printf 'SHA256 校验通过。\n'
+		source_ref=$asset_version
 	fi
 
+	agent_env_url="$GITHUB_RAW_BASE/${source_ref}/deploy/systemd/vaultmesh-agent.env.example"
+	curl -fsSL --max-time 30 -o "$agent_tmp/vaultmesh-agent.env.example" "$agent_env_url" \
+		|| fail "下载 Agent 环境模板失败：$agent_env_url"
+	service_url="$GITHUB_RAW_BASE/${source_ref}/deploy/systemd/vaultmesh-agent.service"
+	curl -fsSL --max-time 30 -o "$agent_tmp/vaultmesh-agent.service" "$service_url" \
+		|| fail "下载 systemd unit 失败：$service_url"
+
 	printf '设置 systemd 服务…\n'
-	install -m 0755 /tmp/vaultmesh-agent /usr/local/bin/vaultmesh-agent
-	agent_env_url="$GITHUB_RAW_BASE/${asset_version}/deploy/systemd/vaultmesh-agent.env.example"
-	curl -fsSL --max-time 30 -o /tmp/vaultmesh-agent.env.example "$agent_env_url" \
-		|| curl -fsSL --max-time 30 -o /tmp/vaultmesh-agent.env.example "$GITHUB_RAW_BASE/main/deploy/systemd/vaultmesh-agent.env.example" \
-		|| printf '# VaultMesh Agent environment\nVAULTMESH_SERVER_URL=\n' > /tmp/vaultmesh-agent.env.example
-	install -m 0644 /tmp/vaultmesh-agent.env.example /etc/vaultmesh-agent.env
-	curl -fsSL --max-time 30 -o /etc/systemd/system/vaultmesh-agent.service "$GITHUB_RAW_BASE/main/deploy/systemd/vaultmesh-agent.service" \
-		|| fail "下载 systemd unit 失败"
+	if systemctl is-active --quiet vaultmesh-agent; then old_service_active=true; fi
+	if systemctl is-enabled --quiet vaultmesh-agent; then old_service_enabled=true; fi
+	if [ -f /usr/local/bin/vaultmesh-agent ]; then
+		cp -p /usr/local/bin/vaultmesh-agent "$agent_tmp/old-agent"
+		old_agent_binary=true
+	fi
+	if [ -f /etc/vaultmesh-agent.env ]; then
+		cp -p /etc/vaultmesh-agent.env "$agent_tmp/old-agent.env"
+		old_agent_env=true
+	fi
+	if [ -f /etc/systemd/system/vaultmesh-agent.service ]; then
+		cp -p /etc/systemd/system/vaultmesh-agent.service "$agent_tmp/old-agent.service"
+		old_agent_service=true
+	fi
+	if [ -f /var/lib/vaultmesh-agent/state.json ]; then
+		cp -p /var/lib/vaultmesh-agent/state.json "$agent_tmp/old-state.json"
+		old_agent_state=true
+	fi
+	agent_rollback_armed=true
+
+	install -m 0755 "$agent_binary" /usr/local/bin/vaultmesh-agent
+	install -m 0644 "$agent_tmp/vaultmesh-agent.env.example" /etc/vaultmesh-agent.env
+	install -m 0644 "$agent_tmp/vaultmesh-agent.service" /etc/systemd/system/vaultmesh-agent.service
 
 	# A state file from a previous enrollment binds the agent to another
 	# identity and makes the new token unusable; reset it automatically.
@@ -141,19 +210,20 @@ install_agent() {
 	# Stop any running instance and clear the previous device identity so the
 	# new enrollment token can bind cleanly.
 	systemctl disable --now vaultmesh-agent >/dev/null 2>&1 || true
-	rm -rf /var/lib/vaultmesh-agent/state.json
+	rm -f /var/lib/vaultmesh-agent/state.json
 	# Restore artifacts are user data from recovery tests and are preserved.
 
 	systemctl daemon-reload
 	systemctl enable --now vaultmesh-agent >/dev/null 2>&1 || systemctl restart vaultmesh-agent
 	sleep 3
-	if ! systemctl is-active --quiet vaultmesh-agent; then
+	if ! systemctl is-active --quiet vaultmesh-agent || ! grep -q '"identity"' /var/lib/vaultmesh-agent/state.json 2>/dev/null; then
 		journalctl -u vaultmesh-agent --no-pager -n 30 >&2 || true
 		fail "Agent 启动失败，请检查上方日志（常见原因：令牌过期或已使用、控制面地址不可达）"
 	fi
 
 	# Registration succeeded: the token is single-use and must not linger.
 	sed -i '/^VAULTMESH_ENROLLMENT_TOKEN=/d' /etc/vaultmesh-agent.env
+	agent_install_succeeded=true
 	printf '\nVaultMesh Agent 已安装并注册成功。\n'
 	printf '版本：%s\n' "$(vaultmesh-agent --version 2>/dev/null | head -1 || echo "$asset_version")"
 	printf '打开控制台，在该服务器下创建备份项目；或使用「探测可备份项」自动发现。\n'
@@ -192,6 +262,7 @@ detect_public_host() {
 # preserved and their location printed.
 uninstall_agent() {
 	[ "$(id -u)" -eq 0 ] || fail "请使用 root 运行"
+	require_command systemctl
 	printf '卸载 VaultMesh Agent…\n'
 	systemctl disable --now vaultmesh-agent >/dev/null 2>&1 || true
 	rm -f /etc/systemd/system/vaultmesh-agent.service
@@ -201,13 +272,15 @@ uninstall_agent() {
 	if [ -d /var/lib/vaultmesh-agent/restores ] && [ -n "$(ls -A /var/lib/vaultmesh-agent/restores 2>/dev/null)" ]; then
 		printf '恢复测试产物保留在 /var/lib/vaultmesh-agent/restores，确认后可手动删除。\n'
 	fi
-	rm -rf /var/lib/vaultmesh-agent
-	printf 'Agent 已卸载（设备身份已清除，控制台对应记录可归档）。\n'
+	rm -f /var/lib/vaultmesh-agent/state.json
+	rm -rf /var/lib/vaultmesh-agent/cache /var/lib/vaultmesh-agent/staging
+	rmdir /var/lib/vaultmesh-agent >/dev/null 2>&1 || true
+	printf 'Agent 已卸载（设备身份已清除；恢复测试产物如存在则仍保留）。\n'
 }
 
 if [ "${1:-}" = "install-agent" ]; then
-	[ $# -ge 3 ] || fail "用法：install-agent <server-url> <enroll-token> [名称]"
-	install_agent "$2" "$3" "${4:-}"
+	[ $# -ge 3 ] || fail "用法：install-agent <server-url> <enroll-token>"
+	install_agent "$2" "$3"
 	exit 0
 fi
 
@@ -222,6 +295,7 @@ fi
 # are preserved. Irreversible.
 if [ "${1:-}" = "purge-agents" ]; then
 	[ "$(id -u)" -eq 0 ] || fail "请使用 root 运行"
+	require_command docker
 	printf '!! 这将硬删除全部服务器记录及其项目、运行、快照索引、命令。\n'
 	printf '!! 仓库渠道、通知渠道、管理员账号保留。此操作不可恢复。\n'
 	printf '确认请输入 YES：'
@@ -234,6 +308,15 @@ if [ "${1:-}" = "purge-agents" ]; then
 	printf '各备份主机上请运行 uninstall-agent 清理设备身份后重新注册。\n'
 	exit 0
 fi
+
+case "$ADMIN_USERNAME" in
+	""|*[!A-Za-z0-9._-]*) fail "管理员用户名只能包含字母、数字、点、下划线和连字符" ;;
+esac
+
+require_command git
+require_command openssl
+require_command docker
+docker compose version >/dev/null 2>&1 || fail "需要 Docker Compose v2（docker compose）"
 
 PUBLIC_HOST=$(detect_public_host)
 PUBLIC_API_URL="http://${PUBLIC_HOST}:8080"

@@ -116,11 +116,13 @@ func (s *Store) Dashboard(ctx context.Context, since time.Time) (domain.Dashboar
 		  (SELECT COUNT(*) FROM servers WHERE archived_at IS NULL),
 		  (SELECT COUNT(*) FROM servers WHERE archived_at IS NULL AND last_seen_at >= NOW() - $2::interval),
 		  (SELECT COUNT(*) FROM projects WHERE archived_at IS NULL),
-		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $3),
-		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status IN ($4, $5, $6)),
-		  (SELECT COUNT(*) FROM runs WHERE started_at >= $1 AND COALESCE(stats->>'operation', 'backup') = 'backup' AND status = $7)`,
+		  COUNT(*) FILTER (WHERE status = $3),
+		  COUNT(*) FILTER (WHERE status IN ($4, $5, $6, $8)),
+		  COUNT(*) FILTER (WHERE status = $7)
+		FROM runs
+		WHERE started_at >= $1 AND COALESCE(NULLIF(stats->>'operation', ''), 'backup') = 'backup'`,
 		since, fmt.Sprintf("%d seconds", int64(domain.AgentOfflineAfter/time.Second)), domain.RunSucceeded, domain.RunFailed, domain.RunTimedOut,
-		domain.RunUnknown, domain.RunPartial).Scan(&dashboard.ServersTotal,
+		domain.RunUnknown, domain.RunPartial, domain.RunCanceled).Scan(&dashboard.ServersTotal,
 		&dashboard.ServersOnline, &dashboard.ProjectsTotal, &dashboard.RunsSucceeded,
 		&dashboard.RunsFailed, &dashboard.RunsPartial)
 	return dashboard, err

@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: read
   packages: write
 
 env:
@@ -34,7 +35,10 @@ jobs:
           build-args: |
             VERSION=edge-${{ github.sha }}
             COMMIT=${{ github.sha }}
-          tags: ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-control:edge
+          tags: |
+            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-control:edge
+            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-control:edge-${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build and push edge web image
@@ -43,7 +47,10 @@ jobs:
           context: .
           file: ./Dockerfile.web
           push: true
-          tags: ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-web:edge
+          tags: |
+            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-web:edge
+            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-web:edge-${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build and push edge agent image
@@ -55,6 +62,9 @@ jobs:
           build-args: |
             VERSION=edge-${{ github.sha }}
             COMMIT=${{ github.sha }}
-          tags: ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-agent:edge
+          tags: |
+            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-agent:edge
+            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-agent:edge-${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

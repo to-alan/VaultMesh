@@ -91,11 +91,11 @@ func (s *Service) EvaluateAlerts(ctx context.Context) error {
 		}
 		activityItem := activity[project.ID]
 		var failure *alertCondition
-		if isBackupFailureStatus(activityItem.LatestRunStatus) {
+		if isBackupFailureStatus(activityItem.LatestCompletedStatus) {
 			failure = &alertCondition{Kind: "backup_failure", ResourceType: "project", ResourceID: project.ID, ResourceName: projectNames[project.ID],
 				ProjectID: project.ID, ProjectName: projectNames[project.ID],
-				SourceEventID: activityItem.LatestRunID, Severity: backupFailureSeverity(activityItem.LatestRunStatus),
-				Summary: "备份运行未成功", Description: fmt.Sprintf("最近一次备份运行状态为 %s。", activityItem.LatestRunStatus)}
+				SourceEventID: activityItem.LatestCompletedRunID, Severity: backupFailureSeverity(activityItem.LatestCompletedStatus),
+				Summary: "备份运行未成功", Description: fmt.Sprintf("最近一次已结束的备份状态为 %s。", activityItem.LatestCompletedStatus)}
 		}
 		if err := s.reconcileAlert(ctx, "backup:"+project.ID, failure); err != nil {
 			return err

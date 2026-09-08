@@ -115,14 +115,15 @@ func (s *Store) ListProjectBackupActivity(ctx context.Context) ([]domain.Project
 	rows, err := s.pool.Query(ctx, `
 		SELECT project.id,
 		       COALESCE(latest.id, ''), COALESCE(latest.status, ''), latest.started_at,
-		       successful.finished_at
+		       successful.finished_at, active.started_at,
+		       COALESCE(completed.id, ''), COALESCE(completed.status, ''), completed.started_at
 		FROM projects AS project
 		LEFT JOIN LATERAL (
 			SELECT id, status, started_at
 			FROM runs
 			WHERE project_id = project.id
 			  AND COALESCE(NULLIF(stats->>'operation', ''), 'backup') = 'backup'
-			ORDER BY started_at DESC
+			ORDER BY started_at DESC, id DESC
 			LIMIT 1
 		) AS latest ON TRUE
 		LEFT JOIN LATERAL (
@@ -134,6 +135,22 @@ func (s *Store) ListProjectBackupActivity(ctx context.Context) ([]domain.Project
 			ORDER BY COALESCE(finished_at, started_at) DESC
 			LIMIT 1
 		) AS successful ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT started_at
+			FROM runs
+			WHERE project_id = project.id AND status = 'running'
+			  AND COALESCE(NULLIF(stats->>'operation', ''), 'backup') = 'backup'
+			ORDER BY started_at DESC, id DESC
+			LIMIT 1
+		) AS active ON TRUE
+		LEFT JOIN LATERAL (
+			SELECT id, status, started_at
+			FROM runs
+			WHERE project_id = project.id AND status NOT IN ('running', 'skipped')
+			  AND COALESCE(NULLIF(stats->>'operation', ''), 'backup') = 'backup'
+			ORDER BY started_at DESC, id DESC
+			LIMIT 1
+		) AS completed ON TRUE
 		ORDER BY project.id`)
 	if err != nil {
 		return nil, err
@@ -142,7 +159,8 @@ func (s *Store) ListProjectBackupActivity(ctx context.Context) ([]domain.Project
 	var result []domain.ProjectBackupActivity
 	for rows.Next() {
 		var item domain.ProjectBackupActivity
-		if err := rows.Scan(&item.ProjectID, &item.LatestRunID, &item.LatestRunStatus, &item.LatestRunAt, &item.LastSuccessfulAt); err != nil {
+		if err := rows.Scan(&item.ProjectID, &item.LatestRunID, &item.LatestRunStatus, &item.LatestRunAt, &item.LastSuccessfulAt, &item.ActiveRunAt,
+			&item.LatestCompletedRunID, &item.LatestCompletedStatus, &item.LatestCompletedRunAt); err != nil {
 			return nil, err
 		}
 		result = append(result, item)

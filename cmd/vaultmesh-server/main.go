@@ -69,7 +69,7 @@ func main() {
 		WebAuthnRPID:      config.WebAuthnRPID,
 		WebAuthnRPName:    config.WebAuthnRPName,
 		WebAuthnRPOrigins: config.WebAuthnRPOrigins,
-	}, config.AllowedOrigins)
+	}, config.AllowedOrigins, config.HTTPSReady)
 	if err != nil {
 		logger.Error("initialize administrator authentication", "error", err)
 		os.Exit(1)

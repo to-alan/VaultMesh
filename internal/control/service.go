@@ -27,6 +27,7 @@ const protectedSnapshotTag = "vaultmesh.protected=true"
 const defaultScheduleGrace = time.Hour
 
 var fullResticSnapshotID = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var agentSemanticVersion = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$`)
 
 type Service struct {
 	store              store.Store
@@ -386,8 +387,10 @@ func (s *Service) ProjectHealth(ctx context.Context) ([]domain.ProjectHealth, er
 		// A backup that started for this slot and is still inside its execution
 		// window is reported as running. Past the deadline the run report can no
 		// longer be trusted, so health escalates back to late/overdue.
-		running := now.Before(deadline) && item.LatestRunStatus == domain.RunRunning &&
-			item.LatestRunAt != nil && !item.LatestRunAt.Before(expected)
+		// A later skipped trigger must not hide the backup that is still running.
+		// Bound the active report by both its own runtime and this slot's deadline.
+		running := now.Before(deadline) && item.ActiveRunAt != nil && !item.ActiveRunAt.Before(expected) &&
+			now.Before(item.ActiveRunAt.Add(time.Duration(maxRuntimeSeconds+graceSeconds)*time.Second))
 		switch {
 		case now.Before(expected):
 			if item.LastSuccessfulAt == nil {
@@ -521,24 +524,41 @@ func (s *Service) reconcileConfigDegradation(ctx context.Context, serverID strin
 const detectMinimumVersion = "v0.1.2"
 
 func detectionWarningFor(agentVersion string) string {
-	version := strings.TrimPrefix(strings.TrimSpace(agentVersion), "v")
-	if version == "" || strings.HasPrefix(version, "edge") || version == "dev" {
+	version := strings.TrimSpace(agentVersion)
+	if supportsDetectionVersion(version) {
 		return ""
 	}
-	parts := strings.Split(version, ".")
-	if len(parts) != 3 {
-		return ""
+	if version == "" {
+		return fmt.Sprintf("Agent 未上报版本，无法确认探测能力（需要 %s 或 edge）。请先升级 Agent。", detectMinimumVersion)
 	}
-	major, err1 := strconv.Atoi(parts[0])
-	minor, err2 := strconv.Atoi(parts[1])
-	patch, err3 := strconv.Atoi(parts[2])
-	if err1 != nil || err2 != nil || err3 != nil {
-		return ""
+	return fmt.Sprintf("Agent 版本 %s 不支持探测命令或版本格式无法识别（需要 %s 或 edge）。请重新运行 install-agent 并设置 VAULTMESH_AGENT_VERSION=edge。", agentVersion, detectMinimumVersion)
+}
+
+func supportsDetectionVersion(agentVersion string) bool {
+	value := strings.TrimSpace(agentVersion)
+	channel := strings.ToLower(value)
+	if channel == "dev" || channel == "edge" || strings.HasPrefix(channel, "edge-") {
+		return true
 	}
-	if major == 0 && minor == 1 && patch < 2 {
-		return fmt.Sprintf("Agent 版本 %s 不支持探测命令（需要 %s 或 edge）。请重新运行 install-agent 并设置 VAULTMESH_AGENT_VERSION=edge。", agentVersion, detectMinimumVersion)
+	matches := agentSemanticVersion.FindStringSubmatch(value)
+	if matches == nil {
+		return false
 	}
-	return ""
+	numbers := [3]int{}
+	for index := range numbers {
+		number, err := strconv.Atoi(matches[index+1])
+		if err != nil || number < 0 {
+			return false
+		}
+		numbers[index] = number
+	}
+	minimum := [3]int{0, 1, 2}
+	for index := range numbers {
+		if numbers[index] != minimum[index] {
+			return numbers[index] > minimum[index]
+		}
+	}
+	return matches[4] == ""
 }
 
 // CreateDetectionCommand queues a read-only inventory scan on one server.
@@ -565,6 +585,9 @@ func (s *Service) CreateDetectionCommand(ctx context.Context, serverID string) (
 	if !found {
 		return domain.DetectionDispatch{}, store.ErrNotFound
 	}
+	if warning := detectionWarningFor(agentVersion); warning != "" {
+		return domain.DetectionDispatch{}, validationError("agent_version", warning)
+	}
 	id, err := randomValue("cmd", 10)
 	if err != nil {
 		return domain.DetectionDispatch{}, err
@@ -578,12 +601,15 @@ func (s *Service) CreateDetectionCommand(ctx context.Context, serverID string) (
 	if err != nil {
 		return domain.DetectionDispatch{}, err
 	}
-	return domain.DetectionDispatch{Command: command, Warning: detectionWarningFor(agentVersion)}, nil
+	return domain.DetectionDispatch{Command: command}, nil
 }
 
 func (s *Service) SaveDetectionReport(ctx context.Context, serverID, commandID string, report domain.DetectionReport) error {
 	serverID = strings.TrimSpace(serverID)
 	commandID = strings.TrimSpace(commandID)
+	if serverID == "" {
+		return validationError("server_id", "is required")
+	}
 	if commandID == "" {
 		return validationError("command_id", "is required")
 	}

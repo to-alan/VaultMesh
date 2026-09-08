@@ -4,7 +4,6 @@ import type {
   AuditEvent,
   Dashboard,
   DetectionDispatch,
-  DetectionReport,
   DetectionStatus,
   EnrollmentResult,
   NotificationChannel,
@@ -114,7 +113,7 @@ async function list<T>(path: string): Promise<T[]> {
 
 export const controlPlane = {
   meta: {
-    get: () => requestJSON<{ name: string; version: string; commit: string }>('/api/v1/meta'),
+    get: () => requestJSON<{ name: string; version: string; commit: string; https_ready: boolean }>('/api/v1/meta'),
   },
 
   auth: {

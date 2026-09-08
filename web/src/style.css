@@ -205,7 +205,7 @@ nav button.active .nav-index { color: var(--accent); }
 .recent-run-grid code { text-align: right; }
 
 .content-grid { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(310px, .7fr); gap: 10px; align-items: start; }
-.content-grid.projects-grid { grid-template-columns: minmax(360px, 1fr) minmax(440px, 1.08fr); }
+.content-grid.projects-grid { grid-template-columns: minmax(0, 1fr); }
 .form-panel { position: sticky; top: 18px; }
 .project-builder { position: static; }
 .form-intro { margin: 8px 0 0; color: var(--muted-light); font-size: 13px; line-height: 1.6; }
@@ -276,7 +276,7 @@ textarea { resize: vertical; line-height: 1.5; }
 .run-row strong, .data-card strong { font-size: 12px; }
 .run-row small, .data-card small { margin-top: 3px; color: var(--muted-light); font-size: 10px; }
 .status-pill { display: inline-flex; width: max-content; align-items: center; padding: 5px 8px; color: #acbbb4; border: 1px solid #3d5059; border-radius: 6px; font-size: 11px; white-space: nowrap; }
-.status-pill.online, .status-pill.succeeded { color: var(--accent); border-color: #285f45; background: #0c281c; }
+.status-pill.online, .status-pill.succeeded, .status-pill.healthy { color: var(--accent); border-color: #285f45; background: #0c281c; }
 .status-pill.pending, .status-pill.partial, .status-pill.running { color: var(--warning); border-color: #60512a; background: #251f0d; }
 .status-pill.offline, .status-pill.failed, .status-pill.timed_out, .status-pill.unknown { color: #ff9ca2; border-color: #60333a; background: #281419; }
 .status-pill.late { color: #f6c85f; border-color: #665327; background: #261f0c; }
@@ -329,6 +329,7 @@ tbody tr:hover { background: rgba(93, 240, 168, .025); }
 .enrollment-card { display: grid; gap: 12px; margin-top: 10px; border-color: #315d4b; }
 .enrollment-card code { display: block; padding: 13px; color: #d4fbea; border: 1px solid #2b4d40; border-radius: 7px; background: #050c09; user-select: all; }
 .enrollment-card p { margin: 0; color: var(--muted-light); font-size: 11px; }
+.enrollment-card .enrollment-warning { grid-column: 1 / -1; color: #c1a968; line-height: 1.6; }
 .enrollment-card .ghost { justify-self: start; }
 .data-card { grid-template-columns: minmax(140px, .4fr) minmax(0, 1fr); }
 .project-card { padding: 14px; border: 1px solid #1c2a32; border-radius: 8px; background: #090f14; }
@@ -647,6 +648,51 @@ button.file-name.directory:hover { text-decoration: underline; }
 .alert-history-panel table, .delivery-history-panel table { min-width: 900px; }
 .notification-description { max-width: 420px; color: #8fa199; line-height: 1.5; }
 
+.sidebar-footer { flex-wrap: wrap; }
+.sidebar-footer .app-version { flex: 1 1 100%; min-width: 0; overflow: hidden; color: #5c6f78; font-size: 11px; text-overflow: ellipsis; user-select: text; white-space: nowrap; margin-bottom: 2px; }
+.sidebar-footer .app-version strong { color: #6d8189; font-weight: 600; }
+.projects-left { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.projects-left .content-grid { display: block; }
+.projects-left .content-grid > .panel { margin: 0 0 10px; }
+.projects-left .projects-list-panel { margin: 0 0 10px; }
+.detection-wizard { min-width: 0; }
+
+.system-pulse.stale { background: var(--warning); box-shadow: none; }
+.metric-grid.overview-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.overview-metrics .metric { min-width: 0; gap: 20px; }
+.overview-metrics .metric footer { flex-wrap: wrap; line-height: 1.6; }
+.setup-guide { margin-bottom: 14px; }
+.overview-charts { margin-top: 14px; }
+.overview-legend { flex-wrap: wrap; gap: 8px 16px; margin: 16px 0; font-size: 12px; }
+.overview-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.overview-legend span::before { display: none; }
+.overview-legend i { width: 7px; height: 7px; border-radius: 2px; }
+.sample-rate { display: grid; gap: 8px; margin: 22px 0; }
+.sample-rate strong { font-size: 36px; }
+.sample-rate span { color: var(--muted-light); font-size: 12px; }
+.overview-charts .distribution-list > div { grid-template-columns: 6px minmax(0, 1fr) auto; }
+.next-backup-summary { display: grid; gap: 8px; padding-top: 16px; margin-top: 20px; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.next-backup-summary small, .next-backup-summary span { color: var(--muted-light); font-size: 12px; }
+.project-workspace-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.project-workspace-heading h2 { margin: 0; }
+.project-workspace-heading p { margin-bottom: 0; }
+.project-workspace-heading > button { flex-shrink: 0; }
+.detection-toolbar .data-toolbar select { flex: 1; min-width: 0; }
+.detection-toolbar .data-toolbar button { flex-shrink: 0; white-space: nowrap; }
+.projects-right { width: min(100%, 1000px); margin: 0 auto; }
+.project-builder fieldset { display: grid; gap: 14px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.duration-input { display: grid; gap: 7px; min-width: 0; }
+.duration-fields { display: grid; grid-template-columns: minmax(0, 1fr) 85px; gap: 8px; }
+.project-details { margin-top: 12px; border-top: 1px solid var(--border); }
+.project-details summary { padding: 14px 0; cursor: pointer; color: var(--muted-light); font-size: 13px; }
+.project-details summary span { float: right; color: var(--muted); }
+.project-secondary-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
+.project-secondary-actions .danger-text { margin-left: auto; }
+.rpo-strip strong { font-size: 13px; }
+.rpo-strip > span:last-child { font-size: 12px; white-space: normal; }
+.health-panel .table-wrap td { min-width: 155px; }
+summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 @media (max-width: 1450px) {
   .metric-grid { grid-template-columns: repeat(3, 1fr); }
   .audit-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -655,8 +701,11 @@ button.file-name.directory:hover { text-decoration: underline; }
 }
 
 @media (max-width: 1120px) {
+  .metric-grid.overview-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .primary-dashboard, .secondary-dashboard { grid-template-columns: 1fr; }
   .content-grid, .content-grid.projects-grid { grid-template-columns: 1fr; }
+  .projects-left { position: static; top: auto; max-height: none; align-self: stretch; overflow-y: visible; }
+  .detection-wizard { position: static; top: auto; max-height: none; align-self: stretch; overflow-y: visible; }
   .guide-steps { grid-template-columns: 1fr; }
   .form-panel { position: static; }
   .snapshot-workspace { grid-template-columns: 1fr; }
@@ -671,15 +720,18 @@ button.file-name.directory:hover { text-decoration: underline; }
 }
 
 @media (max-width: 780px) {
+  .project-workspace-heading, .project-top { flex-wrap: wrap; }
+  .project-top > div:first-child { min-width: 0; overflow-wrap: anywhere; }
   .app-shell { display: block; }
   .sidebar { position: static; width: 100%; height: auto; padding: 13px; border-right: 0; border-bottom: 1px solid var(--border); }
   .brand-row { padding-bottom: 12px; }
   .nav-caption, .sidebar-system { display: none; }
   nav { display: flex; overflow-x: auto; }
-  nav button { flex: 0 0 auto; grid-template-columns: 22px auto; }
+  nav button { flex: 0 0 auto; min-width: 112px; grid-template-columns: 22px auto; white-space: nowrap; }
   .nav-badge { display: none; }
   .sidebar-footer { position: absolute; top: 17px; right: 12px; }
   .sidebar-footer .ghost:first-child { display: none; }
+  .sidebar-footer .app-version { display: none; }
   .workspace { padding: 19px 13px 40px; }
   .topbar { align-items: flex-start; gap: 14px; }
   .scope-pill { display: none; }
@@ -711,16 +763,21 @@ button.file-name.directory:hover { text-decoration: underline; }
   .data-toolbar { align-items: stretch; flex-wrap: wrap; }
   .data-toolbar label, .data-toolbar .search-field { min-width: calc(50% - 4px); flex: 1; }
   .data-toolbar > strong { min-width: 100%; padding: 2px 0 0; text-align: left; }
+  .detection-wizard .detection-group .check-row strong,
+  .detection-wizard .detection-group .check-row small { overflow-wrap: anywhere; white-space: normal; }
 }
 
 @media (max-width: 520px) {
+  .metric-grid.overview-metrics { grid-template-columns: 1fr; }
+  .rpo-strip { grid-template-columns: 8px minmax(0, 1fr); }
+  .rpo-strip > span:last-child { grid-column: 2; text-align: left; }
   .login-card { padding: 30px 23px; }
   .metric-grid, .form-row, .dynamic-fields { grid-template-columns: 1fr; }
   .topbar { display: block; }
   .topbar-status { margin-top: 11px; }
   .overview-strip { align-items: flex-start; }
-  .overview-strip > div { display: grid; grid-template-columns: 6px 1fr; }
-  .overview-strip small { grid-column: 2; }
+  .overview-strip > div { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .overview-strip small { grid-column: 1; }
   .overview-strip > span { display: none; }
   .chart-plot { gap: 5px; }
   .donut-layout { grid-template-columns: 110px minmax(0, 1fr); gap: 12px; }
@@ -748,19 +805,10 @@ button.file-name.directory:hover { text-decoration: underline; }
   .project-routing > div { grid-template-columns: 1fr; }
   .run-kpi-grid button { min-height: 88px; }
   .data-toolbar label, .data-toolbar .search-field { min-width: 100%; }
+  .panel { padding: 16px; }
+  .panel-heading { align-items: flex-start; flex-wrap: wrap; gap: 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
-
-.sidebar-footer { flex-wrap: wrap; }
-.sidebar-footer .app-version { flex: 1 1 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5c6f78; font-size: 11px; user-select: text; margin-bottom: 2px; }
-.sidebar-footer .app-version strong { color: #6d8189; font-weight: 600; }
-.projects-left { display: flex; flex-direction: column; gap: 10px; min-width: 0; position: sticky; top: 18px; align-self: start; max-height: calc(100vh - 36px); overflow-y: auto; }
-
-.projects-left .content-grid { display: block; }
-.projects-left .content-grid > .panel { margin: 0 0 10px; }
-.detection-wizard { position: sticky; top: 18px; align-self: start; max-height: calc(100vh - 36px); overflow-y: auto; }
-
-.projects-left .projects-list-panel { margin: 0 0 10px; }

@@ -63,6 +63,15 @@ export function formatCountdown(milliseconds: number): string {
   return days ? `${days}天 ${clock}` : clock
 }
 
+export function formatTimeBudget(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '—'
+  const total = Math.round(seconds)
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor(total % 3600 / 60)
+  const rest = total % 60
+  return [hours ? `${hours} 小时` : '', minutes ? `${minutes} 分钟` : '', rest || !total ? `${rest} 秒` : ''].filter(Boolean).join(' ')
+}
+
 export function projectHealthLabel(health?: ProjectHealth): string {
   const labels: Record<string, string> = {
     healthy: 'RPO 正常',

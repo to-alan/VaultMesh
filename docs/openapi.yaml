@@ -2,6 +2,9 @@ openapi: 3.1.0
 info:
   title: VaultMesh Control Plane API
   version: 1.0.0
+  license:
+    name: MIT
+    identifier: MIT
   summary: Versioned JSON API for VaultMesh frontends and Agents
   description: |
     The Control Plane is independent from the Web application and never serves frontend assets.
@@ -14,17 +17,29 @@ servers:
     description: Local development
 tags:
   - name: System
+    description: Health and build metadata endpoints.
   - name: Authentication
+    description: Administrator session and multi-factor login flows.
   - name: Profile
+    description: Administrator credentials and security settings.
   - name: Dashboard
+    description: Aggregated operational status.
   - name: Servers
+    description: Agent enrollment and server inventory management.
   - name: Repositories
+    description: Encrypted backup repository configuration.
   - name: Projects
+    description: Backup sources, schedules, and retention policies.
   - name: Snapshots
+    description: Snapshot inventory, browsing, protection, and restore operations.
   - name: Runs
+    description: Backup and maintenance execution history.
   - name: Notifications
+    description: Alert incidents, channels, and delivery history.
   - name: Audit
+    description: Append-only administrator audit history.
   - name: Agent
+    description: Authenticated Agent control-plane protocol.
 security:
   - cookieAuth: []
 paths:
@@ -32,6 +47,7 @@ paths:
     get:
       tags: [System]
       operationId: health
+      summary: Check control-plane health
       security: []
       responses:
         '200':
@@ -48,6 +64,7 @@ paths:
     get:
       tags: [System]
       operationId: getMeta
+      summary: Get control-plane build metadata
       security: []
       responses:
         '200':
@@ -59,6 +76,7 @@ paths:
     post:
       tags: [Authentication]
       operationId: login
+      summary: Start an administrator session
       security: []
       requestBody:
         required: true
@@ -90,6 +108,7 @@ paths:
     post:
       tags: [Authentication]
       operationId: completeTOTPLogin
+      summary: Complete login with a TOTP code
       security: []
       requestBody:
         required: true
@@ -108,6 +127,7 @@ paths:
     post:
       tags: [Authentication]
       operationId: beginPasskeyLogin
+      summary: Begin passkey authentication
       security: []
       responses:
         '200': { $ref: '#/components/responses/WebAuthnOptions' }
@@ -117,6 +137,7 @@ paths:
     post:
       tags: [Authentication]
       operationId: finishPasskeyLogin
+      summary: Complete passkey authentication
       security: []
       requestBody:
         required: true
@@ -134,6 +155,7 @@ paths:
     get:
       tags: [Authentication]
       operationId: getSession
+      summary: Get the current administrator session
       responses:
         '200':
           description: Active administrator session
@@ -145,6 +167,7 @@ paths:
     post:
       tags: [Authentication]
       operationId: logout
+      summary: End the current administrator session
       security: []
       responses:
         '204': { $ref: '#/components/responses/NoContent' }
@@ -152,6 +175,7 @@ paths:
     get:
       tags: [Profile]
       operationId: getProfile
+      summary: Get the administrator security profile
       responses:
         '200':
           description: Public administrator security profile
@@ -163,6 +187,7 @@ paths:
     post:
       tags: [Profile]
       operationId: reauthenticate
+      summary: Confirm an administrator security action
       requestBody:
         required: true
         content:
@@ -176,6 +201,7 @@ paths:
     post:
       tags: [Profile]
       operationId: changePassword
+      summary: Change the administrator password
       requestBody:
         required: true
         content:
@@ -196,6 +222,7 @@ paths:
     post:
       tags: [Profile]
       operationId: beginTOTPSetup
+      summary: Begin TOTP enrollment
       requestBody:
         required: true
         content:
@@ -218,6 +245,7 @@ paths:
     post:
       tags: [Profile]
       operationId: enableTOTP
+      summary: Enable TOTP authentication
       requestBody:
         required: true
         content:
@@ -231,6 +259,7 @@ paths:
     post:
       tags: [Profile]
       operationId: disableTOTP
+      summary: Disable TOTP authentication
       requestBody:
         required: true
         content:
@@ -243,6 +272,7 @@ paths:
     post:
       tags: [Profile]
       operationId: regenerateRecoveryCodes
+      summary: Regenerate recovery codes
       requestBody:
         required: true
         content:
@@ -255,6 +285,7 @@ paths:
     post:
       tags: [Profile]
       operationId: beginPasskeyRegistration
+      summary: Begin passkey registration
       requestBody:
         required: true
         content:
@@ -273,6 +304,7 @@ paths:
     post:
       tags: [Profile]
       operationId: finishPasskeyRegistration
+      summary: Complete passkey registration
       requestBody:
         required: true
         content:
@@ -292,6 +324,7 @@ paths:
     post:
       tags: [Profile]
       operationId: deletePasskey
+      summary: Delete an administrator passkey
       responses:
         '204': { $ref: '#/components/responses/NoContent' }
         '404': { $ref: '#/components/responses/Error' }
@@ -300,6 +333,7 @@ paths:
     get:
       tags: [Dashboard]
       operationId: getDashboard
+      summary: Get dashboard metrics
       responses:
         '200':
           description: Last-24-hours dashboard summary
@@ -311,11 +345,14 @@ paths:
     get:
       tags: [Servers]
       operationId: listServers
+      summary: List enrolled servers
       responses:
         '200': { $ref: '#/components/responses/ServerList' }
+        '401': { $ref: '#/components/responses/Error' }
     post:
       tags: [Servers]
       operationId: createServer
+      summary: Create a server enrollment
       requestBody:
         required: true
         content:
@@ -337,11 +374,14 @@ paths:
     get:
       tags: [Repositories]
       operationId: listRepositories
+      summary: List backup repositories
       responses:
         '200': { $ref: '#/components/responses/RepositoryList' }
+        '401': { $ref: '#/components/responses/Error' }
     post:
       tags: [Repositories]
       operationId: createRepository
+      summary: Create a backup repository
       requestBody:
         required: true
         content:
@@ -358,11 +398,14 @@ paths:
     get:
       tags: [Projects]
       operationId: listProjects
+      summary: List backup projects
       responses:
         '200': { $ref: '#/components/responses/ProjectList' }
+        '401': { $ref: '#/components/responses/Error' }
     post:
       tags: [Projects]
       operationId: createProject
+      summary: Create a backup project
       requestBody:
         required: true
         content:
@@ -379,6 +422,7 @@ paths:
     post:
       tags: [Servers]
       operationId: detectServerBackups
+      summary: Start a server inventory scan
       description: |
         Queues a read-only detection scan on one agent: running containers,
         database signals (ports, dump tools), and application directories
@@ -390,7 +434,7 @@ paths:
           schema: { type: string }
       responses:
         '202':
-          description: Detection command queued for the agent; warning is present when the installed agent predates the detect command
+          description: Detection command queued for a compatible agent
           content:
             application/json:
               schema:
@@ -400,11 +444,13 @@ paths:
                   command: { $ref: '#/components/schemas/Command' }
                   warning: { type: string }
         '404': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
         '422': { $ref: '#/components/responses/Error' }
   /api/v1/servers/{serverID}/detection:
     get:
       tags: [Servers]
       operationId: getServerDetection
+      summary: Get the latest server inventory scan
       parameters:
         - name: serverID
           in: path
@@ -434,6 +480,16 @@ paths:
                             image: { type: string }
                             running: { type: boolean }
                             ports: { type: array, items: { type: string } }
+                            port_bindings:
+                              type: array
+                              items:
+                                type: object
+                                required: [container_port, protocol, host_ip, host_port]
+                                properties:
+                                  container_port: { type: integer, minimum: 1, maximum: 65535 }
+                                  protocol: { type: string }
+                                  host_ip: { type: string }
+                                  host_port: { type: integer, minimum: 1, maximum: 65535 }
                             mounts: { type: array, items: { type: string } }
                       databases:
                         type: array
@@ -464,11 +520,13 @@ paths:
     put:
       tags: [Agent]
       operationId: reportAgentDetection
+      summary: Report a server inventory scan
       security: [{ agentBearer: [] }]
       description: |
         Delivers the read-only detection inventory for the authenticated
-        server; the originating detect command is closed in the same
-        transaction.
+        server. The command must be a server-scoped detect command belonging
+        to that Agent. It is closed in the same transaction, and a delayed
+        older report cannot replace a report from a newer command.
       requestBody:
         required: true
         content:
@@ -483,10 +541,14 @@ paths:
         '204': { $ref: '#/components/responses/NoContent' }
         '400': { $ref: '#/components/responses/Error' }
         '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
   /api/v1/servers/{serverID}:
     delete:
       tags: [Servers]
       operationId: archiveServer
+      summary: Archive a server
       description: |
         Archives a server that has no active backup projects. The server
         disappears from the console, its agent credentials are revoked, and
@@ -504,6 +566,7 @@ paths:
     delete:
       tags: [Repositories]
       operationId: archiveRepository
+      summary: Archive a backup repository
       description: |
         Archives a storage channel that is no longer referenced by any active
         project. Repositories still used by active projects are rejected to
@@ -523,6 +586,7 @@ paths:
     delete:
       tags: [Projects]
       operationId: archiveProject
+      summary: Archive a backup project
       description: |
         Archives a project. Scheduling stops and the agent configuration no
         longer includes it, while run history and the snapshot index keep
@@ -534,6 +598,7 @@ paths:
     put:
       tags: [Projects]
       operationId: replaceProject
+      summary: Replace a backup project configuration
       description: Database passwords may be empty only when preserving an existing source with the same ID and type.
       requestBody:
         required: true
@@ -551,6 +616,7 @@ paths:
     patch:
       tags: [Projects]
       operationId: setProjectEnabled
+      summary: Enable or pause a backup project
       requestBody:
         required: true
         content:
@@ -572,6 +638,7 @@ paths:
     get:
       tags: [Projects]
       operationId: listProjectHealth
+      summary: List backup project health
       responses:
         '200':
           description: RPO health for all projects
@@ -584,14 +651,17 @@ paths:
                   items:
                     type: array
                     items: { $ref: '#/components/schemas/ProjectHealth' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/projects/{projectID}/run:
     parameters:
       - $ref: '#/components/parameters/ProjectID'
     post:
       tags: [Projects]
       operationId: runProject
+      summary: Queue a manual backup
       responses:
         '202': { $ref: '#/components/responses/CommandAccepted' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
   /api/v1/projects/{projectID}/retention-preview:
@@ -600,8 +670,10 @@ paths:
     post:
       tags: [Projects]
       operationId: previewRetention
+      summary: Preview a retention policy
       responses:
         '202': { $ref: '#/components/responses/CommandAccepted' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/projects/{projectID}/snapshots/refresh:
     parameters:
@@ -609,8 +681,10 @@ paths:
     post:
       tags: [Snapshots]
       operationId: refreshSnapshots
+      summary: Refresh a project's snapshot inventory
       responses:
         '202': { $ref: '#/components/responses/CommandAccepted' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/projects/{projectID}/snapshots/{snapshotID}/protect:
     parameters:
@@ -619,6 +693,7 @@ paths:
     post:
       tags: [Snapshots]
       operationId: protectSnapshot
+      summary: Change snapshot protection
       requestBody:
         required: true
         content:
@@ -631,6 +706,7 @@ paths:
                 protected: { type: boolean }
       responses:
         '202': { $ref: '#/components/responses/CommandAccepted' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/projects/{projectID}/snapshots/{snapshotID}/browse:
     parameters:
@@ -639,6 +715,7 @@ paths:
     post:
       tags: [Snapshots]
       operationId: browseSnapshot
+      summary: Browse a snapshot directory
       requestBody:
         required: true
         content:
@@ -646,6 +723,7 @@ paths:
             schema: { $ref: '#/components/schemas/SnapshotPath' }
       responses:
         '202': { $ref: '#/components/responses/CommandAccepted' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/projects/{projectID}/snapshots/{snapshotID}/restore:
     parameters:
@@ -654,6 +732,7 @@ paths:
     post:
       tags: [Snapshots]
       operationId: restoreSnapshot
+      summary: Restore a path from a snapshot
       requestBody:
         required: true
         content:
@@ -661,11 +740,13 @@ paths:
             schema: { $ref: '#/components/schemas/SnapshotPath' }
       responses:
         '202': { $ref: '#/components/responses/CommandAccepted' }
+        '403': { $ref: '#/components/responses/Error' }
         '404': { $ref: '#/components/responses/Error' }
   /api/v1/snapshots:
     get:
       tags: [Snapshots]
       operationId: listSnapshots
+      summary: List cached snapshots
       parameters:
         - $ref: '#/components/parameters/Limit'
         - name: project_id
@@ -683,10 +764,12 @@ paths:
                   items:
                     type: array
                     items: { $ref: '#/components/schemas/Snapshot' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/runs:
     get:
       tags: [Runs]
       operationId: listRuns
+      summary: List backup and maintenance runs
       parameters:
         - $ref: '#/components/parameters/Limit'
       responses:
@@ -701,10 +784,12 @@ paths:
                   items:
                     type: array
                     items: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/audit-events:
     get:
       tags: [Audit]
       operationId: listAuditEvents
+      summary: List administrator audit events
       parameters:
         - $ref: '#/components/parameters/Limit'
       responses:
@@ -719,15 +804,19 @@ paths:
                   items:
                     type: array
                     items: { $ref: '#/components/schemas/AuditEvent' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/notification-channels:
     get:
       tags: [Notifications]
       operationId: listNotificationChannels
+      summary: List notification channels
       responses:
         '200': { $ref: '#/components/responses/NotificationChannelList' }
+        '401': { $ref: '#/components/responses/Error' }
     post:
       tags: [Notifications]
       operationId: createNotificationChannel
+      summary: Create a notification channel
       requestBody:
         required: true
         content:
@@ -746,6 +835,7 @@ paths:
     put:
       tags: [Notifications]
       operationId: replaceNotificationChannel
+      summary: Replace a notification channel
       requestBody:
         required: true
         content:
@@ -762,6 +852,7 @@ paths:
     patch:
       tags: [Notifications]
       operationId: setNotificationChannelEnabled
+      summary: Enable or disable a notification channel
       requestBody:
         required: true
         content:
@@ -782,6 +873,7 @@ paths:
     delete:
       tags: [Notifications]
       operationId: archiveNotificationChannel
+      summary: Archive a notification channel
       responses:
         '204': { $ref: '#/components/responses/NoContent' }
         '404': { $ref: '#/components/responses/Error' }
@@ -791,6 +883,7 @@ paths:
     post:
       tags: [Notifications]
       operationId: testNotificationChannel
+      summary: Send a notification channel test
       responses:
         '204': { $ref: '#/components/responses/NoContent' }
         '404': { $ref: '#/components/responses/Error' }
@@ -799,6 +892,7 @@ paths:
     get:
       tags: [Notifications]
       operationId: listAlertIncidents
+      summary: List alert incidents
       parameters:
         - $ref: '#/components/parameters/Limit'
       responses:
@@ -813,10 +907,12 @@ paths:
                   items:
                     type: array
                     items: { $ref: '#/components/schemas/AlertIncident' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/notification-deliveries:
     get:
       tags: [Notifications]
       operationId: listNotificationDeliveries
+      summary: List notification deliveries
       parameters:
         - $ref: '#/components/parameters/Limit'
       responses:
@@ -831,17 +927,21 @@ paths:
                   items:
                     type: array
                     items: { $ref: '#/components/schemas/NotificationDelivery' }
+        '401': { $ref: '#/components/responses/Error' }
   /api/v1/alerts/evaluate:
     post:
       tags: [Notifications]
       operationId: evaluateAlerts
+      summary: Evaluate current alert conditions
       responses:
         '204': { $ref: '#/components/responses/NoContent' }
+        '401': { $ref: '#/components/responses/Error' }
         '500': { $ref: '#/components/responses/Error' }
   /api/v1/enroll:
     post:
       tags: [Agent]
       operationId: enrollAgent
+      summary: Enroll an Agent
       security: []
       requestBody:
         required: true
@@ -859,6 +959,7 @@ paths:
     post:
       tags: [Agent]
       operationId: agentHeartbeat
+      summary: Report an Agent heartbeat
       security: [{ agentBearer: [] }]
       description: |
         Merged sync request: records the heartbeat and returns the full
@@ -888,6 +989,7 @@ paths:
     get:
       tags: [Agent]
       operationId: getAgentConfig
+      summary: Get the desired Agent configuration
       security: [{ agentBearer: [] }]
       parameters:
         - name: after
@@ -905,6 +1007,7 @@ paths:
     get:
       tags: [Agent]
       operationId: listAgentCommands
+      summary: Lease pending Agent commands
       security: [{ agentBearer: [] }]
       responses:
         '200':
@@ -923,6 +1026,7 @@ paths:
     post:
       tags: [Agent]
       operationId: reportAgentRun
+      summary: Report an Agent run
       security: [{ agentBearer: [] }]
       requestBody:
         required: true
@@ -947,6 +1051,7 @@ paths:
     put:
       tags: [Agent]
       operationId: reportAgentSnapshots
+      summary: Replace a project's snapshot inventory
       security: [{ agentBearer: [] }]
       description: |
         Replaces the cached snapshot index for one project. Inventories are
@@ -1111,11 +1216,12 @@ components:
             details: {}
     Meta:
       type: object
-      required: [name, version, commit]
+      required: [name, version, commit, https_ready]
       properties:
         name: { type: string, const: VaultMesh }
         version: { type: string }
         commit: { type: string }
+        https_ready: { type: boolean }
     LoginRequest:
       type: object
       additionalProperties: false
@@ -1175,6 +1281,7 @@ components:
       description: Serialized PublicKeyCredential using Base64URL strings for binary values.
     Dashboard:
       type: object
+      description: Backup-only counts for runs started in the last 24 hours. Maintenance, inventory and recovery operations are excluded; runs_failed includes failed, timed_out, unknown and canceled runs. Running and skipped runs are not completed attempts.
       required: [servers_total, servers_online, projects_total, runs_succeeded, runs_failed, runs_partial, projects_late, projects_overdue]
       properties:
         servers_total: { type: integer, minimum: 0 }

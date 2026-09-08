@@ -1,0 +1,14 @@
+# IP-only test deployment with a self-signed certificate, not a production CA.
+# Requires Docker Compose 2.24.4+ for !override. Paths resolve from compose.yaml.
+# Set COMPOSE_FILE=compose.yaml:deploy/compose.ip-test.yaml in .env and configure
+# PUBLIC_API_URL, ALLOWED_ORIGINS and COOKIE_SECURE for the HTTPS test origin.
+services:
+  control:
+    ports: !override
+      - "127.0.0.1:${VAULTMESH_API_PORT:-8080}:8080"
+  web:
+    ports: !override
+      - "0.0.0.0:${VAULTMESH_WEB_PORT:-3000}:443"
+    volumes:
+      - ./deploy/nginx/ip-test.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${VAULTMESH_TEST_TLS_DIR:-/etc/vaultmesh/test-tls}:/etc/nginx/test-tls:ro

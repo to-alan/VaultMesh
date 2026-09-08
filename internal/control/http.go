@@ -20,9 +20,10 @@ type HTTPServer struct {
 	secondFactors  *authAttemptLimiter
 	auditFailures  *auditFailureSampler
 	allowedOrigins map[string]struct{}
+	httpsReady     bool
 }
 
-func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthConfig, allowedOrigins []string) (*HTTPServer, error) {
+func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthConfig, allowedOrigins []string, httpsReady bool) (*HTTPServer, error) {
 	adminAuth, err := newAdminAuthenticator(context.Background(), service, adminConfig)
 	if err != nil {
 		return nil, err
@@ -39,6 +40,7 @@ func NewHTTPServer(service *Service, logger *slog.Logger, adminConfig AdminAuthC
 		secondFactors:  newAuthAttemptLimiter(),
 		auditFailures:  newAuditFailureSampler(),
 		allowedOrigins: origins,
+		httpsReady:     httpsReady,
 	}, nil
 }
 
@@ -67,7 +69,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("GET /api/v1/dashboard", s.admin(http.HandlerFunc(s.dashboard)))
 	mux.Handle("GET /api/v1/servers", s.admin(http.HandlerFunc(s.listServers)))
 	mux.Handle("POST /api/v1/servers", s.admin(http.HandlerFunc(s.createServer)))
-	mux.Handle("POST /api/v1/servers/{serverID}/detect", s.admin(http.HandlerFunc(s.createDetection)))
+	mux.Handle("POST /api/v1/servers/{serverID}/detect", s.admin(s.agentWorkGate(http.HandlerFunc(s.createDetection))))
 	mux.Handle("GET /api/v1/servers/{serverID}/detection", s.admin(http.HandlerFunc(s.getDetection)))
 	mux.Handle("DELETE /api/v1/servers/{serverID}", s.admin(http.HandlerFunc(s.archiveServer)))
 	mux.Handle("GET /api/v1/repositories", s.admin(http.HandlerFunc(s.listRepositories)))
@@ -79,12 +81,12 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.Handle("PATCH /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.updateProject)))
 	mux.Handle("DELETE /api/v1/projects/{projectID}", s.admin(http.HandlerFunc(s.archiveProject)))
 	mux.Handle("GET /api/v1/project-health", s.admin(http.HandlerFunc(s.listProjectHealth)))
-	mux.Handle("POST /api/v1/projects/{projectID}/run", s.admin(http.HandlerFunc(s.createManualRun)))
-	mux.Handle("POST /api/v1/projects/{projectID}/retention-preview", s.admin(http.HandlerFunc(s.createRetentionPreview)))
-	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/refresh", s.admin(http.HandlerFunc(s.refreshSnapshots)))
-	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/protect", s.admin(http.HandlerFunc(s.protectSnapshot)))
-	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/browse", s.admin(http.HandlerFunc(s.browseSnapshot)))
-	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/restore", s.admin(http.HandlerFunc(s.restoreSnapshot)))
+	mux.Handle("POST /api/v1/projects/{projectID}/run", s.admin(s.agentWorkGate(http.HandlerFunc(s.createManualRun))))
+	mux.Handle("POST /api/v1/projects/{projectID}/retention-preview", s.admin(s.agentWorkGate(http.HandlerFunc(s.createRetentionPreview))))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/refresh", s.admin(s.agentWorkGate(http.HandlerFunc(s.refreshSnapshots))))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/protect", s.admin(s.agentWorkGate(http.HandlerFunc(s.protectSnapshot))))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/browse", s.admin(s.agentWorkGate(http.HandlerFunc(s.browseSnapshot))))
+	mux.Handle("POST /api/v1/projects/{projectID}/snapshots/{snapshotID}/restore", s.admin(s.agentWorkGate(http.HandlerFunc(s.restoreSnapshot))))
 	mux.Handle("GET /api/v1/snapshots", s.admin(http.HandlerFunc(s.listSnapshots)))
 	mux.Handle("GET /api/v1/runs", s.admin(http.HandlerFunc(s.listRuns)))
 	mux.Handle("GET /api/v1/audit-events", s.admin(http.HandlerFunc(s.listAuditEvents)))
@@ -120,10 +122,26 @@ func (s *HTTPServer) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) meta(w http.ResponseWriter, _ *http.Request) {
-	s.writeJSON(w, http.StatusOK, map[string]string{
-		"name":    "VaultMesh",
-		"version": version.Version,
-		"commit":  version.Commit,
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"name":        "VaultMesh",
+		"version":     version.Version,
+		"commit":      version.Commit,
+		"https_ready": s.httpsReady,
+	})
+}
+
+// agentWorkGate keeps every management action that queues Agent work or
+// reads repository contents disabled until HTTPS is explicitly configured.
+// Read-only management endpoints and Agent-originated HTTPS/loopback traffic
+// remain available while an operator finishes TLS setup.
+func (s *HTTPServer) agentWorkGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.httpsReady {
+			s.writeError(w, http.StatusForbidden, "https_required",
+				"HTTPS is not configured; Agent work is disabled. Set VAULTMESH_PUBLIC_API_URL to an https:// URL (or VAULTMESH_HTTPS_ENABLED=true) and restart.", nil)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 

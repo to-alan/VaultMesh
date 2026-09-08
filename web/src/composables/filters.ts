@@ -74,7 +74,7 @@ export function useProjectFilters(
         const stateMatches = stateFilter.value === 'all'
           || (stateFilter.value === 'enabled' && project.enabled)
           || (stateFilter.value === 'paused' && !project.enabled)
-          || (stateFilter.value === 'at_risk' && ['late', 'overdue'].includes(status || ''))
+          || (stateFilter.value === 'at_risk' && ['late', 'overdue', 'invalid'].includes(status || ''))
         const textMatches = serverMatches || [project.name, project.id, labels.repositoryName(project.repository_id), ...project.sources.map(sourceSummary)]
           .some((value) => value.toLocaleLowerCase('zh-CN').includes(query))
         return stateMatches && textMatches

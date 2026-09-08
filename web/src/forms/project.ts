@@ -32,9 +32,9 @@ export interface ProjectFormDraft {
   weekday: string
   custom_cron: string
   timezone: string
-  jitter_minutes: number
-  max_runtime_hours: number
-  grace_minutes: number
+  jitter_seconds: number
+  max_runtime_seconds: number
+  grace_seconds: number
   one_file_system: boolean
   exclude_caches: boolean
   exclude_if_present: string
@@ -51,6 +51,8 @@ export interface ProjectFormDraft {
   prune: boolean
   verification_mode: 'off' | 'metadata' | 'subset' | 'full'
   read_data_subset: string
+  maintenance_separate: boolean
+  maintenance_timezone: string
   retention_cron: string
   prune_cron: string
   verification_cron: string
@@ -87,9 +89,9 @@ export function createProjectFormDraft(serverID = '', repositoryID = ''): Projec
     weekday: '1',
     custom_cron: '0 2 * * *',
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-    jitter_minutes: 5,
-    max_runtime_hours: 6,
-    grace_minutes: 60,
+    jitter_seconds: 300,
+    max_runtime_seconds: 21600,
+    grace_seconds: 3600,
     one_file_system: true,
     exclude_caches: true,
     exclude_if_present: '.nobackup',
@@ -106,6 +108,8 @@ export function createProjectFormDraft(serverID = '', repositoryID = ''): Projec
     prune: false,
     verification_mode: 'off',
     read_data_subset: '1%',
+    maintenance_separate: true,
+    maintenance_timezone: '',
     retention_cron: '30 3 * * *',
     prune_cron: '0 4 * * 0',
     verification_cron: '0 5 * * 0',
@@ -144,9 +148,9 @@ export function projectFormDraftFromProject(project: Project): ProjectFormDraft 
     weekday: weekly?.[3] || '1',
     custom_cron: project.schedule.cron,
     timezone: project.schedule.timezone,
-    jitter_minutes: Math.round(project.schedule.jitter_seconds / 60),
-    max_runtime_hours: Math.max(1, Math.round(project.schedule.max_runtime_seconds / 3600)),
-    grace_minutes: Math.max(1, Math.round((project.schedule.grace_seconds || 3600) / 60)),
+    jitter_seconds: project.schedule.jitter_seconds,
+    max_runtime_seconds: project.schedule.max_runtime_seconds,
+    grace_seconds: project.schedule.grace_seconds || 3600,
     one_file_system: backup?.one_file_system ?? true,
     exclude_caches: backup?.exclude_caches ?? true,
     exclude_if_present: backup?.exclude_if_present?.join('\n') || '',
@@ -163,6 +167,8 @@ export function projectFormDraftFromProject(project: Project): ProjectFormDraft 
     prune: retention?.prune ?? false,
     verification_mode: verification?.mode || 'off',
     read_data_subset: verification?.read_data_subset || '1%',
+    maintenance_separate: maintenance?.separate ?? false,
+    maintenance_timezone: maintenance?.timezone || '',
     retention_cron: maintenance?.retention_cron || '30 3 * * *',
     prune_cron: maintenance?.prune_cron || '0 4 * * 0',
     verification_cron: maintenance?.verification_cron || '0 5 * * 0',
@@ -212,9 +218,9 @@ export function projectWriteInput(form: ProjectFormDraft): ProjectWriteInput {
     schedule: {
       cron: buildProjectCron(form),
       timezone: form.timezone,
-      jitter_seconds: Number(form.jitter_minutes) * 60,
-      max_runtime_seconds: Number(form.max_runtime_hours) * 3600,
-      grace_seconds: Number(form.grace_minutes) * 60,
+      jitter_seconds: Math.round(Number(form.jitter_seconds)),
+      max_runtime_seconds: Math.round(Number(form.max_runtime_seconds)),
+      grace_seconds: Math.round(Number(form.grace_seconds)),
       missed_run_policy: 'skip',
       concurrency_policy: 'forbid',
     },
@@ -235,15 +241,15 @@ export function projectWriteInput(form: ProjectFormDraft): ProjectWriteInput {
         keep_monthly: Number(form.keep_monthly),
         keep_yearly: Number(form.keep_yearly),
         keep_within: form.keep_within.trim(),
-        prune: form.prune,
+        prune: form.retention_enabled && form.prune,
       },
       verification: {
         mode: form.verification_mode,
         read_data_subset: form.verification_mode === 'subset' ? form.read_data_subset : '',
       },
       maintenance: {
-        separate: true,
-        timezone: form.timezone,
+        separate: form.maintenance_separate,
+        timezone: form.maintenance_timezone.trim() || form.timezone,
         retention_cron: form.retention_enabled ? form.retention_cron.trim() : '',
         prune_cron: form.retention_enabled && form.prune ? form.prune_cron.trim() : '',
         verification_cron: form.verification_mode !== 'off' ? form.verification_cron.trim() : '',

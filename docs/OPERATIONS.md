@@ -84,6 +84,8 @@ curl --fail http://127.0.0.1:8080/healthz
 
 `VAULTMESH_IMAGE_TAG` 为 `latest` 时每次 `pull` 都可能拿到新镜像，生产环境应固定到明确的版本 tag。`up -d --build` 会在本机从源码重建镜像，用于Registry 不可达或需要运行未发布修改的场景；重建后把 `VAULTMESH_IMAGE_TAG` 指向的镜像与本机镜像区分清楚，避免下次 `pull` 又切回去。
 
+主分支测试版本可固定为 `edge-<完整提交 SHA>`。先确认对应提交的 CI 和 Edge Images 均成功，再拉取 Control Plane、Web 与 Agent 的同一提交镜像；镜像的 `org.opencontainers.image.revision` 标签应与目标 SHA 一致。不要在工作流尚未完成时直接部署浮动 `edge` 标签。
+
 `git status --short` 必须为空；不要让一键更新覆盖本地修改。当前数据库迁移由 Control Plane 启动时自动执行。出现问题时先保存日志和数据库备份，再决定回滚。
 
 ## 回滚
@@ -111,6 +113,29 @@ sudo journalctl -u vaultmesh-agent --since '30 minutes ago'
 sudo test -s /var/lib/vaultmesh-agent/state.json
 sudo find /var/lib/vaultmesh-agent/restores -mindepth 1 -maxdepth 1 -type d -print
 ```
+
+## HTTPS 与 Agent 操作门控
+
+### 仅使用 IP 的临时测试
+
+不使用域名时，可使用 `deploy/compose.ip-test.yaml` 在 Web 端口（默认 3000）提供 IP HTTPS，并将 API 明文端口限制到宿主机回环。它需要 Docker Compose 2.24.4+。在 `/etc/vaultmesh/test-tls` 创建带实际 IP SAN 的自签名 `server.crt` 与 `server.key`，目录权限 `0700`、私钥权限 `0600`，再在 `.env` 中设置：
+
+```dotenv
+COMPOSE_FILE=compose.yaml:deploy/compose.ip-test.yaml
+VAULTMESH_PUBLIC_API_URL=https://YOUR_SERVER_IP:3000
+VAULTMESH_ALLOWED_ORIGINS=https://YOUR_SERVER_IP:3000
+VAULTMESH_COOKIE_SECURE=true
+VAULTMESH_WEBAUTHN_RP_ID=YOUR_SERVER_IP
+VAULTMESH_WEBAUTHN_RP_ORIGINS=https://YOUR_SERVER_IP:3000
+```
+
+备份后执行 `docker compose config --quiet` 和 `docker compose up -d --no-build`。浏览器会提示证书不受信任；应通过独立可信渠道核对证书 SHA-256 指纹后，仅对该测试站点建立信任。自签名证书不等于受公共 CA 信任的生产 HTTPS，不应全局关闭证书验证。IP 地址下不要依赖通行密钥登录，使用密码或已配置的 TOTP。同机 Agent 可继续连接 `http://127.0.0.1:8080`，远程 Agent 必须先建立对测试证书的信任。正式上线时应切换到可信证书并移除测试覆盖配置。
+
+### 正式环境
+
+Control Plane 只有在 `VAULTMESH_PUBLIC_API_URL` 使用 `https://`，或显式设置 `VAULTMESH_HTTPS_ENABLED=true` 时，才允许管理员下发探测、备份、保留预览、快照同步、保护、浏览和恢复等 Agent 任务。未完成 TLS 配置时，查询页面仍可使用，相关写操作返回 `403 https_required`。
+
+`VAULTMESH_HTTPS_ENABLED=true` 只表示 TLS 已由可信反向代理终止，并不会自行启用 HTTPS。设置前应确认公网只能访问代理的 HTTPS 入口、Control Plane 明文端口不直接暴露，并把 `VAULTMESH_ALLOWED_ORIGINS`、Cookie 和 WebAuthn 配置同步到实际域名。
 
 升级或维护 Agent 时使用 `systemctl stop/restart vaultmesh-agent`，不要直接发送 `SIGKILL`。收到 `SIGTERM` 后，Agent 会先停止接受新的计划和手动任务，取消正在运行的 Restic/数据库进程，等待终态写入本地 Outbox，再退出；被取消的任务会以 `canceled` 上报。systemd 单元提供 30 秒停止上限，正常命令应在此时间内响应上下文取消。若最终被强制终止，下次启动会把遗留的 `running` 记录恢复为 `unknown`，避免把未确认完成的备份误报为成功。
 

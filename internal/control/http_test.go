@@ -365,7 +365,7 @@ func TestAdminLoginSupportsSecureCrossSiteFrontendCookie(t *testing.T) {
 	server, err := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), AdminAuthConfig{
 		Username: testAdminUsername, Password: testAdminPassword,
 		CookieSecure: true, CookieSameSite: "none",
-	}, []string{"https://console.other-site.example"})
+	}, []string{"https://console.other-site.example"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,7 +614,7 @@ func TestRecentAuthenticationRequiresSecondFactorWhenTOTPEnabled(t *testing.T) {
 	}
 	server, err := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), AdminAuthConfig{
 		Username: testAdminUsername, Password: testAdminPassword,
-	}, nil)
+	}, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -699,7 +699,7 @@ func TestSecondFactorStateRollsBackWhenPersistenceFails(t *testing.T) {
 	service := NewService(dataStore, sealer)
 	server, err := NewHTTPServer(service, slog.Default(), AdminAuthConfig{
 		Username: testAdminUsername, Password: testAdminPassword,
-	}, nil)
+	}, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,7 +742,7 @@ func TestPasskeyRegistrationBeginsWithDiscoverableCredentialPolicy(t *testing.T)
 	server, err := NewHTTPServer(NewService(memory.New(), sealer), slog.Default(), AdminAuthConfig{
 		Username: testAdminUsername, Password: testAdminPassword,
 		WebAuthnRPID: "localhost", WebAuthnRPOrigins: []string{"http://localhost:3000"},
-	}, []string{"http://localhost:3000"})
+	}, []string{"http://localhost:3000"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1095,7 +1095,7 @@ func TestDetectionCommandRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "detect-host", AgentVersion: "v0.1.1"})
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "detect-host", AgentVersion: "v0.1.2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1112,10 +1112,8 @@ func TestDetectionCommandRoundTrip(t *testing.T) {
 	if command.ID == "" || command.ProjectID != "" {
 		t.Fatalf("detection command must be server-scoped: %#v", command)
 	}
-	// The enrolled agent (v0.1.1 in this fixture) predates the detect
-	// command; the dispatch must warn immediately instead of after polling.
-	if !strings.Contains(dispatch.Warning, "不支持探测命令") {
-		t.Fatalf("expected a version-mismatch warning: %#v", dispatch)
+	if dispatch.Warning != "" {
+		t.Fatalf("supported Agent received a version warning: %#v", dispatch)
 	}
 
 	// The wizard reports "not available" before the agent answers, and the
@@ -1174,6 +1172,219 @@ func TestDetectionCommandRoundTrip(t *testing.T) {
 		if item.ID == command.ID {
 			t.Fatalf("completed detection command was leased again: %#v", commands.Items)
 		}
+	}
+}
+
+func TestDetectionVersionSupportIsFailClosed(t *testing.T) {
+	tests := []struct {
+		version   string
+		supported bool
+	}{
+		{"v0.1.1", false},
+		{"v0.0.99", false},
+		{"v0.1.2-rc.1", false},
+		{"v0.1.2", true},
+		{"v0.1.2+build.7", true},
+		{"v0.2.0", true},
+		{"v1.0.0", true},
+		{"edge-20260904", true},
+		{"dev", true},
+		{"", false},
+		{"unknown", false},
+		{"v0.1.2-", false},
+		{"v999999999999999999999.0.0", false},
+	}
+	for _, test := range tests {
+		t.Run(test.version, func(t *testing.T) {
+			if got := supportsDetectionVersion(test.version); got != test.supported {
+				t.Fatalf("supportsDetectionVersion(%q)=%v, want %v", test.version, got, test.supported)
+			}
+		})
+	}
+}
+
+func TestUnsupportedAgentDoesNotQueueDetection(t *testing.T) {
+	ctx := context.Background()
+	service := NewService(memory.New(), mustSealer(t, 32))
+	enrollment, err := service.CreateServer(ctx, "Legacy host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "legacy-host", AgentVersion: "v0.0.99"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHTTPHandler(t, service, slog.New(slog.NewTextHandler(io.Discard, nil)), false, nil)
+	adminCookie := loginAdmin(t, handler)
+
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/servers/"+identity.AgentID+"/detect", adminCookie,
+		nil, http.StatusUnprocessableEntity, &struct {
+			Error any `json:"error"`
+		}{})
+	if _, found, err := service.GetLatestDetectionCommand(ctx, identity.AgentID); err != nil || found {
+		t.Fatalf("unsupported Agent received a command: found=%v err=%v", found, err)
+	}
+}
+
+func TestLatestDetectionCommandHasDeterministicTieBreak(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	service := NewService(dataStore, mustSealer(t, 34))
+	fixedTime := time.Now().UTC()
+	service.now = func() time.Time { return fixedTime }
+
+	enrollment, err := service.CreateServer(ctx, "Tie-break host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "tie-break", AgentVersion: "v0.1.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.CreateDetectionCommand(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.CreateDetectionCommand(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := first.Command.ID
+	if second.Command.ID > want {
+		want = second.Command.ID
+	}
+	latest, found, err := service.GetLatestDetectionCommand(ctx, identity.AgentID)
+	if err != nil || !found {
+		t.Fatalf("latest detection command: found=%v err=%v", found, err)
+	}
+	if latest.ID != want {
+		t.Fatalf("same-time commands were ordered nondeterministically: got %s want %s", latest.ID, want)
+	}
+	winner, loser := first, second
+	if second.Command.ID > first.Command.ID {
+		winner, loser = second, first
+	}
+	if err := service.SaveDetectionReport(ctx, identity.AgentID, winner.Command.ID, domain.DetectionReport{
+		Apps: []domain.DetectedApp{{Path: "/srv/winner"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SaveDetectionReport(ctx, identity.AgentID, loser.Command.ID, domain.DetectionReport{
+		Apps: []domain.DetectedApp{{Path: "/srv/loser"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	report, found, err := service.GetDetectionReport(ctx, identity.AgentID)
+	if err != nil || !found || report.CommandID != winner.Command.ID || len(report.Apps) != 1 || report.Apps[0].Path != "/srv/winner" {
+		t.Fatalf("same-time older report replaced the deterministic winner: found=%v report=%#v err=%v", found, report, err)
+	}
+}
+
+func TestDetectionReportRejectsWrongCommandAndCannotOverwriteNewerReport(t *testing.T) {
+	ctx := context.Background()
+	dataStore := memory.New()
+	service := NewService(dataStore, mustSealer(t, 33))
+	current := time.Now().UTC().Truncate(time.Second)
+	service.now = func() time.Time { return current }
+
+	enrollment, err := service.CreateServer(ctx, "Ordered reports")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "ordered-host", AgentVersion: "v0.1.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldDispatch, err := service.CreateDetectionCommand(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current = current.Add(time.Minute)
+	newDispatch, err := service.CreateDetectionCommand(ctx, identity.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current = current.Add(time.Minute)
+	if err := service.SaveDetectionReport(ctx, identity.AgentID, newDispatch.Command.ID, domain.DetectionReport{
+		CommandID: newDispatch.Command.ID,
+		Apps:      []domain.DetectedApp{{Path: "/srv/new", Name: "new", Kind: "test"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current = current.Add(time.Minute)
+	if err := service.SaveDetectionReport(ctx, identity.AgentID, oldDispatch.Command.ID, domain.DetectionReport{
+		CommandID: oldDispatch.Command.ID,
+		Apps:      []domain.DetectedApp{{Path: "/srv/old", Name: "old", Kind: "test"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	report, found, err := service.GetDetectionReport(ctx, identity.AgentID)
+	if err != nil || !found {
+		t.Fatalf("latest report missing: found=%v err=%v", found, err)
+	}
+	if report.CommandID != newDispatch.Command.ID || len(report.Apps) != 1 || report.Apps[0].Path != "/srv/new" {
+		t.Fatalf("older command overwrote the latest report: %#v", report)
+	}
+
+	otherEnrollment, err := service.CreateServer(ctx, "Other host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherIdentity, err := service.EnrollAgent(ctx, otherEnrollment.EnrollmentToken, domain.AgentInfo{Hostname: "other", AgentVersion: "v0.1.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SaveDetectionReport(ctx, otherIdentity.AgentID, newDispatch.Command.ID, domain.DetectionReport{}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cross-server report should be rejected, got %v", err)
+	}
+	wrongType, err := dataStore.CreateCommand(ctx, domain.Command{
+		ID: "cmd_wrong_type", ServerID: identity.AgentID, Type: "backup", CreatedAt: current,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SaveDetectionReport(ctx, identity.AgentID, wrongType.ID, domain.DetectionReport{}); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("non-detection command should be rejected, got %v", err)
+	}
+}
+
+func TestPlainHTTPMetadataAndAgentWorkGate(t *testing.T) {
+	ctx := context.Background()
+	service := NewService(memory.New(), mustSealer(t, 31))
+	enrollment, err := service.CreateServer(ctx, "HTTP-only host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewHTTPServer(service, slog.New(slog.NewTextHandler(io.Discard, nil)), AdminAuthConfig{
+		Username: testAdminUsername,
+		Password: testAdminPassword,
+	}, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := server.Handler()
+
+	var meta struct {
+		HTTPSReady bool `json:"https_ready"`
+	}
+	requestJSON(t, handler, http.MethodGet, "/api/v1/meta", "", nil, http.StatusOK, &meta)
+	if meta.HTTPSReady {
+		t.Fatal("plain HTTP server reported HTTPS readiness")
+	}
+
+	adminCookie := loginAdmin(t, handler)
+	var response struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	requestJSONWithCookie(t, handler, http.MethodPost, "/api/v1/servers/"+enrollment.Server.ID+"/detect", adminCookie,
+		nil, http.StatusForbidden, &response)
+	if response.Error.Code != "https_required" {
+		t.Fatalf("unexpected gate response: %#v", response)
+	}
+	if _, found, err := service.GetLatestDetectionCommand(ctx, enrollment.Server.ID); err != nil || found {
+		t.Fatalf("gated request queued a command: found=%v err=%v", found, err)
 	}
 }
 
@@ -2398,7 +2609,7 @@ func newTestHTTPHandler(t *testing.T, service *Service, logger *slog.Logger, coo
 		Username:     testAdminUsername,
 		Password:     testAdminPassword,
 		CookieSecure: cookieSecure,
-	}, origins)
+	}, origins, true)
 	if err != nil {
 		t.Fatal(err)
 	}

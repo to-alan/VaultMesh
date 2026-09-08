@@ -3,12 +3,14 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/to-alan/vaultmesh/internal/domain"
+	"github.com/to-alan/vaultmesh/internal/store"
 )
 
 func TestPostgresVerticalSlice(t *testing.T) {
@@ -278,5 +280,66 @@ func TestPostgresDetectCommandLifecycle(t *testing.T) {
 	}
 	if report.CommandID != command.ID {
 		t.Fatalf("unexpected report: %#v", report)
+	}
+
+	newer, err := dataStore.CreateCommand(ctx, domain.Command{
+		ID: "cmd_det_new_" + suffix, ServerID: serverID, Type: "detect", CreatedAt: now.Add(2 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.SaveDetectionReport(ctx, serverID, newer.ID, domain.DetectionReport{
+		CommandID: newer.ID, Apps: []domain.DetectedApp{{Path: "/srv/new"}},
+	}, now.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.SaveDetectionReport(ctx, serverID, command.ID, domain.DetectionReport{
+		CommandID: command.ID, Apps: []domain.DetectedApp{{Path: "/srv/old"}},
+	}, now.Add(4*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	report, found, err = dataStore.GetDetectionReport(ctx, serverID)
+	if err != nil || !found || report.CommandID != newer.ID || len(report.Apps) != 1 || report.Apps[0].Path != "/srv/new" {
+		t.Fatalf("older report overwrote newer detection: found=%v report=%#v err=%v", found, report, err)
+	}
+
+	wrongType, err := dataStore.CreateCommand(ctx, domain.Command{
+		ID: "cmd_det_wrong_" + suffix, ServerID: serverID, Type: "backup", CreatedAt: now.Add(5 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.SaveDetectionReport(ctx, serverID, wrongType.ID, domain.DetectionReport{}, now.Add(6*time.Minute)); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("non-detection command should be rejected, got %v", err)
+	}
+	if err := dataStore.SaveDetectionReport(ctx, "srv_other", newer.ID, domain.DetectionReport{}, now.Add(6*time.Minute)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("cross-server command should be rejected, got %v", err)
+	}
+
+	tieTime := now.Add(7 * time.Minute)
+	for _, id := range []string{"cmd_det_tie_a_" + suffix, "cmd_det_tie_z_" + suffix} {
+		if _, err := dataStore.CreateCommand(ctx, domain.Command{
+			ID: id, ServerID: serverID, Type: "detect", CreatedAt: tieTime,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latest, found, err = dataStore.GetLatestCommand(ctx, serverID, "detect")
+	if err != nil || !found || latest.ID != "cmd_det_tie_z_"+suffix {
+		t.Fatalf("same-time commands were ordered nondeterministically: found=%v command=%#v err=%v", found, latest, err)
+	}
+	if err := dataStore.SaveDetectionReport(ctx, serverID, "cmd_det_tie_z_"+suffix, domain.DetectionReport{
+		CommandID: "cmd_det_tie_z_" + suffix, Apps: []domain.DetectedApp{{Path: "/srv/tie-winner"}},
+	}, tieTime.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := dataStore.SaveDetectionReport(ctx, serverID, "cmd_det_tie_a_"+suffix, domain.DetectionReport{
+		CommandID: "cmd_det_tie_a_" + suffix, Apps: []domain.DetectedApp{{Path: "/srv/tie-loser"}},
+	}, tieTime.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	report, found, err = dataStore.GetDetectionReport(ctx, serverID)
+	if err != nil || !found || report.CommandID != "cmd_det_tie_z_"+suffix || len(report.Apps) != 1 || report.Apps[0].Path != "/srv/tie-winner" {
+		t.Fatalf("same-time older report replaced deterministic winner: found=%v report=%#v err=%v", found, report, err)
 	}
 }

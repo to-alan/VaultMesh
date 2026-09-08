@@ -116,14 +116,6 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 		if len(parts) != 3 {
 			continue
 		}
-		// The VaultMesh deployment itself: backing up the control plane from
-		// its own agent is circular (docs cover host-level pg_dump instead).
-		if strings.Contains(strings.ToLower(parts[0]+parts[1]), "vaultmesh") {
-			continue
-		}
-		if isInfrastructureContainer(parts[0], parts[1]) {
-			continue
-		}
 		containers = append(containers, domain.DetectedContainer{
 			Name:    parts[0],
 			Image:   parts[1],
@@ -143,56 +135,56 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 		if json.Unmarshal(inspect, &parsed) != nil || len(parsed) != 1 {
 			continue
 		}
-		for port := range parsed[0].NetworkSettings.Ports {
-			containers[index].Ports = append(containers[index].Ports, port)
+		for portSpec, bindings := range parsed[0].NetworkSettings.Ports {
+			containers[index].Ports = append(containers[index].Ports, portSpec)
+			containerPort, protocol, ok := parseDockerPortSpec(portSpec)
+			if !ok {
+				continue
+			}
+			for _, binding := range bindings {
+				hostPort, err := strconv.Atoi(binding.HostPort)
+				if err != nil || hostPort < 1 || hostPort > 65535 {
+					continue
+				}
+				containers[index].PortBindings = append(containers[index].PortBindings, domain.DetectedPortBinding{
+					ContainerPort: containerPort,
+					Protocol:      protocol,
+					HostIP:        binding.HostIP,
+					HostPort:      hostPort,
+				})
+			}
 		}
 		for _, mount := range parsed[0].Mounts {
 			if mount.Source != "" {
 				containers[index].Mounts = append(containers[index].Mounts, mount.Source)
 			}
 		}
+		sort.Strings(containers[index].Ports)
+		sort.Strings(containers[index].Mounts)
+		sort.Slice(containers[index].PortBindings, func(i, j int) bool {
+			left, right := containers[index].PortBindings[i], containers[index].PortBindings[j]
+			if left.ContainerPort != right.ContainerPort {
+				return left.ContainerPort < right.ContainerPort
+			}
+			if left.HostIP != right.HostIP {
+				return left.HostIP < right.HostIP
+			}
+			return left.HostPort < right.HostPort
+		})
 	}
 	return containers
 }
 
-// infrastructurePatterns match containers and runtime directories that are
-// supporting infrastructure rather than user data worth backing up: the
-// VaultMesh deployment itself, shared runtimes, admin panels, and build
-// tooling. Their content is either reproducible or already covered by the
-// applications that use them.
-// Patterns match shared admin panels, caches, queues, and observability
-// agents — not user-deployed projects. A self-built VaultMesh deployment
-// stays visible: users know their own projects best.
-var infrastructurePatterns = []string{
-	"phpmyadmin", "adminer", "redis", "memcached",
-	"rabbitmq", "kafka", "elasticsearch", "minio",
-	"grafana", "prometheus", "portainer",
-}
-
-func isInfrastructureContainer(name, image string) bool {
-	haystack := strings.ToLower(name + " " + image)
-	for _, pattern := range infrastructurePatterns {
-		if strings.Contains(haystack, pattern) {
-			return true
-		}
+func parseDockerPortSpec(value string) (int, string, bool) {
+	parts := strings.SplitN(value, "/", 2)
+	if len(parts) != 2 {
+		return 0, "", false
 	}
-	return false
-}
-
-// isInfrastructurePath filters app directories that are runtimes or tooling
-// rather than a deployable project.
-func isInfrastructurePath(path string) bool {
-	lower := strings.ToLower(path)
-	for _, pattern := range infrastructurePatterns {
-		if strings.Contains(lower, pattern) {
-			return true
-		}
+	port, err := strconv.Atoi(parts[0])
+	if err != nil || port < 1 || port > 65535 {
+		return 0, "", false
 	}
-	// Shared runtime directories (1Panel keeps per-version runtimes here).
-	if strings.Contains(lower, "/runtime/") {
-		return true
-	}
-	return false
+	return port, parts[1], true
 }
 
 // databaseSignals are probed on loopback and via listening docker ports.
@@ -223,11 +215,6 @@ func (r *Runner) detectDatabases(ctx context.Context, containers []domain.Detect
 		}
 	}
 
-	seen := map[string]bool{}
-	for _, database := range databases {
-		seen[database.Kind] = true
-	}
-
 	for _, container := range containers {
 		if !container.Running {
 			continue
@@ -242,24 +229,11 @@ func (r *Runner) detectDatabases(ctx context.Context, containers []domain.Detect
 		if kind == "" {
 			continue
 		}
-		port := 0
-		for _, published := range container.Ports {
-			// "0.0.0.0:3306->3306/tcp" style entries are collapsed by the ps
-			// format already; inspect gave raw container ports like
-			// "3306/tcp". Parse the numeric prefix.
-			if numeric := strings.SplitN(published, "/", 2)[0]; numeric != "" {
-				if value, err := strconv.Atoi(numeric); err == nil {
-					port = value
-					break
-				}
-			}
+		expectedPort := 5432
+		if kind == "mysql" {
+			expectedPort = 3306
 		}
-		host := "127.0.0.1"
-		reach := port != 0 && reachable(host, port)
-		if seen[kind] && !reach {
-			continue
-		}
-		seen[kind] = true
+		host, port, reach := detectedDatabaseEndpoint(container, expectedPort, reachable)
 		databases = append(databases, domain.DetectedDatabase{
 			Kind: kind, Source: "docker", Container: container.Name,
 			Host: host, Port: port, Reachable: reach,
@@ -271,15 +245,16 @@ func (r *Runner) detectDatabases(ctx context.Context, containers []domain.Detect
 	// it carries the container name, which tells the user where the data
 	// lives and which compose project to restart. Two passes, because the
 	// loopback probe appends before the container inspection runs.
-	claimedPort := map[int]bool{}
+	claimedEndpoint := map[string]bool{}
 	for _, database := range databases {
 		if database.Source == "docker" && database.Reachable {
-			claimedPort[database.Port] = true
+			claimedEndpoint[database.Kind+"\x00"+database.Host+"\x00"+strconv.Itoa(database.Port)] = true
 		}
 	}
 	deduped := make([]domain.DetectedDatabase, 0, len(databases))
 	for _, database := range databases {
-		if database.Source == "loopback" && claimedPort[database.Port] {
+		key := database.Kind + "\x00" + database.Host + "\x00" + strconv.Itoa(database.Port)
+		if database.Source == "loopback" && claimedEndpoint[key] {
 			continue
 		}
 		deduped = append(deduped, database)
@@ -293,6 +268,41 @@ func (r *Runner) detectDatabases(ctx context.Context, containers []domain.Detect
 		}
 	}
 	return deduped
+}
+
+func detectedDatabaseEndpoint(container domain.DetectedContainer, expectedContainerPort int, reachable func(string, int) bool) (string, int, bool) {
+	var fallback *domain.DetectedPortBinding
+	for index := range container.PortBindings {
+		binding := &container.PortBindings[index]
+		if binding.ContainerPort != expectedContainerPort || binding.Protocol != "tcp" {
+			continue
+		}
+		if fallback == nil {
+			fallback = binding
+		}
+		host := dockerBindingHost(binding.HostIP)
+		if reachable(host, binding.HostPort) {
+			return host, binding.HostPort, true
+		}
+	}
+	if fallback != nil {
+		return dockerBindingHost(fallback.HostIP), fallback.HostPort, false
+	}
+	// An exposed container port without a host binding is not reachable from
+	// the host. Do not probe the same loopback port: another local database
+	// could answer and be falsely attributed to this container.
+	return "127.0.0.1", 0, false
+}
+
+func dockerBindingHost(host string) string {
+	switch host {
+	case "", "0.0.0.0":
+		return "127.0.0.1"
+	case "::":
+		return "::1"
+	default:
+		return host
+	}
 }
 
 func detectApps(ctx context.Context) []domain.DetectedApp {
@@ -363,7 +373,7 @@ func scanMarkers(ctx context.Context, root string, depth int) []domain.DetectedA
 		}
 		child := filepath.Join(root, name)
 		cleaned, pathErr := safePath(child)
-		if pathErr != nil || isInfrastructurePath(cleaned) {
+		if pathErr != nil {
 			continue
 		}
 		found = append(found, scanMarkers(ctx, cleaned, depth-1)...)

@@ -18,8 +18,6 @@ function snapshot(overrides: Partial<Snapshot> = {}): Snapshot {
   }
 }
 
-import type { Run } from '../../types'
-
 function makeExplorer(runs: RunLike[] = [], options: { browse?: (commandID: string) => void; restore?: (commandID: string) => void } = {}) {
   const issued: { kind: string; projectID: string; snapshotID: string; path: string }[] = []
   const explorer = useSnapshotExplorer({

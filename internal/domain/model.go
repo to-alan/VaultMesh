@@ -283,6 +283,12 @@ type ProjectBackupActivity struct {
 	LatestRunStatus  string     `json:"latest_run_status,omitempty"`
 	LatestRunAt      *time.Time `json:"latest_run_at,omitempty"`
 	LastSuccessfulAt *time.Time `json:"last_successful_at,omitempty"`
+	ActiveRunAt      *time.Time `json:"active_run_at,omitempty"`
+	// Alert recovery requires a completed attempt; running/skipped triggers
+	// do not establish whether the previous failure has recovered.
+	LatestCompletedRunID  string     `json:"latest_completed_run_id,omitempty"`
+	LatestCompletedStatus string     `json:"latest_completed_status,omitempty"`
+	LatestCompletedRunAt  *time.Time `json:"latest_completed_run_at,omitempty"`
 }
 
 // NotificationChannel is a user-defined contact point. Config is accepted on
@@ -389,11 +395,22 @@ type DetectionReport struct {
 }
 
 type DetectedContainer struct {
-	Name    string   `json:"name"`
-	Image   string   `json:"image"`
-	Running bool     `json:"running"`
-	Ports   []string `json:"ports,omitempty"`
-	Mounts  []string `json:"mounts,omitempty"`
+	Name         string                `json:"name"`
+	Image        string                `json:"image"`
+	Running      bool                  `json:"running"`
+	Ports        []string              `json:"ports,omitempty"`
+	PortBindings []DetectedPortBinding `json:"port_bindings,omitempty"`
+	Mounts       []string              `json:"mounts,omitempty"`
+}
+
+// DetectedPortBinding preserves the host endpoint separately from the
+// container port. Docker commonly publishes 3306/tcp as an arbitrary host
+// port, so collapsing the mapping to "3306/tcp" produces unusable drafts.
+type DetectedPortBinding struct {
+	ContainerPort int    `json:"container_port"`
+	Protocol      string `json:"protocol"`
+	HostIP        string `json:"host_ip"`
+	HostPort      int    `json:"host_port"`
 }
 
 type DetectedDatabase struct {

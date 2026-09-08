@@ -249,7 +249,15 @@ export interface DetectedContainer {
   image: string
   running: boolean
   ports?: string[]
+  port_bindings?: DetectedPortBinding[]
   mounts?: string[]
+}
+
+export interface DetectedPortBinding {
+  container_port: number
+  protocol: string
+  host_ip: string
+  host_port: number
 }
 
 export interface DetectedDatabase {

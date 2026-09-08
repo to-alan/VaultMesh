@@ -46,9 +46,10 @@ type Store struct {
 }
 
 type detectionEntry struct {
-	commandID  string
-	report     domain.DetectionReport
-	detectedAt time.Time
+	commandID        string
+	commandCreatedAt time.Time
+	report           domain.DetectionReport
+	detectedAt       time.Time
 }
 
 func New() *Store {
@@ -441,7 +442,12 @@ func (s *Store) ClaimCommands(_ context.Context, serverID string, now, leaseUnti
 		}
 		candidates = append(candidates, cloneCommand(command))
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].CreatedAt.Before(candidates[j].CreatedAt) })
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].CreatedAt.Equal(candidates[j].CreatedAt) {
+			return candidates[i].ID < candidates[j].ID
+		}
+		return candidates[i].CreatedAt.Before(candidates[j].CreatedAt)
+	})
 	if len(candidates) > limit {
 		candidates = candidates[:limit]
 	}
@@ -587,11 +593,24 @@ func (s *Store) ListProjectBackupActivity(_ context.Context) ([]domain.ProjectBa
 		if !ok {
 			continue
 		}
-		if item.LatestRunAt == nil || report.StartedAt.After(*item.LatestRunAt) {
+		if item.LatestRunAt == nil || report.StartedAt.After(*item.LatestRunAt) ||
+			(report.StartedAt.Equal(*item.LatestRunAt) && report.ID > item.LatestRunID) {
 			startedAt := report.StartedAt
 			item.LatestRunAt = &startedAt
 			item.LatestRunID = report.ID
 			item.LatestRunStatus = report.Status
+		}
+		if report.Status == domain.RunRunning && (item.ActiveRunAt == nil || report.StartedAt.After(*item.ActiveRunAt)) {
+			startedAt := report.StartedAt
+			item.ActiveRunAt = &startedAt
+		}
+		if report.Status != domain.RunRunning && report.Status != domain.RunSkipped &&
+			(item.LatestCompletedRunAt == nil || report.StartedAt.After(*item.LatestCompletedRunAt) ||
+				(report.StartedAt.Equal(*item.LatestCompletedRunAt) && report.ID > item.LatestCompletedRunID)) {
+			startedAt := report.StartedAt
+			item.LatestCompletedRunAt = &startedAt
+			item.LatestCompletedRunID = report.ID
+			item.LatestCompletedStatus = report.Status
 		}
 		if report.Status == domain.RunSucceeded {
 			succeededAt := report.StartedAt
@@ -618,10 +637,32 @@ func (s *Store) SaveDetectionReport(_ context.Context, serverID, commandID strin
 	if _, ok := s.servers[serverID]; !ok {
 		return store.ErrNotFound
 	}
-	s.detections[serverID] = detectionEntry{commandID: commandID, report: report, detectedAt: at}
+	command, ok := s.commands[commandID]
+	if !ok || command.ServerID != serverID {
+		return store.ErrNotFound
+	}
+	if command.Type != "detect" || command.ProjectID != "" {
+		return store.ErrConflict
+	}
+	current, hasCurrent := s.detections[serverID]
+	if !hasCurrent || current.commandID == commandID || detectionCommandAfter(command, current.commandID, current.commandCreatedAt) {
+		s.detections[serverID] = detectionEntry{
+			commandID: commandID, commandCreatedAt: command.CreatedAt, report: report, detectedAt: at,
+		}
+	}
 	s.completed[commandID] = at
 	s.accepted[commandID] = at
 	return nil
+}
+
+func detectionCommandAfter(incoming domain.Command, currentID string, currentCreatedAt time.Time) bool {
+	if currentID == "" || currentCreatedAt.IsZero() {
+		return true
+	}
+	if incoming.CreatedAt.Equal(currentCreatedAt) {
+		return incoming.ID > currentID
+	}
+	return incoming.CreatedAt.After(currentCreatedAt)
 }
 
 func (s *Store) GetDetectionReport(_ context.Context, serverID string) (domain.DetectionReport, bool, error) {
@@ -642,7 +683,8 @@ func (s *Store) GetLatestCommand(_ context.Context, serverID, commandType string
 		if command.ServerID != serverID || command.Type != commandType {
 			continue
 		}
-		if latest == nil || command.CreatedAt.After(latest.CreatedAt) {
+		if latest == nil || command.CreatedAt.After(latest.CreatedAt) ||
+			(command.CreatedAt.Equal(latest.CreatedAt) && command.ID > latest.ID) {
 			clone := cloneCommand(command)
 			latest = &clone
 		}
@@ -984,7 +1026,7 @@ func (s *Store) Dashboard(_ context.Context, since time.Time) (domain.Dashboard,
 			dashboard.RunsSucceeded++
 		case domain.RunPartial:
 			dashboard.RunsPartial++
-		case domain.RunFailed, domain.RunTimedOut, domain.RunUnknown:
+		case domain.RunFailed, domain.RunTimedOut, domain.RunUnknown, domain.RunCanceled:
 			dashboard.RunsFailed++
 		}
 	}

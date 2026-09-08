@@ -14,37 +14,17 @@ import {
   repositoryProviders,
 } from './repositories'
 import {
-  alertKindLabel,
-  auditActionCategory,
-  auditActionLabel,
-  auditCategoryLabel,
-  auditResourceLabel,
   cronDescription,
-  describeProjectHealth,
   formatBytes,
-  formatCountdown,
   formatDate,
-  formatDuration,
-  formatNextRun,
-  healthOrder,
-  localDateKey,
-  maintenanceSummary,
-  notificationTransitionLabel,
+  formatTimeBudget,
   pageDescription,
-  projectHealthLabel,
-  repeatIntervalLabel,
-  retentionSummary,
-  runOperationGroup,
-  runOperationLabel,
-  scanSummary,
   snapshotEntryIcon,
   snapshotEntryName,
-  sourceSummary,
   sourceTypeLabel,
   statusLabel,
-  verificationSummary,
 } from './display'
-import type { AuditCategory, RunOperationFilter, SourceType, Tab } from './display'
+import type { SourceType, Tab } from './display'
 import {
   buildProjectCron,
   changeProjectSourceType as changeSourceType,
@@ -56,15 +36,18 @@ import {
 } from './forms/project'
 import { controlPlane } from './services'
 import type { NotificationChannelWriteInput } from './services'
+import { agentInstallUsesLoopbackFallback, buildAgentInstallCommand, detectionPollDecision, supportsDetectionVersion } from './detection'
 import { useAuditFilters } from './composables/auditFilters'
-import { useProjectFilters, useRunFilters } from './composables/filters'
 import { useSnapshotExplorer } from './composables/snapshotExplorer'
 import AuditView from './views/AuditView.vue'
 import RunsView from './views/RunsView.vue'
-import type { AlertIncident, AuditEvent, Dashboard, DetectionReport, EnrollmentResult, NotificationChannel, NotificationDelivery, Passkey, Profile, Project, ProjectHealth, Repository, Run, Server, Snapshot, SnapshotEntry } from './types'
+import OverviewView from './views/OverviewView.vue'
+import ProjectListView from './views/ProjectListView.vue'
+import NotificationsView from './views/NotificationsView.vue'
+import DurationInput from './components/DurationInput.vue'
+import type { AlertIncident, AuditEvent, Dashboard, DetectionReport, EnrollmentResult, NotificationChannel, NotificationDelivery, Passkey, Profile, Project, ProjectHealth, Repository, Run, Server, Snapshot } from './types'
 import { friendlyPasskeyError, parseCreationOptions, parseRequestOptions, serializeAssertion, serializeRegistration, suggestedPasskeyName } from './webauthn'
 
-type RunStatusFilter = 'all' | 'active' | 'succeeded' | 'attention'
 type SecurityModal = 'password' | 'totp-setup' | 'totp-manage' | 'passkey-add' | 'passkey-delete' | 'reauthenticate' | null
 type PendingPasskeyAction = 'add' | 'delete' | null
 
@@ -116,13 +99,6 @@ const auditEvents = ref<AuditEvent[]>([])
 const notificationChannels = ref<NotificationChannel[]>([])
 const alertIncidents = ref<AlertIncident[]>([])
 const notificationDeliveries = ref<NotificationDelivery[]>([])
-const auditOutcomeFilter = ref<'all' | AuditEvent['outcome']>('all')
-const auditCategoryFilter = ref<AuditCategory>('all')
-const projectSearch = ref('')
-const projectStateFilter = ref<'all' | 'enabled' | 'paused' | 'at_risk'>('all')
-const runSearch = ref('')
-const runStatusFilter = ref<RunStatusFilter>('all')
-const runOperationFilter = ref<RunOperationFilter>('all')
 const explorer = useSnapshotExplorer({
   runs,
   browse: async (projectID, snapshotID, path) => {
@@ -154,6 +130,7 @@ const snapshotBrowseCommandID = explorer.browseCommandID
 const snapshotRestoreCommandID = explorer.restoreCommandID
 const enrollment = ref<EnrollmentResult | null>(null)
 const editingProjectID = ref('')
+const projectEditorOpen = ref(false)
 const profile = ref<Profile>({ username: '', totp_enabled: false, recovery_codes_remaining: 0, passkeys: [], webauthn_available: false, webauthn_rp_id: '' })
 const totpSetup = ref<{ secret: string; qr_code: string } | null>(null)
 const recoveryCodes = ref<string[]>([])
@@ -181,7 +158,6 @@ const projectForm = reactive(createProjectFormDraft())
 
 const activeRepositoryProvider = computed(() => repositoryProvider(repositoryForm.provider))
 const firingAlertCount = computed(() => alertIncidents.value.filter((item) => item.status === 'firing').length)
-const failedDeliveryCount = computed(() => notificationDeliveries.value.filter((item) => item.status === 'failed').length)
 const repositoryFields = computed(() => activeRepositoryProvider.value.fields.filter((field) => repositoryFieldVisible(field, repositoryForm.values)))
 const repositoryURL = computed(() => buildRepositoryTarget(repositoryForm.provider, repositoryForm.values, repositoryForm.prefix))
 const repositoryMissing = computed(() => missingRepositoryFields(repositoryForm.provider, repositoryForm.values))
@@ -205,133 +181,23 @@ watch(activeTab, (tab) => {
 
 const projectNames = computed(() => new Map(projects.value.map((project) => [project.id, project.name])))
 const projectHealthByID = computed(() => new Map(projectHealthItems.value.map((item) => [item.project_id, item])))
-const rpoRiskCount = computed(() => projectHealthItems.value.filter((item) => ['late', 'overdue'].includes(item.status)).length)
 const editingProject = computed(() => projects.value.find((project) => project.id === editingProjectID.value))
-const backupRuns = computed(() => runs.value.filter((run) => {
-  const operation = String(run.stats?.operation || 'backup')
-  return operation === 'backup'
-}))
 const projectCron = computed(() => buildProjectCron(projectForm))
 const projectSchedulePreview = computed(() => {
-  const jitter = projectForm.jitter_minutes > 0 ? `，最多随机延后 ${projectForm.jitter_minutes} 分钟` : ''
+  const jitter = projectForm.jitter_seconds > 0 ? `，最多随机延后 ${formatTimeBudget(projectForm.jitter_seconds)}` : ''
   return `${cronDescription(projectCron.value)} · ${projectForm.timezone}${jitter}`
 })
-const totalRunCount = computed(() => backupRuns.value.length)
-const successfulRunCount = computed(() => backupRuns.value.filter((run) => run.status === 'succeeded').length)
-const successRate = computed(() => totalRunCount.value ? Math.round(successfulRunCount.value / totalRunCount.value * 100) : 0)
-const protectedSourceCount = computed(() => projects.value.reduce((total, project) => total + project.sources.length, 0))
 const attentionCount = computed(() => dashboard.value.runs_failed + dashboard.value.runs_partial)
-const onlineRate = computed(() => dashboard.value.servers_total
-  ? Math.round(dashboard.value.servers_online / dashboard.value.servers_total * 100)
-  : 0)
 const passkeyEnvironmentReady = computed(() => Boolean(
   profile.value.webauthn_available && window.isSecureContext && window.PublicKeyCredential && navigator.credentials,
 ))
-const nextScheduledProject = computed(() => projects.value
-  .filter((project) => project.next_run_at)
-  .map((project) => ({ project, at: new Date(project.next_run_at!).getTime() }))
-  .filter((item) => Number.isFinite(item.at) && item.at >= nowEpoch.value - 1000)
-  .sort((left, right) => left.at - right.at)[0])
-const nextBackupCountdown = computed(() => {
-  if (!nextScheduledProject.value) return '--:--:--'
-  return formatCountdown(Math.max(0, nextScheduledProject.value.at - nowEpoch.value))
-})
 const audit = useAuditFilters(auditEvents, nowEpoch)
 const failedAuditEvents = audit.failed
 
-const runTrend = computed(() => {
-  const points = Array.from({ length: 7 }, (_, index) => {
-    const date = new Date()
-    date.setHours(0, 0, 0, 0)
-    date.setDate(date.getDate() - (6 - index))
-    return {
-      key: localDateKey(date),
-      label: `${date.getMonth() + 1}/${date.getDate()}`,
-      succeeded: 0,
-      partial: 0,
-      failed: 0,
-      total: 0,
-    }
-  })
-  const byDate = new Map(points.map((point) => [point.key, point]))
-  for (const run of backupRuns.value) {
-    const point = byDate.get(localDateKey(new Date(run.started_at)))
-    if (!point) continue
-    point.total += 1
-    if (run.status === 'succeeded') point.succeeded += 1
-    else if (run.status === 'partial') point.partial += 1
-    else point.failed += 1
-  }
-  const max = Math.max(1, ...points.map((point) => point.total))
-  return points.map((point) => ({
-    ...point,
-    succeededHeight: point.succeeded / max * 100,
-    partialHeight: point.partial / max * 100,
-    failedHeight: point.failed / max * 100,
-    totalHeight: point.total / max * 100,
-  }))
-})
-
-const runDistribution = computed(() => [
-  { key: 'succeeded', label: '成功', count: backupRuns.value.filter((run) => run.status === 'succeeded').length, color: '#5df0a8' },
-  { key: 'partial', label: '部分成功', count: backupRuns.value.filter((run) => run.status === 'partial').length, color: '#f6c85f' },
-  { key: 'failed', label: '失败/超时', count: backupRuns.value.filter((run) => ['failed', 'timed_out', 'canceled', 'unknown'].includes(run.status)).length, color: '#ff6b73' },
-  { key: 'running', label: '执行中', count: backupRuns.value.filter((run) => run.status === 'running').length, color: '#65b8ff' },
-])
-
-const runDonutBackground = computed(() => {
-  const total = runDistribution.value.reduce((sum, item) => sum + item.count, 0)
-  if (!total) return 'conic-gradient(#22312d 0 100%)'
-  let cursor = 0
-  const segments = runDistribution.value.filter((item) => item.count > 0).map((item) => {
-    const start = cursor
-    cursor += item.count / total * 100
-    return `${item.color} ${start}% ${cursor}%`
-  })
-  return `conic-gradient(${segments.join(', ')})`
-})
-
-const projectHealth = computed(() => projects.value.map((project) => {
-  const latest = backupRuns.value.find((run) => run.project_id === project.id)
-  return { project, latest, status: latest?.status ?? 'unknown' }
-}).sort((left, right) => healthOrder(left.status) - healthOrder(right.status)))
-
-const projectGroups = computed(() => {
-  const assigned = new Set<string>()
-  const groups: { id: string; name: string; server?: Server; projects: Project[] }[] = servers.value.map((server) => {
-    const items = projects.value.filter((project) => project.server_id === server.id)
-    items.forEach((project) => assigned.add(project.id))
-    return { id: server.id, name: server.name, server, projects: items }
-  })
-  const detached = projects.value.filter((project) => !assigned.has(project.id))
-  if (detached.length) groups.push({ id: 'unknown', name: '未知服务器', projects: detached })
-  return groups
-})
-
-const filteredProjectGroups = computed(() => {
-  const query = projectSearch.value.trim().toLocaleLowerCase('zh-CN')
-  return projectGroups.value.map((group) => {
-    const serverMatches = !query || [group.name, group.server?.hostname, group.server?.id]
-      .some((value) => value?.toLocaleLowerCase('zh-CN').includes(query))
-    const items = group.projects.filter((project) => {
-      const health = projectHealthByID.value.get(project.id)
-      const stateMatches = projectStateFilter.value === 'all'
-        || (projectStateFilter.value === 'enabled' && project.enabled)
-        || (projectStateFilter.value === 'paused' && !project.enabled)
-        || (projectStateFilter.value === 'at_risk' && ['late', 'overdue'].includes(health?.status || ''))
-      const textMatches = serverMatches || [project.name, project.id, repositoryName(project.repository_id), ...project.sources.map(sourceSummary)]
-        .some((value) => value.toLocaleLowerCase('zh-CN').includes(query))
-      return stateMatches && textMatches
-    })
-    return { ...group, projects: items }
-  }).filter((group) => !query && projectStateFilter.value === 'all' ? true : group.projects.length > 0)
-})
-const filteredProjectCount = computed(() => filteredProjectGroups.value.reduce((total, group) => total + group.projects.length, 0))
 
 function projectNameLabel(projectID: string): string {
   return projectNames.value.get(projectID) ?? projectID
 }
-const runFilterState = useRunFilters(runs, { projectName: projectNameLabel, serverName })
 
 const filteredSnapshots = explorer.filtered
 const selectedSnapshot = explorer.selected
@@ -696,36 +562,35 @@ const detectionExhausted = ref(false)
 // dispatched is true ONLY after the control plane accepted a detect POST.
 // Merely selecting a server must never disable the button.
 const detectionDispatched = ref(false)
-const detectionDispatchedAt = ref<number | null>(null)
+const activeDetectionCommandID = ref('')
 let detectionPollTimer: number | undefined
-const detectionRunning = computed(() => detectionDispatched.value && !detectionReport.value && !detectionExhausted.value)
+let detectionReportLoadRevision = 0
+const detectionRunning = computed(() => detectionDispatched.value && !detectionExhausted.value)
 const detectionHasSelection = computed(() =>
   detectionSelection.apps.length + detectionSelection.databases.length + detectionSelection.containers.length > 0)
 const detectionWarning = ref('')
 const detectionAgentVersion = computed(() =>
   servers.value.find((item) => item.id === detectionServerID.value)?.agent_version || '')
 
-// The dropdown already displays each agent's version; use it as a hard gate
-// so detection can never be dispatched to an agent that will silently
-// reject the command.
-function supportsDetection(version: string): boolean {
-  const value = version.replace(/^v/, '')
-  if (!value || value.startsWith('edge') || value === 'dev') return true
-  const parts = value.split('.')
-  if (parts.length !== 3) return true
-  const [major, minor, patch] = parts.map(Number)
-  if (Number.isNaN(major) || Number.isNaN(minor) || Number.isNaN(patch)) return true
-  return major > 0 || minor > 1 || patch >= 2
-}
 const detectionVersionBlocked = computed(() =>
-  Boolean(detectionServerID.value) && !supportsDetection(detectionAgentVersion.value))
+  Boolean(detectionServerID.value) && !supportsDetectionVersion(detectionAgentVersion.value))
+const controlPlaneVersion = ref<string | null>(null)
+const controlPlaneCommit = ref('')
+const controlPlaneHTTPSReady = ref<boolean | null>(null)
+const controlPlaneVersionLabel = computed(() => controlPlaneVersion.value?.replace(/^edge-/, 'edge ') || '…')
+const agentWorkDisabled = computed(() => controlPlaneHTTPSReady.value === false)
 const installCommandText = ref('生成中…')
-watch(enrollment, (value) => {
-  if (!value) {
+const installCommandSameHostOnly = computed(() => Boolean(enrollment.value && agentInstallUsesLoopbackFallback(apiBaseURL)))
+watch([enrollment, controlPlaneVersion], ([result, version]) => {
+  if (!result) {
     installCommandText.value = ''
     return
   }
-  void buildInstallCommand(value).then((text) => { installCommandText.value = text })
+  if (version === null) {
+    installCommandText.value = '正在读取 Control Plane 版本…'
+    return
+  }
+  installCommandText.value = buildInstallCommand(result, version)
 })
 const detectionTargetName = computed(() =>
   servers.value.find((item) => item.id === detectionServerID.value)?.name || detectionServerID.value)
@@ -734,6 +599,7 @@ const detectionTargetName = computed(() =>
 watch(() => servers.value.map((item) => item.id + ':' + item.status).join(','), () => {
   if (!detectionServerID.value) return
   const target = servers.value.find((item) => item.id === detectionServerID.value)
+  if (detectionRunning.value) return
   if (!target) {
     detectionServerID.value = servers.value.find((item) => item.status === 'online')?.id ?? ''
     if (!detectionReport.value) detectionExhausted.value = false
@@ -752,14 +618,24 @@ function revealDetectionPanel(id: string) {
   })
 }
 watch(detectionServerID, (serverID) => {
-  if (!serverID || detectionRunning.value) return
+  const loadRevision = ++detectionReportLoadRevision
+  if (detectionRunning.value) return
+  window.clearTimeout(detectionPollTimer)
+  detectionReport.value = null
+  detectionExhausted.value = false
+  detectionWarning.value = ''
+  detectionAttempts.value = 0
+  detectionSelection.apps = []
+  detectionSelection.databases = []
+  detectionSelection.containers = []
+  if (!serverID) return
   void (async () => {
     try {
       const status = await controlPlane.servers.detection(serverID)
+      if (loadRevision !== detectionReportLoadRevision || detectionServerID.value !== serverID || detectionRunning.value) return
       if (status.available && status.report) {
         detectionReport.value = status.report
-        detectionExhausted.value = false
-        detectionWarning.value = ''
+        detectionAttempts.value = status.command?.attempts ?? 0
       }
     } catch {
       // ignore: the wizard stays empty until the user starts a detection
@@ -784,6 +660,11 @@ async function startDetection(serverIDInput: string, force = false) {
     return
   }
   detectionServerID.value = server.id
+  // Invalidate a stored-report request that may already be in flight for the
+  // selected server. Otherwise it can put an old report back after this fresh
+  // scan has started and make the UI appear idle.
+  const requestRevision = ++detectionReportLoadRevision
+  window.clearTimeout(detectionPollTimer)
   detectionReport.value = null
   detectionExhausted.value = false
   detectionAttempts.value = 0
@@ -791,20 +672,24 @@ async function startDetection(serverIDInput: string, force = false) {
   detectionSelection.apps = []
   detectionSelection.databases = []
   detectionSelection.containers = []
+  detectionDispatched.value = false
+  activeDetectionCommandID.value = ''
   await perform(async () => {
     // Selecting a server surfaces the stored report so a fresh page load
     // never hides a detection that already succeeded. An explicit click
     // (force) always dispatches a fresh scan instead.
     if (!force) {
       const status = await controlPlane.servers.detection(server.id)
+      if (requestRevision !== detectionReportLoadRevision || detectionServerID.value !== server.id) return
       if (status.available && status.report) {
         detectionReport.value = status.report
-        detectionAttempts.value = (status.command as { attempts?: number } | undefined)?.attempts ?? 0
+        detectionAttempts.value = status.command?.attempts ?? 0
         success.value = '已加载上次探测结果。数据有变化时可重新探测。'
         return
       }
     }
     const dispatch = await controlPlane.servers.detect(server.id)
+    if (requestRevision !== detectionReportLoadRevision || detectionServerID.value !== server.id) return
     if (dispatch.warning) {
       // Fail fast: an agent that cannot understand the command will never
       // answer, so polling would be theater.
@@ -812,54 +697,56 @@ async function startDetection(serverIDInput: string, force = false) {
       error.value = dispatch.warning
       return
     }
+    activeDetectionCommandID.value = dispatch.command.id
     detectionDispatched.value = true
-    detectionDispatchedAt.value = Date.now()
     success.value = `已向 ${server.name} 发送只读探测任务，完成后自动展示结果。`
-    pollDetection(server.id, DETECTION_POLL_TOTAL)
+    pollDetection(server.id, dispatch.command.id, DETECTION_POLL_TOTAL)
   })
 }
 
-function pollDetection(serverID: string, remainingAttempts: number) {
+function pollDetection(serverID: string, commandID: string, remainingAttempts: number) {
   window.clearTimeout(detectionPollTimer)
+  if (activeDetectionCommandID.value !== commandID || detectionServerID.value !== serverID) return
   if (remainingAttempts <= 0) {
     detectionExhausted.value = true
     detectionDispatched.value = false
+    activeDetectionCommandID.value = ''
     return
   }
   detectionPollTimer = window.setTimeout(async () => {
-    let seenCommand = false
+    if (activeDetectionCommandID.value !== commandID || detectionServerID.value !== serverID) return
     try {
       const status = await controlPlane.servers.detection(serverID)
       // 命令派发状态随每次轮询刷新，让用户看到"系统确实在等 Agent"
-      if ('command' in status && status.command) {
-        detectionAttempts.value = (status.command as { attempts?: number }).attempts ?? 0
-        seenCommand = true
+      if (status.command?.id === commandID) {
+        detectionAttempts.value = status.command.attempts ?? 0
       }
-      const reportIsFresh = status.report && status.report.generated_at &&
-        new Date(status.report.generated_at).getTime() >= (detectionDispatchedAt.value ?? 0) - 3000
-      if (status.available && status.report && reportIsFresh) {
-        detectionReport.value = status.report
+      const decision = detectionPollDecision(status, commandID)
+      if (decision.kind === 'superseded') {
         detectionDispatched.value = false
-        success.value = '探测完成。勾选要备份的内容并生成项目草稿。'
+        activeDetectionCommandID.value = ''
+        error.value = '当前探测已被另一项更新的探测请求取代。请等待最新请求完成，或重新点击“开始探测”。'
         return
       }
-      if (seenCommand === false && detectionAttempts.value === 0 && remainingAttempts < DETECTION_POLL_TOTAL - 4) {
-        detectionExhausted.value = true
+      if (decision.kind === 'complete') {
+        detectionReport.value = decision.report
         detectionDispatched.value = false
-        error.value = '探测命令已不存在（可能被清理）。请重新点击「开始探测」。'
+        activeDetectionCommandID.value = ''
+        success.value = '探测完成。勾选要备份的内容并生成项目草稿。'
         return
       }
       const target = servers.value.find((item) => item.id === serverID)
       if (!target || target.status !== 'online') {
         detectionExhausted.value = true
         detectionDispatched.value = false
+        activeDetectionCommandID.value = ''
         error.value = `探测中止：${target ? `Agent「${target.name}」已离线` : '目标服务器已不存在'}。请确认 Agent 运行后重新探测。`
         return
       }
     } catch {
       // transient errors: keep polling
     }
-    pollDetection(serverID, remainingAttempts - 1)
+    pollDetection(serverID, commandID, remainingAttempts - 1)
   }, DETECTION_POLL_INTERVAL)
 }
 
@@ -869,6 +756,12 @@ function closeDetection() {
   detectionReport.value = null
   detectionExhausted.value = false
   detectionWarning.value = ''
+  detectionDispatched.value = false
+  activeDetectionCommandID.value = ''
+  detectionAttempts.value = 0
+  detectionSelection.apps = []
+  detectionSelection.databases = []
+  detectionSelection.containers = []
 }
 
 
@@ -879,8 +772,6 @@ function applyDetectionDraft() {
   const report = detectionReport.value
   const serverID = detectionServerID.value
   if (!report) return
-  Object.assign(projectForm, createProjectFormDraft())
-  projectForm.server_id = serverID
   const drafts: ProjectSourceDraft[] = []
   const skipped: string[] = []
 
@@ -919,13 +810,15 @@ function applyDetectionDraft() {
     error.value = `所选内容没有可备份的数据${reason}。容器需要挂载卷才有持久化数据。`
     return
   }
+  Object.assign(projectForm, createProjectFormDraft(serverID, repositories.value[0]?.id ?? ''))
   projectForm.sources = drafts
   projectForm.name = `探测草稿 · ${servers.value.find((item) => item.id === serverID)?.name || serverID}`
   detectionSelection.apps = []
   detectionSelection.databases = []
   detectionSelection.containers = []
-  activeTab.value = 'projects'
+  navigateTo('projects')
   editingProjectID.value = ''
+  projectEditorOpen.value = true
   window.requestAnimationFrame(() => {
     document.getElementById('project-builder')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   })
@@ -1017,6 +910,7 @@ async function saveProject() {
     if (projectID) await controlPlane.projects.replace(projectID, payload)
     else await controlPlane.projects.create(payload)
     resetProjectForm()
+    projectEditorOpen.value = false
     await loadCoreData()
     success.value = projectID
       ? '项目配置已更新，Agent 将在下一次同步时原子替换执行计划。'
@@ -1032,8 +926,14 @@ function resetProjectForm() {
   ))
 }
 
+function cancelProjectEditor() {
+  resetProjectForm()
+  projectEditorOpen.value = false
+}
+
 function openProjectEditor(project: Project) {
   editingProjectID.value = project.id
+  projectEditorOpen.value = true
   Object.assign(projectForm, projectFormDraftFromProject(project))
   window.requestAnimationFrame(() => {
     document.getElementById('project-builder')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -1270,9 +1170,6 @@ function retryActiveTabData() {
   void loadTabData(activeTab.value, true)
 }
 
-function projectHealthSummary(health?: ProjectHealth): string {
-  return describeProjectHealth(health, nowEpoch.value)
-}
 function navBadge(tab: Tab): number {
   return {
     overview: attentionCount.value,
@@ -1307,37 +1204,29 @@ function latestRetentionPreview(projectID: string): Run | undefined {
   return runs.value.find((run) => run.project_id === projectID && run.stats?.operation === 'retention_preview')
 }
 
-function retentionPreviewSummary(projectID: string): string {
-  const preview = latestRetentionPreview(projectID)
-  if (!preview) return ''
-  if (preview.status !== 'succeeded') return `预览失败：${preview.error_message || 'Agent 未返回有效结果'}`
-  return `保留 ${Number(preview.stats?.snapshots_kept || 0)} 份 · 将删除 ${Number(preview.stats?.snapshots_removed || 0)} 份 · 未执行删除`
-}
-
-const controlPlaneVersion = ref('')
-const controlPlaneCommit = ref('')
-
-async function buildInstallCommand(result: EnrollmentResult): Promise<string> {
+function buildInstallCommand(result: EnrollmentResult, controlVersion: string): string {
   // One command must work from a bare host: the installer fetches the agent
   // release asset, registers, and starts the systemd service. The agent
   // only accepts plain HTTP against loopback, so an http:// public API URL
-  // is rewritten to localhost with a note that cross-host use needs HTTPS.
-  const isPlainHTTP = apiBaseURL.startsWith('http://') && !apiBaseURL.includes('localhost') && !apiBaseURL.includes('127.0.0.1')
-  const agentURL = isPlainHTTP ? 'http://localhost:8080' : apiBaseURL
-  // An edge control plane speaks unreleased commands (e.g. detect); the
-  // agent must track the same channel or the command will be rejected.
-  const channel = controlPlaneVersion.value.startsWith('edge') ? 'VAULTMESH_AGENT_VERSION=edge ' : ''
-  return `curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo ${channel}sh -s -- install-agent '${agentURL}' '${result.enrollment_token}' '${result.server.name}'`
+  // is rewritten to localhost; cross-host use requires HTTPS.
+  return buildAgentInstallCommand(apiBaseURL, result.enrollment_token, controlVersion)
+}
+
+function handleUIError(event: Event) {
+  error.value = `界面发生错误：${(event as CustomEvent<string>).detail}`
 }
 
 onMounted(() => {
-  window.addEventListener('vaultmesh-ui-error', (event) => {
-    error.value = `界面发生错误：${(event as CustomEvent<string>).detail}`
-  })
+  window.addEventListener('vaultmesh-ui-error', handleUIError)
   void controlPlane.meta.get().then((meta) => {
     controlPlaneVersion.value = meta.version
     controlPlaneCommit.value = meta.commit
-  }).catch(() => {})
+    controlPlaneHTTPSReady.value = meta.https_ready
+  }).catch(() => {
+    // Enrollment remains usable on older control planes whose metadata does
+    // not expose the version capability fields yet.
+    controlPlaneVersion.value = ''
+  })
 })
 
 onMounted(async () => {
@@ -1362,9 +1251,11 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('vaultmesh-ui-error', handleUIError)
   window.removeEventListener('popstate', syncTabFromLocation)
   if (clockTimer) window.clearInterval(clockTimer)
   if (refreshTimer) window.clearInterval(refreshTimer)
+  window.clearTimeout(detectionPollTimer)
   snapshotPollTimers.forEach((timer) => window.clearTimeout(timer))
   snapshotPollTimers.clear()
 })
@@ -1423,9 +1314,9 @@ onBeforeUnmount(() => {
         </button>
       </nav>
       <div class="sidebar-system">
-        <div><span class="system-pulse"></span><strong>API 已连接</strong></div>
+        <div><span class="system-pulse" :class="{ stale: syncError || !lastUpdatedAt }"></span><strong>{{ syncError ? '数据同步失败' : lastUpdatedAt ? '数据同步正常' : '等待数据同步' }}</strong></div>
         <code>{{ apiBaseURL.replace(/^https?:\/\//, '') }}</code>
-        <small>Control Plane 与 Web 独立运行</small>
+        <small>{{ syncError || '每 30 秒自动刷新运行状态' }}</small>
       </div>
       <button type="button" class="sidebar-account" :class="{ active: activeTab === 'profile' }" @click="navigateTo('profile')">
         <span class="account-avatar">{{ (profile.username || 'A').slice(0, 1).toUpperCase() }}</span>
@@ -1433,7 +1324,7 @@ onBeforeUnmount(() => {
         <span class="account-chevron">›</span>
       </button>
       <div class="sidebar-footer">
-        <span class="app-version" :title="`commit ${controlPlaneCommit || '…'}`"><strong>VaultMesh</strong> {{ controlPlaneVersion.replace(/^edge-/, 'edge ') || '…' }}</span>
+        <span class="app-version" :title="`commit ${controlPlaneCommit || '…'}`"><strong>VaultMesh</strong> {{ controlPlaneVersionLabel }}</span>
         <button type="button" class="ghost" @click="refreshData()" :disabled="loading || backgroundRefreshing">{{ backgroundRefreshing ? '同步中…' : '刷新' }}</button>
         <button type="button" class="ghost" @click="logout">退出</button>
       </div>
@@ -1451,75 +1342,16 @@ onBeforeUnmount(() => {
 
       <p v-if="error" class="message error" role="alert">{{ error }}</p>
       <p v-if="success" class="message success" role="status" aria-live="polite">{{ success }}</p>
-      <div v-if="loadingTabs.has(activeTab)" class="page-load-state" role="status"><i></i><span>正在加载{{ activeTab === 'snapshots' ? '快照索引' : '审计事件' }}…</span></div>
+      <div v-if="loadingTabs.has(activeTab)" class="page-load-state" role="status"><i></i><span>正在加载{{ activeTab === 'snapshots' ? '快照索引' : activeTab === 'notifications' ? '通知与告警' : '审计事件' }}…</span></div>
       <div v-else-if="pageError" class="page-load-state failed" role="alert"><span>{{ pageError }}</span><button type="button" class="text-button" @click="retryActiveTabData">重试当前页面</button></div>
+      <div v-if="authenticated && controlPlaneHTTPSReady === false" class="page-load-state warning-banner" role="status"><span>⚠ HTTPS 未配置：备份、探测、快照同步与恢复等 Agent 操作已禁用；配置和历史记录仍可查看。将 .env 中的 VAULTMESH_PUBLIC_API_URL 改为 https:// 域名（或设置 VAULTMESH_HTTPS_ENABLED=true）并重启 Control Plane 后解锁。</span></div>
 
-      <template v-if="activeTab === 'overview'">
-        <div class="overview-strip">
-          <div><span class="operational-dot"></span><strong>Backup operations</strong><small>基于最近 100 次运行和当前 Agent 心跳聚合</small></div>
-          <span>最近刷新 · {{ lastUpdatedAt ? new Intl.DateTimeFormat('zh-CN', { timeStyle: 'medium' }).format(new Date(lastUpdatedAt)) : '等待同步' }}</span>
-        </div>
-        <div class="metric-grid dense-metrics">
-          <article class="metric"><header><span>AGENT HEALTH</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ dashboard.servers_online }}<small>/{{ dashboard.servers_total }}</small></strong><em>{{ onlineRate }}%</em></div><footer>在线节点 <span>{{ dashboard.servers_total - dashboard.servers_online }} 异常</span></footer></article>
-          <article class="metric"><header><span>SUCCESS RATE</span><i class="metric-signal" :class="successRate >= 95 ? 'good' : successRate >= 80 ? 'warn' : 'bad'"></i></header><div class="metric-value"><strong>{{ successRate }}<small>%</small></strong><em>{{ successfulRunCount }}/{{ totalRunCount }}</em></div><footer>最近 100 次 <span>{{ totalRunCount ? '有效样本' : '等待数据' }}</span></footer></article>
-          <article class="metric"><header><span>24H SNAPSHOTS</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ dashboard.runs_succeeded }}</strong><em>success</em></div><footer>有效快照 <span>{{ dashboard.runs_partial }} 次部分成功</span></footer></article>
-          <article class="metric"><header><span>PROTECTED SOURCES</span><i class="metric-signal"></i></header><div class="metric-value"><strong>{{ protectedSourceCount }}</strong><em>{{ projects.length }} projects</em></div><footer>文件与数据库 <span>{{ repositories.length }} 个仓库</span></footer></article>
-          <article class="metric" :class="{ alert: attentionCount + rpoRiskCount > 0 }"><header><span>NEEDS ATTENTION</span><i class="metric-signal" :class="attentionCount + rpoRiskCount ? 'bad' : 'good'"></i></header><div class="metric-value"><strong>{{ attentionCount + rpoRiskCount }}</strong><em>RUN / RPO</em></div><footer>{{ attentionCount }} 次异常运行 · {{ rpoRiskCount }} 个 RPO 风险 <span>{{ attentionCount + rpoRiskCount ? '需要处理' : '状态正常' }}</span></footer></article>
-          <article class="metric countdown-metric"><header><span>NEXT BACKUP</span><i class="metric-signal good"></i></header><div class="metric-value"><strong>{{ nextBackupCountdown }}</strong></div><footer><template v-if="nextScheduledProject"><span>{{ nextScheduledProject.project.name }}</span><span>{{ formatNextRun(nextScheduledProject.project) }}</span></template><template v-else><span>暂无已启用计划</span></template></footer></article>
-        </div>
-
-        <div class="dashboard-grid primary-dashboard">
-          <section class="panel trend-panel">
-            <div class="panel-heading compact-heading"><div><p class="eyebrow">RUN TELEMETRY</p><h2>7 日运行趋势</h2></div><div class="chart-legend"><span class="succeeded">成功</span><span class="partial">部分</span><span class="failed">失败</span></div></div>
-            <div class="stacked-chart">
-              <div class="chart-axis"><span>MAX</span><span>50%</span><span>0</span></div>
-              <div class="chart-plot">
-                <div class="chart-grid-lines"><i></i><i></i><i></i></div>
-                <div v-for="point in runTrend" :key="point.key" class="chart-column">
-                  <div class="bar-total" :title="`${point.label}: ${point.total} 次`">
-                    <span class="bar-segment failed" :style="{ height: `${point.failedHeight}%` }"></span>
-                    <span class="bar-segment partial" :style="{ height: `${point.partialHeight}%` }"></span>
-                    <span class="bar-segment succeeded" :style="{ height: `${point.succeededHeight}%` }"></span>
-                  </div>
-                  <strong>{{ point.total }}</strong><small>{{ point.label }}</small>
-                </div>
-              </div>
-            </div>
-            <div class="chart-summary"><span>7 日总运行 <strong>{{ runTrend.reduce((sum, point) => sum + point.total, 0) }}</strong></span><span>成功 <strong class="good-text">{{ runTrend.reduce((sum, point) => sum + point.succeeded, 0) }}</strong></span><span>异常 <strong class="bad-text">{{ runTrend.reduce((sum, point) => sum + point.failed + point.partial, 0) }}</strong></span></div>
-          </section>
-
-          <section class="panel distribution-panel">
-            <div class="panel-heading compact-heading"><div><p class="eyebrow">OUTCOME MIX</p><h2>运行结果</h2></div><span class="sample-size">N={{ totalRunCount }}</span></div>
-            <div class="donut-layout">
-              <div class="donut-chart" :style="{ background: runDonutBackground }"><div><strong>{{ successRate }}%</strong><small>成功率</small></div></div>
-              <div class="distribution-list"><div v-for="item in runDistribution" :key="item.key"><i :style="{ background: item.color }"></i><span>{{ item.label }}</span><strong>{{ item.count }}</strong><small>{{ totalRunCount ? Math.round(item.count / totalRunCount * 100) : 0 }}%</small></div></div>
-            </div>
-            <div class="micro-sparkline" aria-label="每日运行量"><i v-for="point in runTrend" :key="point.key" :style="{ height: `${Math.max(point.total ? 10 : 3, point.totalHeight)}%` }"></i></div>
-          </section>
-        </div>
-
-        <div class="dashboard-grid secondary-dashboard">
-          <section class="panel health-panel">
-            <div class="panel-heading compact-heading"><div><p class="eyebrow">PROTECTION MATRIX</p><h2>项目健康度</h2></div><button class="text-button" @click="navigateTo('projects')">管理项目 →</button></div>
-            <div v-if="!projectHealth.length" class="empty-state compact-empty">尚未创建备份项目。</div>
-            <div v-else class="table-wrap"><table class="dense-table"><thead><tr><th>项目</th><th>数据源</th><th>最近结果</th><th>耗时</th><th>下次计划</th></tr></thead><tbody>
-              <tr v-for="row in projectHealth" :key="row.project.id"><td><strong>{{ row.project.name }}</strong><small>{{ serverName(row.project.server_id) }}</small></td><td><div class="source-dots"><i v-for="source in row.project.sources" :key="source.id" :class="source.type" :title="sourceSummary(source)"></i><span>{{ row.project.sources.length }}</span></div></td><td><span class="status-pill" :class="row.status">{{ row.latest ? statusLabel(row.status) : '无运行' }}</span><small>{{ row.latest ? formatDate(row.latest.started_at) : '等待首次执行' }}</small></td><td>{{ row.latest ? formatDuration(row.latest) : '—' }}</td><td><strong>{{ formatNextRun(row.project) }}</strong><small>{{ cronDescription(row.project.schedule.cron) }}</small></td></tr>
-            </tbody></table></div>
-          </section>
-
-          <section class="panel infrastructure-panel">
-            <div class="panel-heading compact-heading"><div><p class="eyebrow">INFRASTRUCTURE</p><h2>Agent 状态</h2></div><button class="text-button" @click="navigateTo('servers')">全部 →</button></div>
-            <div v-if="!servers.length" class="empty-state compact-empty">暂无 Agent。</div>
-            <div v-else class="server-density-list"><article v-for="server in servers.slice(0, 6)" :key="server.id"><span class="server-state" :class="server.status"></span><div><strong>{{ server.name }}</strong><small>{{ server.hostname || '尚未注册' }} · {{ server.agent_version || '—' }}</small></div><div class="revision-meter"><span><i :style="{ width: `${server.desired_revision ? Math.min(100, server.applied_revision / server.desired_revision * 100) : 100}%` }"></i></span><small>rev {{ server.applied_revision }}/{{ server.desired_revision }}</small></div></article></div>
-          </section>
-        </div>
-
-        <section class="panel recent-panel">
-          <div class="panel-heading compact-heading"><div><p class="eyebrow">EVENT STREAM</p><h2>最近运行</h2></div><button class="text-button" @click="navigateTo('runs')">查看 100 条记录 →</button></div>
-          <div v-if="!runs.length" class="empty-state compact-empty">尚无运行记录。图表会在 Agent 上报首个结果后自动生成。</div>
-          <div v-else class="recent-run-grid"><article v-for="run in runs.slice(0, 8)" :key="run.id"><span class="status-line" :class="run.status"></span><div><strong>{{ projectNames.get(run.project_id) ?? run.project_id }}</strong><small>{{ formatDate(run.started_at) }}</small></div><span class="status-copy">{{ statusLabel(run.status) }}</span><code>{{ formatDuration(run) }}</code></article></div>
-        </section>
-      </template>
+      <OverviewView v-if="activeTab === 'overview'"
+        :dashboard="dashboard" :projects="projects" :health="projectHealthItems"
+        :servers="servers" :runs="runs" :repository-count="repositories.length"
+        :now-epoch="nowEpoch" :last-updated-at="lastUpdatedAt" :sync-error="syncError"
+        @navigate="navigateTo"
+      />
 
       <template v-else-if="activeTab === 'servers'">
         <div class="content-grid">
@@ -1538,6 +1370,7 @@ onBeforeUnmount(() => {
         <section v-if="enrollment" class="panel enrollment-card">
           <div><p class="eyebrow">ONE-TIME TOKEN</p><h2>在 {{ enrollment.server.name }} 上运行</h2></div>
           <code>{{ installCommandText }}</code>
+          <p v-if="installCommandSameHostOnly" class="setting-warning enrollment-warning">当前 API 地址是远程明文 HTTP，上方命令已安全改写为 <code>http://localhost:8080</code>，因此只适用于 Agent 与 Control Plane 安装在同一台机器。要备份其他服务器，请先配置 HTTPS，再重新创建注册码。</p>
           <p>令牌将在 {{ formatDate(enrollment.expires_at) }} 过期，并且只能使用一次。关闭本提示后无法再次查看完整令牌。</p>
           <button class="ghost" @click="enrollment = null">我已保存</button>
         </section>
@@ -1545,13 +1378,9 @@ onBeforeUnmount(() => {
 
       <template v-else-if="activeTab === 'repositories'">
         <section class="panel repository-guide">
-          <div class="panel-heading"><div><p class="eyebrow">INDUSTRY-BACKED STORAGE MODEL</p><h2>仓库类型来自成熟项目的真实实现</h2></div><span class="sample-size">{{ repositoryProviders.length }} TYPES</span></div>
-          <div class="guide-steps">
-            <article><span>1</span><div><strong>Restic 是协议标准</strong><small>VaultMesh 的执行引擎就是 Restic，因此原生后端、URL 格式和环境变量以官方文档为准。</small><a href="https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html" target="_blank" rel="noreferrer">官方后端列表 ↗</a></div></article>
-            <article><span>2</span><div><strong>1Panel 提供产品字段参考</strong><small>S3、OSS、COS、SFTP、WebDAV 与网盘的字段分组参考其公开实现，不凭空发明表单。</small><a href="https://github.com/1Panel-dev/1Panel/blob/dev-v2/frontend/src/views/setting/backup-account/operate/index.vue" target="_blank" rel="noreferrer">查看源码 ↗</a></div></article>
-            <article><span>3</span><div><strong>Kopia 用于交叉验证</strong><small>用另一套成熟备份系统核对 S3、Azure、B2、GCS、SFTP、WebDAV 与 rclone 的分类边界。</small><a href="https://kopia.io/docs/repositories/" target="_blank" rel="noreferrer">仓库文档 ↗</a></div></article>
-          </div>
-          <p class="guide-note">没有跨所有备份软件的“万能表单”：SFTP、S3、Swift、Azure 和 OAuth 网盘的认证模型不同。VaultMesh 采用统一的三层模板：<code>Restic 原生协议</code>、<code>S3 厂商预设</code>、<code>rclone 扩展</code>。</p>
+          <h2>备份保存在哪里？</h2>
+          <p class="form-intro">选择已有的对象存储、远程服务器或本地目录。仓库可供多个项目使用，不同服务器的数据自动隔离；数据由 Agent 直接写入存储。</p>
+          <p class="field-help">首次使用建议选择独立的测试目录或 Bucket。Restic 仓库密码用于解密恢复，请另外安全保存。</p>
         </section>
         <div class="content-grid repository-grid">
           <section class="panel">
@@ -1576,18 +1405,24 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-else-if="activeTab === 'projects'">
+        <div class="project-workspace-heading">
+          <p class="muted">{{ projectEditorOpen ? '按步骤配置数据源、计划与保留策略。返回列表会保留当前草稿。' : '查看保护状态、发起备份，或添加新的备份计划。' }}</p>
+          <button v-if="projectEditorOpen" type="button" class="ghost" :disabled="loading" @click="projectEditorOpen = false">返回项目列表</button>
+          <button v-else type="button" class="primary" :disabled="loading || !servers.length || !repositories.length" @click="projectEditorOpen = true">{{ editingProjectID || projectForm.name ? '继续编辑草稿' : '+ 创建备份项目' }}</button>
+        </div>
+        <p v-if="!servers.length || !repositories.length" class="message" role="status">创建项目需要服务器和备份仓库。<button v-if="!servers.length" class="text-button" @click="navigateTo('servers')">添加服务器 →</button> <button v-if="!repositories.length" class="text-button" @click="navigateTo('repositories')">配置仓库 →</button></p>
         <div class="content-grid projects-grid">
-        <div class="projects-left">
+        <div v-show="!projectEditorOpen" class="projects-left">
         <section class="panel detection-toolbar">
           <div><p class="eyebrow">AUTO-DETECT</p><h2>自动发现可备份项</h2><small>只读扫描运行中的容器、数据库信号与应用目录；不读取文件内容，不收集密钥。</small></div>
           <div class="data-toolbar">
-            <select v-model="detectionServerID" :disabled="detectionRunning">
+            <select v-model="detectionServerID" :disabled="detectionRunning" aria-label="自动发现的目标服务器">
               <option value="" disabled>选择服务器</option>
               <option v-for="server in servers.filter((item) => item.status === 'online')" :key="server.id" :value="server.id">{{ server.name }}（{{ server.agent_version || '未知版本' }}）</option>
             </select>
-            <button type="button" class="primary compact-action" :disabled="loading || !detectionServerID || detectionRunning || detectionVersionBlocked" @click="startDetection(detectionServerID, true)">{{ detectionRunning ? '探测中…' : '开始探测' }}</button>
+            <button type="button" class="primary compact-action" :disabled="loading || agentWorkDisabled || !detectionServerID || detectionRunning || detectionVersionBlocked" @click="startDetection(detectionServerID, true)">{{ detectionRunning ? '探测中…' : '开始探测' }}</button>
           </div>
-          <p v-if="detectionVersionBlocked" class="detection-status stale">该 Agent 版本为 {{ detectionAgentVersion }}，不支持探测（需要 v0.1.2 或 edge）。重新安装：<code>curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo VAULTMESH_AGENT_VERSION=edge sh -s -- install-agent 'http://localhost:8080' '新令牌' '名称'</code></p>
+          <p v-if="detectionVersionBlocked" class="detection-status stale">该 Agent 版本为 {{ detectionAgentVersion || '未知' }}，不支持探测或无法确认能力（需要 v0.1.2 或 edge）。重新安装：<code>curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo VAULTMESH_AGENT_VERSION=edge sh -s -- install-agent 'http://localhost:8080' '新令牌'</code></p>
           <p v-if="detectionRunning" class="detection-status" role="status"><i></i>已派发给 {{ detectionTargetName }}（{{ detectionServerID }}）的 Agent，等待回传（第 {{ detectionAttempts }} 次尝试）…</p>
           <p v-else-if="detectionExhausted" class="detection-status stale">两分钟内没有收到回传，请查看下方诊断。</p>
         </section>
@@ -1599,7 +1434,7 @@ onBeforeUnmount(() => {
             <label v-for="(db, index) in detectionReport.databases" :key="'db' + index" class="check-row">
               <input type="checkbox" v-model="detectionSelection.databases" :value="index" />
               <span><strong>{{ db.kind === 'mysql' ? 'MySQL' : 'PostgreSQL' }} · {{ db.container || db.source }}</strong>
-              <small>127.0.0.1:{{ db.port || (db.kind === 'mysql' ? 3306 : 5432) }} · {{ db.reachable ? '端口可达' : '端口未发布，暂不可备份' }}{{ db.dump_tool ? ' · ' + db.dump_tool : '' }}</small></span>
+              <small>{{ db.host || '127.0.0.1' }}:{{ db.port || (db.kind === 'mysql' ? 3306 : 5432) }} · {{ db.reachable ? '端口可达' : '端口未发布，暂不可备份' }}{{ db.dump_tool ? ' · ' + db.dump_tool : '' }}</small></span>
             </label>
           </div>
 
@@ -1625,7 +1460,7 @@ onBeforeUnmount(() => {
 
           <footer class="form-actions">
             <button type="button" class="primary" :disabled="loading || !detectionHasSelection" @click="applyDetectionDraft">用所选生成项目草稿</button>
-            <button type="button" class="ghost" @click="startDetection(detectionServerID, true)" :disabled="loading || !detectionServerID">重新探测</button>
+            <button type="button" class="ghost" @click="startDetection(detectionServerID, true)" :disabled="loading || agentWorkDisabled || !detectionServerID">重新探测</button>
           </footer>
         </section>
         <section id="detection-diagnosis" v-if="detectionWarning" class="panel detection-diagnosis">
@@ -1635,7 +1470,7 @@ onBeforeUnmount(() => {
         <section id="detection-diagnosis" v-if="detectionExhausted" class="panel detection-diagnosis">
           <div class="panel-heading"><div><p class="eyebrow">DIAGNOSIS</p><h2>Agent 没有回传探测结果</h2></div></div>
           <ol>
-            <li v-if="detectionAgentVersion && detectionAgentVersion.startsWith('v0.1.')">Agent 版本是 <code>{{ detectionAgentVersion }}</code>，<strong>不支持探测命令</strong>。重新运行 install-agent 并设置 <code>VAULTMESH_AGENT_VERSION=edge</code> 升级。</li>
+            <li v-if="detectionAgentVersion">Agent 版本为 <code>{{ detectionAgentVersion }}</code>，已通过探测能力检查；超时通常表示 Agent 未能领取命令或扫描过程失败。</li>
             <li>查看 Agent 日志：<code>journalctl -u vaultmesh-agent -n 50</code>，关注 <code>detection</code> 或 <code>reject unsupported command</code> 关键字。</li>
             <li>确认 Agent 在线（服务器页状态为「在线」），并且与控制面的地址可达。</li>
           </ol>
@@ -1651,6 +1486,7 @@ onBeforeUnmount(() => {
             :queued-project-ids="queuedProjectIDs"
             :queued-preview-project-ids="queuedPreviewProjectIDs"
             :loading="loading"
+            :agent-work-disabled="agentWorkDisabled"
             @edit="openProjectEditor"
             @toggle="toggleProject"
             @preview="previewRetention"
@@ -1658,12 +1494,13 @@ onBeforeUnmount(() => {
             @archive="archiveProject"
           />
         </div>
-        <div class="projects-right">
+        <div v-if="projectEditorOpen" class="projects-right">
 <aside id="project-builder" class="panel form-panel project-builder" :class="{ editing: editingProjectID }">
-            <div class="builder-heading"><div><p class="eyebrow">{{ editingProjectID ? 'EDIT DESIRED STATE' : 'NEW PROJECT' }}</p><h2>{{ editingProjectID ? `编辑 ${editingProject?.name || '备份项目'}` : '创建备份项目' }}</h2></div><button v-if="editingProjectID" type="button" class="ghost compact" @click="resetProjectForm">取消编辑</button></div>
+            <div class="builder-heading"><div><p class="eyebrow">{{ editingProjectID ? 'EDIT DESIRED STATE' : 'NEW PROJECT' }}</p><h2>{{ editingProjectID ? `编辑 ${editingProject?.name || '备份项目'}` : '创建备份项目' }}</h2></div><button v-if="editingProjectID" type="button" class="ghost compact" :disabled="loading" @click="cancelProjectEditor">取消编辑</button></div>
             <p class="form-intro">一个项目可以组合文件、Docker、MySQL 和 PostgreSQL 数据源，并在同一个 Restic 快照中归档。</p>
             <div v-if="editingProjectID" class="editing-notice"><strong>原地更新执行策略</strong><span>服务器与仓库保持不变，以保留 Agent 所有权和既有快照恢复链；保存后会生成新的配置 Revision。</span></div>
             <form @submit.prevent="saveProject">
+              <fieldset :disabled="loading" aria-label="项目配置">
               <section class="form-section">
                 <div class="section-title"><span>1</span><div><strong>基础信息</strong><small>选择 Agent 和快照写入位置</small></div></div>
                 <div class="form-row"><label>执行服务器<select v-model="projectForm.server_id" required :disabled="Boolean(editingProjectID)" @change="selectDefaults"><option value="" disabled>选择运行备份的 Agent</option><option v-for="server in servers" :key="server.id" :value="server.id">{{ server.name }}</option></select></label><label>备份仓库<select v-model="projectForm.repository_id" required :disabled="Boolean(editingProjectID)"><option value="" disabled>选择独立存储渠道</option><option v-for="repository in repositories" :key="repository.id" :value="repository.id">{{ repository.name }} · {{ providerLabel(repository.provider) }}</option></select></label></div>
@@ -1705,8 +1542,9 @@ onBeforeUnmount(() => {
                 <div class="form-row"><label>计划类型<select v-model="projectForm.schedule_mode"><option value="daily">每天</option><option value="weekly">每周</option><option value="custom">高级 Cron</option></select></label><label v-if="projectForm.schedule_mode !== 'custom'">开始时间<input v-model="projectForm.schedule_time" type="time" required /></label><label v-else>Cron（5 段）<input v-model="projectForm.custom_cron" required placeholder="0 2 * * *" /></label></div>
                 <div v-if="projectForm.schedule_mode === 'weekly'" class="weekday-grid" role="group" aria-label="选择星期"><button v-for="(day, index) in weekdays" :key="day" type="button" :class="{ active: projectForm.weekday === String(index) }" @click="projectForm.weekday = String(index)">{{ day }}</button></div>
                 <label>时区<input v-model="projectForm.timezone" required list="timezone-options" /><datalist id="timezone-options"><option v-for="timezone in commonTimezones" :key="timezone" :value="timezone" /></datalist></label>
-                <div class="form-row"><label>随机延迟<select v-model.number="projectForm.jitter_minutes"><option :value="0">不延迟</option><option :value="5">最多 5 分钟</option><option :value="10">最多 10 分钟</option><option :value="30">最多 30 分钟</option><option :value="60">最多 60 分钟</option></select></label><label>最长运行时间<select v-model.number="projectForm.max_runtime_hours"><option :value="1">1 小时</option><option :value="3">3 小时</option><option :value="6">6 小时</option><option :value="12">12 小时</option><option :value="24">24 小时</option></select></label></div>
-                <label>完成时限宽限（分钟）<input v-model.number="projectForm.grace_minutes" type="number" min="1" max="10080" required /><small class="field-help">计划到点后先进入“迟到”；超过随机延迟 + 最长运行时间 + 此宽限仍无成功备份，才标记为 RPO 超时。</small></label>
+                <div class="form-row"><DurationInput v-model="projectForm.jitter_seconds" label="随机延迟上限" :min="0" :max="3600" /><DurationInput v-model="projectForm.max_runtime_seconds" label="最长运行时间" :min="60" :max="604800" /></div>
+                <DurationInput v-model="projectForm.grace_seconds" label="完成时限宽限" :min="60" :max="604800" />
+                <p class="field-help">计划到点后先进入“迟到”；超过随机延迟 + 最长运行时间 + 此宽限仍无成功备份，才标记为 RPO 超时。</p>
                 <div class="schedule-preview"><span>计划预览</span><strong>{{ projectSchedulePreview }}</strong><code>{{ projectCron }}</code></div>
               </section>
               <section class="form-section">
@@ -1726,20 +1564,23 @@ onBeforeUnmount(() => {
                   </div>
                   <label v-else>保留时间范围<input v-model.trim="projectForm.keep_within" required pattern="(?:[1-9][0-9]*[ymdh])+" placeholder="例如 90d、6m、1y" /><small class="field-help">Restic duration：<code>h</code> 小时、<code>d</code> 天、<code>m</code> 月、<code>y</code> 年，可组合为 <code>1y6m</code>。</small></label>
                 </template>
-                <label v-if="projectForm.retention_enabled" class="check-row caution-row"><input v-model="projectForm.prune" type="checkbox" /><span><strong>定期回收未引用空间</strong><small><code>prune</code> 会锁定仓库并重写数据，启用后只在下方独立维护窗口执行，不阻塞备份。</small></span></label>
-                <div class="form-row"><label>仓库校验<select v-model="projectForm.verification_mode"><option value="off">关闭</option><option value="metadata">检查仓库结构</option><option value="subset">抽样读取数据</option><option value="full">读取全部数据（高成本）</option></select></label><label v-if="projectForm.verification_mode === 'subset'">抽样比例<select v-model="projectForm.read_data_subset"><option value="1%">1%</option><option value="5%">5%</option><option value="10%">10%</option><option value="25%">25%</option></select></label></div>
-                <div class="maintenance-window">
-                  <div><strong>独立维护窗口</strong><small>Forget、Prune、Check 使用项目时区单独调度；仓库级互斥锁会避免它们与备份并发。</small></div>
+                <label v-if="projectForm.retention_enabled" class="check-row caution-row"><input v-model="projectForm.prune" type="checkbox" /><span><strong>回收未引用空间</strong><small>回收会锁定仓库并重写数据；建议安排在独立维护窗口，与备份错开。</small></span></label>
+                <div class="form-row"><label>仓库校验<select v-model="projectForm.verification_mode"><option value="off">关闭</option><option value="metadata">检查仓库结构</option><option value="subset">抽样读取数据</option><option value="full">读取全部数据（高成本）</option></select></label><label v-if="projectForm.verification_mode === 'subset'">抽样比例<input v-model="projectForm.read_data_subset" required pattern="(?:100|[1-9][0-9]?)%" placeholder="例如 5%" /><small class="field-help">1% 至 100%。</small></label></div>
+                <label class="check-row"><input v-model="projectForm.maintenance_separate" type="checkbox" /><span><strong>独立安排维护时间</strong><small>关闭时在备份后执行；开启后分别安排清理、回收和校验。</small></span></label>
+                <div v-if="projectForm.maintenance_separate" class="maintenance-window">
+                  <div><strong>独立维护窗口</strong><small>仓库锁会避免维护与备份并发；请将运行时间错开。</small></div>
+                  <label>维护时区<input v-model="projectForm.maintenance_timezone" list="timezone-options" :placeholder="projectForm.timezone" /><small class="field-help">留空使用备份计划时区；可为维护单独设置。</small></label>
                   <div class="maintenance-cron-grid">
                     <label v-if="projectForm.retention_enabled">清理快照 Cron<input v-model.trim="projectForm.retention_cron" required placeholder="30 3 * * *" /><small class="field-help">只执行 Forget，不回收数据块。</small></label>
                     <label v-if="projectForm.retention_enabled && projectForm.prune">空间回收 Cron<input v-model.trim="projectForm.prune_cron" required placeholder="0 4 * * 0" /><small class="field-help">建议每周低峰期执行。</small></label>
                     <label v-if="projectForm.verification_mode !== 'off'">仓库校验 Cron<input v-model.trim="projectForm.verification_cron" required placeholder="0 5 * * 0" /><small class="field-help">完整读取应安排在流量低峰。</small></label>
                   </div>
-                  <code>{{ projectForm.timezone }}</code>
+                  <code>{{ projectForm.maintenance_timezone || projectForm.timezone }}</code>
                 </div>
                 <p class="policy-reference">字段与执行语义直接采用 <a href="https://restic.readthedocs.io/en/stable/040_backup.html" target="_blank" rel="noreferrer">Restic backup</a>、<a href="https://restic.readthedocs.io/en/stable/060_forget.html" target="_blank" rel="noreferrer">forget/prune</a> 和 <a href="https://kopia.io/docs/reference/command-line/common/policy-set/" target="_blank" rel="noreferrer">Kopia policy</a> 的成熟模型。</p>
               </section>
-              <div class="form-actions project-form-actions"><button v-if="editingProjectID" type="button" class="ghost" @click="resetProjectForm">取消</button><button class="primary" :disabled="loading || !servers.length || !repositories.length">{{ editingProjectID ? '保存并下发新 Revision' : '创建并下发' }}</button></div>
+              <div class="form-actions project-form-actions"><button type="button" class="ghost" @click="cancelProjectEditor">放弃草稿</button><button class="primary" :disabled="loading || !servers.length || !repositories.length">{{ editingProjectID ? '保存项目配置' : '创建并下发' }}</button></div>
+              </fieldset>
             </form>
           </aside>
         </div>
@@ -1751,7 +1592,7 @@ onBeforeUnmount(() => {
             <div><p class="eyebrow">RECOVERY INDEX</p><h2>可恢复快照</h2></div>
             <div class="snapshot-toolbar">
               <label>项目筛选<select v-model="snapshotProjectFilter"><option value="">全部项目</option><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }} · {{ serverName(project.server_id) }}</option></select></label>
-              <button type="button" class="primary compact-action" :disabled="loading || !projects.length" @click="refreshSnapshotInventory">从 Agent 同步</button>
+              <button type="button" class="primary compact-action" :disabled="loading || agentWorkDisabled || !projects.length" @click="refreshSnapshotInventory">从 Agent 同步</button>
             </div>
           </div>
           <div class="snapshot-metrics">
@@ -1771,13 +1612,13 @@ onBeforeUnmount(() => {
             </div>
             <div v-else class="snapshot-list">
               <article v-for="snapshot in filteredSnapshots" :key="`${snapshot.project_id}:${snapshot.id}`" :class="{ active: selectedSnapshotID === snapshot.id && selectedSnapshotProjectID === snapshot.project_id }">
-                <button type="button" class="snapshot-select" @click="selectSnapshot(snapshot)">
+                <button type="button" class="snapshot-select" :disabled="agentWorkDisabled" @click="selectSnapshot(snapshot)">
                   <span class="snapshot-state" :class="{ protected: snapshot.protected }">{{ snapshot.protected ? '◆' : '●' }}</span>
                   <span><strong>{{ formatDate(snapshot.time) }}</strong><small>{{ projectNames.get(snapshot.project_id) ?? snapshot.project_id }} · {{ serverName(snapshot.server_id) }}</small></span>
                   <code>{{ snapshot.id.slice(0, 12) }}</code>
                 </button>
                 <div class="snapshot-facts"><span>{{ Number(snapshot.total_files || 0).toLocaleString() }} 文件</span><span>{{ formatBytes(snapshot.total_bytes) }}</span><span>{{ snapshot.paths.length }} 根路径</span></div>
-                <div class="snapshot-card-footer"><span :title="snapshot.paths.join(', ')">{{ snapshot.paths.join(', ') || '/' }}</span><button type="button" class="text-button" :disabled="loading" @click="toggleSnapshotProtection(snapshot)">{{ snapshot.protected ? '取消保护' : '永久保护' }}</button></div>
+                <div class="snapshot-card-footer"><span :title="snapshot.paths.join(', ')">{{ snapshot.paths.join(', ') || '/' }}</span><button type="button" class="text-button" :disabled="loading || agentWorkDisabled" @click="toggleSnapshotProtection(snapshot)">{{ snapshot.protected ? '取消保护' : '永久保护' }}</button></div>
               </article>
             </div>
           </section>
@@ -1789,11 +1630,11 @@ onBeforeUnmount(() => {
             <template v-else>
               <header class="snapshot-browser-header">
                 <div><p class="eyebrow">POINT-IN-TIME BROWSER</p><h2>{{ projectNames.get(selectedSnapshot.project_id) }} <code>{{ selectedSnapshot.id.slice(0, 12) }}</code></h2><small>{{ formatDate(selectedSnapshot.time) }} · {{ selectedSnapshot.hostname || serverName(selectedSnapshot.server_id) }}</small></div>
-                <div class="browser-actions"><span class="protection-badge" :class="{ active: selectedSnapshot.protected }">{{ selectedSnapshot.protected ? '◆ 已保护' : '普通快照' }}</span><button type="button" class="ghost compact" :disabled="loading" @click="browseSnapshotPath(snapshotBrowsePath)">重新读取</button><button type="button" class="primary compact-action" :disabled="loading" @click="requestSnapshotRestore(snapshotBrowsePath)">恢复当前目录</button></div>
+                <div class="browser-actions"><span class="protection-badge" :class="{ active: selectedSnapshot.protected }">{{ selectedSnapshot.protected ? '◆ 已保护' : '普通快照' }}</span><button type="button" class="ghost compact" :disabled="loading || agentWorkDisabled" @click="browseSnapshotPath(snapshotBrowsePath)">重新读取</button><button type="button" class="primary compact-action" :disabled="loading || agentWorkDisabled" @click="requestSnapshotRestore(snapshotBrowsePath)">恢复当前目录</button></div>
               </header>
 
               <div class="snapshot-breadcrumbs" role="navigation" aria-label="快照路径">
-                <button v-for="(crumb, index) in snapshotBreadcrumbs" :key="crumb.path" type="button" :disabled="loading || index === snapshotBreadcrumbs.length - 1" @click="browseSnapshotPath(crumb.path)">{{ crumb.label }}</button>
+                <button v-for="(crumb, index) in snapshotBreadcrumbs" :key="crumb.path" type="button" :disabled="loading || agentWorkDisabled || index === snapshotBreadcrumbs.length - 1" @click="browseSnapshotPath(crumb.path)">{{ crumb.label }}</button>
               </div>
 
               <div v-if="snapshotBrowsePending" class="operation-state running"><i></i><div><strong>Agent 正在读取仓库目录</strong><small>命令 {{ snapshotBrowseCommandID }} · 通常在 10–30 秒内返回</small></div></div>
@@ -1801,12 +1642,12 @@ onBeforeUnmount(() => {
               <div v-else-if="!currentBrowseRun" class="empty-state compact-empty">点击“重新读取”获取当前目录。</div>
               <div v-else-if="!snapshotEntries.length" class="empty-state compact-empty">这个目录是空的。</div>
               <div v-else class="table-wrap snapshot-file-table"><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>权限</th><th>修改时间</th><th></th></tr></thead><tbody>
-                <tr v-for="entry in snapshotEntries" :key="entry.path"><td><button v-if="entry.type === 'dir'" type="button" class="file-name directory" :disabled="loading" @click="browseSnapshotPath(entry.path)"><span>{{ snapshotEntryIcon(entry) }}</span>{{ snapshotEntryName(entry) }}</button><span v-else class="file-name"><span>{{ snapshotEntryIcon(entry) }}</span>{{ snapshotEntryName(entry) }}</span></td><td><span class="source-chip">{{ entry.type === 'dir' ? '目录' : entry.type === 'symlink' ? '链接' : '文件' }}</span></td><td>{{ entry.type === 'dir' ? '—' : formatBytes(entry.size) }}</td><td><code>{{ entry.permissions || '—' }}</code></td><td>{{ formatDate(entry.modified_at) }}</td><td><button type="button" class="text-button" @click="requestSnapshotRestore(entry.path)">恢复</button></td></tr>
+                <tr v-for="entry in snapshotEntries" :key="entry.path"><td><button v-if="entry.type === 'dir'" type="button" class="file-name directory" :disabled="loading || agentWorkDisabled" @click="browseSnapshotPath(entry.path)"><span>{{ snapshotEntryIcon(entry) }}</span>{{ snapshotEntryName(entry) }}</button><span v-else class="file-name"><span>{{ snapshotEntryIcon(entry) }}</span>{{ snapshotEntryName(entry) }}</span></td><td><span class="source-chip">{{ entry.type === 'dir' ? '目录' : entry.type === 'symlink' ? '链接' : '文件' }}</span></td><td>{{ entry.type === 'dir' ? '—' : formatBytes(entry.size) }}</td><td><code>{{ entry.permissions || '—' }}</code></td><td>{{ formatDate(entry.modified_at) }}</td><td><button type="button" class="text-button" :disabled="agentWorkDisabled" @click="requestSnapshotRestore(entry.path)">恢复</button></td></tr>
               </tbody></table></div>
 
               <section v-if="pendingRestorePath" class="restore-confirmation">
                 <div><span class="warning-symbol small">!</span><div><strong>确认隔离恢复</strong><p>将 <code>{{ pendingRestorePath }}</code> 恢复到该 Agent 的新任务目录。系统强制使用 <code>--overwrite never</code>，不会写回原始路径，也不会覆盖已有恢复任务。</p></div></div>
-                <div><button type="button" class="ghost" @click="pendingRestorePath = null">取消</button><button type="button" class="primary" :disabled="loading" @click="confirmSnapshotRestore">确认创建恢复任务</button></div>
+                <div><button type="button" class="ghost" @click="pendingRestorePath = null">取消</button><button type="button" class="primary" :disabled="loading || agentWorkDisabled" @click="confirmSnapshotRestore">确认创建恢复任务</button></div>
               </section>
 
               <div v-if="snapshotRestorePending" class="operation-state running restore-state"><i></i><div><strong>安全恢复正在 Agent 上执行</strong><small>命令 {{ snapshotRestoreCommandID }} · 完成后这里会显示实际隔离目录</small></div></div>

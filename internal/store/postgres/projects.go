@@ -324,7 +324,7 @@ func (s *Store) ClaimCommands(ctx context.Context, serverID string, now, leaseUn
 		    AND accepted_at IS NULL
 		    AND (leased_until IS NULL OR leased_until <= $2)
 		    AND created_at >= $5
-		  ORDER BY created_at
+		  ORDER BY created_at, id
 		  LIMIT $4
 		  FOR UPDATE SKIP LOCKED
 		)
@@ -366,13 +366,32 @@ func (s *Store) SaveDetectionReport(ctx context.Context, serverID, commandID str
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	var commandType, projectID string
+	var commandCreatedAt time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT type, COALESCE(project_id, ''), created_at
+		FROM commands
+		WHERE id = $1 AND server_id = $2
+		FOR UPDATE`, commandID, serverID).Scan(&commandType, &projectID, &commandCreatedAt); errors.Is(err, pgx.ErrNoRows) {
+		return store.ErrNotFound
+	} else if err != nil {
+		return mapError(err)
+	}
+	if commandType != "detect" || projectID != "" {
+		return store.ErrConflict
+	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO detection_reports (server_id, command_id, report, detected_at)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO detection_reports (server_id, command_id, report, detected_at, command_created_at)
+		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (server_id) DO UPDATE SET
 		    command_id = EXCLUDED.command_id,
 		    report = EXCLUDED.report,
-		    detected_at = EXCLUDED.detected_at`, serverID, commandID, encoded, at); err != nil {
+		    detected_at = EXCLUDED.detected_at,
+		    command_created_at = EXCLUDED.command_created_at
+		WHERE detection_reports.command_id = EXCLUDED.command_id
+		   OR detection_reports.command_created_at IS NULL
+		   OR (detection_reports.command_created_at, detection_reports.command_id) < ($5, $2)`,
+		serverID, commandID, encoded, at, commandCreatedAt); err != nil {
 		return mapError(err)
 	}
 	if _, err := tx.Exec(ctx, `
@@ -412,7 +431,7 @@ func (s *Store) GetLatestCommand(ctx context.Context, serverID, commandType stri
 		SELECT id, server_id, COALESCE(project_id, ''), type, payload, leased_until, attempts, created_at
 		FROM commands
 		WHERE server_id = $1 AND type = $2
-		ORDER BY created_at DESC LIMIT 1`, serverID, commandType).Scan(
+		ORDER BY created_at DESC, id DESC LIMIT 1`, serverID, commandType).Scan(
 		&command.ID, &command.ServerID, &command.ProjectID, &command.Type,
 		&payload, &leasedUntil, &command.Attempts, &command.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

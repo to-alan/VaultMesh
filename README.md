@@ -35,7 +35,7 @@ less vaultmesh-install.sh
 sudo sh vaultmesh-install.sh
 ```
 
-服务默认只绑定回环地址：Web `http://localhost:3000`、API `http://localhost:8080`。远程主机先建 SSH 隧道：
+Compose 默认向所有网卡开放 Web `3000` 和 API `8080`，不要把明文端口作为正式公网入口。使用 SSH 隧道访问时，先在 `.env` 中设置 `VAULTMESH_BIND=127.0.0.1`，并把公开 API URL 和允许的 Origin 分别设为 `http://localhost:8080`、`http://localhost:3000`，重建容器后连接：
 
 ```bash
 ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 user@your-server
@@ -43,12 +43,14 @@ ssh -L 3000:127.0.0.1:3000 -L 8080:127.0.0.1:8080 user@your-server
 
 打开 `http://localhost:3000`，用安装脚本输出的账号密码登录。
 
+探测、手动备份和恢复等操作需要先配置可信 HTTPS 入口；仅建立 SSH 隧道不会解除 HTTPS 门控。具体配置见 [运维手册](./docs/OPERATIONS.md#https-与-agent-操作门控)。
+
 ### 安装 Agent
 
 在 Web 控制台创建“服务器”后，注册卡片会显示一条可直接复制的安装命令（在**要备份的那台机器**上执行）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh -s -- install-agent 'https://backup.example.com' 'enroll_xxx' '我的VPS'
+curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh -s -- install-agent 'https://backup.example.com' 'enroll_xxx'
 ```
 
 这条命令会自动：下载对应架构的 Agent 二进制并校验 SHA256 → 安装 systemd 服务 → 写入注册信息并启动 → 注册成功后从配置中清除一次性令牌。
@@ -66,7 +68,7 @@ Agent 与控制面的通信强制 HTTPS（仅 localhost 允许明文）。设备
 curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo sh -s -- uninstall-agent
 ```
 
-重装时安装器会自动重置旧设备身份；控制台里对应的服务器记录可在页面归档。
+重装时安装器会自动重置旧设备身份；如果新版本启动或注册失败，会恢复原有二进制、配置、systemd 单元和设备身份。控制台里被替换的服务器记录可在页面归档。
 
 ### 创建第一份备份
 
@@ -81,6 +83,8 @@ curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh |
 ### 容器镜像
 
 版本 tag 会自动发布 GHCR 镜像（`ghcr.io/to-alan/vaultmesh/vaultmesh-control`、`vaultmesh-web`、`vaultmesh-agent`）。生产部署固定版本 tag，不要使用 `latest`。本地 Compose 部署见 [compose.yaml](./compose.yaml)。
+
+主分支构建同时发布 `edge` 和 `edge-<完整提交 SHA>`；测试部署使用后者固定三种镜像到同一提交，并确认该提交的 CI 与 Edge Images 工作流都成功后再升级。
 
 ## 项目概览
 
