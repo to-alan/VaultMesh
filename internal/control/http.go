@@ -138,7 +138,7 @@ func (s *HTTPServer) agentWorkGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.httpsReady {
 			s.writeError(w, http.StatusForbidden, "https_required",
-				"HTTPS is not configured; Agent work is disabled. Set VAULTMESH_PUBLIC_API_URL to an https:// URL (or VAULTMESH_HTTPS_ENABLED=true) and restart.", nil)
+				"HTTPS is not configured; Agent work is disabled. Configure a real HTTPS reverse proxy, then update the public URL following the installation guide.", nil)
 			return
 		}
 		next.ServeHTTP(w, r)

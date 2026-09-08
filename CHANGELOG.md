@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+## [0.1.2-rc.2] - 2026-09-08
+
+候选测试版，不替换最新正式版。默认安装不再占用 80/443；没有新增数据库迁移或 Agent systemd unit 变更。完整安装、升级边界见 [RC2 说明](docs/RELEASE-v0.1.2-rc.2.md)。
+
+### 安装与代理
+
+- 默认改为 external HTTP 入口，优先使用回环 3000、占用时自动选择 3001–3099，支持 `--port`；域名可后配，只有显式 `--proxy managed` 才占用 80/443。安装前检查宿主机与 Docker 端口，不停止其他服务。
+- 新增 `configure-proxy`：备份原配置后更新公开地址、Cookie 与端口，仅重启同版本应用服务，保留密码、主密钥和 PostgreSQL；失败保留原 `.env` 以便恢复。
+- 新端口布局标记 `INSTALLER_API=2`，拒绝与旧包混装；增加先本地安装、再接入真实 Nginx HTTPS 的集成验收，未配置 HTTPS 时仍禁用敏感 Agent 操作。
+
+### 文档
+
+- 安装、升级示例统一说明 root 与普通用户的权限处理，避免精简系统缺少 sudo 时无法照抄；将 less 明确为可选查看步骤并说明 q / (END)，区分下载与真正安装，补充常见报错定位。
+
 ## [0.1.2-rc.1] - 2026-09-08
 
 候选测试版，不替换最新正式版。新安装器不直接接管旧 Git/IP 部署；安装、升级边界与验收事项见 [候选版说明](docs/RELEASE-v0.1.2-rc.1.md)。
@@ -77,7 +91,8 @@
 - 只支持 `missed_run_policy=skip`；恢复仅限同 Agent 隔离目录
 - 保护标签不等于 Object Lock；仓库连通性在首次 Restic 操作时才验证
 
-[Unreleased]: https://github.com/to-alan/VaultMesh/compare/v0.1.2-rc.1...HEAD
+[Unreleased]: https://github.com/to-alan/VaultMesh/compare/v0.1.2-rc.2...HEAD
+[0.1.2-rc.2]: https://github.com/to-alan/VaultMesh/compare/v0.1.2-rc.1...v0.1.2-rc.2
 [0.1.2-rc.1]: https://github.com/to-alan/VaultMesh/compare/v0.1.1...v0.1.2-rc.1
 [0.1.1]: https://github.com/to-alan/VaultMesh/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/to-alan/VaultMesh/releases/tag/v0.1.0

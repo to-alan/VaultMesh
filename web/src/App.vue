@@ -1354,7 +1354,7 @@ onBeforeUnmount(() => {
       <p v-if="success" class="message success" role="status" aria-live="polite">{{ success }}</p>
       <div v-if="loadingTabs.has(activeTab)" class="page-load-state" role="status"><i></i><span>正在加载{{ activeTab === 'snapshots' ? '快照索引' : activeTab === 'notifications' ? '通知与告警' : '审计事件' }}…</span></div>
       <div v-else-if="pageError" class="page-load-state failed" role="alert"><span>{{ pageError }}</span><button type="button" class="text-button" @click="retryActiveTabData">重试当前页面</button></div>
-      <div v-if="authenticated && controlPlaneHTTPSReady === false" class="page-load-state warning-banner" role="status"><span>⚠ HTTPS 未配置：备份、探测、快照同步与恢复等 Agent 操作已禁用；配置和历史记录仍可查看。将 .env 中的 VAULTMESH_PUBLIC_API_URL 改为 https:// 域名（或设置 VAULTMESH_HTTPS_ENABLED=true）并重启 Control Plane 后解锁。</span></div>
+      <div v-if="authenticated && controlPlaneHTTPSReady === false" class="page-load-state warning-banner" role="status"><span>⚠ HTTPS 未配置：备份、探测、快照同步与恢复等 Agent 操作已禁用；配置和历史记录仍可查看。请先配置 Nginx 等 HTTPS 代理，再按安装指南更新公开访问地址；不要通过开关伪装已启用 HTTPS。</span></div>
 
       <OverviewView v-if="activeTab === 'overview'"
         :dashboard="dashboard" :projects="projects" :health="projectHealthItems"

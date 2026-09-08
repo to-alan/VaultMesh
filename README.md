@@ -19,30 +19,38 @@
 
 ## 安装：使用发布包，不在服务器编译
 
-> 测试 `v0.1.2-rc.1` 请使用[候选版专用安装命令](docs/RELEASE-v0.1.2-rc.1.md#安装候选版)，显式指定版本。候选版不更新 `latest`，下面的正式版入口目前仍指向没有新部署包的 v0.1.1。
+> 以下使用候选版 `v0.1.2-rc.2`（部署包 `INSTALLER_API=2`），不会被 `latest` 自动选中。旧 RC1 没有新端口选项；已因 443 冲突中断时请先按[恢复说明](docs/UPGRADE.md#rc1-443-recovery)继续，不能重新 install 或删数据卷。完整变更见 [RC2 说明](docs/RELEASE-v0.1.2-rc.2.md)。
 
-准备 Linux amd64/arm64、Docker Engine + Compose v2，以及指向服务器的域名。正式发布后，从 GitHub Release 下载脚本：
+准备 Linux amd64/arm64、Docker Engine + Compose v2 和 `ss`（iproute2）。新版默认不要求域名、不占用 80/443；先启动本地 HTTP 入口，随后由你自己的 Nginx/1Panel 反代。以下命令仅用于全新安装；已有安装使用升级流程。
+
+以下安装、维护命令在 **root 终端**执行：`id -u` 输出 `0` 时直接运行，不需要 sudo。普通用户需先用有权限的 `sudo -i` 或 `su -` 切换，详见[安装身份说明](docs/INSTALL.md#先确认执行身份root-不需要-sudo)。遇到 `sudo: command not found` 不代表安装器出错，root 用户去掉 sudo 即可。
 
 ```bash
-curl -fL https://github.com/to-alan/VaultMesh/releases/latest/download/install.sh -o vaultmesh-install.sh
-sudo sh vaultmesh-install.sh install --domain backup.example.com
+curl -fL https://github.com/to-alan/VaultMesh/releases/download/v0.1.2-rc.2/install.sh -o vaultmesh-install.sh &&
+sh vaultmesh-install.sh install --version v0.1.2-rc.2
 ```
 
-替换成你的域名。安装器下载并校验发布包，拉取固定版本镜像，生成随机密码和主密钥，启动 PostgreSQL、控制面、Web 和自动 HTTPS 入口，最后输出登录地址与初始密码。普通用户无需 Git、Go、Node.js。
+`curl` 只负责下载，后面的 `sh ... install` 才执行安装。查看脚本是可选步骤：如果单独运行了 `less vaultmesh-install.sh`，看到源码或 `(END)` 不是报错，按 `q` 退出再安装。只复制代码框中的命令，不包含终端提示符。
 
-> 新流程需要 Release 附件中的 `install.sh` 和 `vaultmesh-deploy-vX.Y.Z.tar.gz`。旧 v0.1.0 / v0.1.1 没有这些附件；在维护者发布包含新包的版本之前，上述下载链接不可用，请勿混用旧包与 main 脚本。
+默认使用 `127.0.0.1:3000`，占用时从 3001–3099 自动选择；也可加 `--port 8300` 指定。端口冲突提前检查，不停止现有服务。安装器下载并校验发布包，拉取固定版本镜像，生成随机密码和主密钥，输出实际入口与初始密码。普通用户无需 Git、Go、Node.js。
 
-已有 1Panel/Nginx 占用 80/443？用 `install --proxy external --url https://backup.example.com`，再让现有 HTTPS 代理转发到宿主机 `127.0.0.1:3000`。完整依赖、IP 测试、镜像访问和排错见[安装指南](docs/INSTALL.md)。
+本地入口仅供宿主机或 SSH 隧道访问；没有 HTTPS 时，探测、备份和恢复仍受保护。配置好 Nginx HTTPS、把整个站点反代到安装器输出的 HTTP 入口后，运行：
+
+```bash
+vaultmesh configure-proxy --url https://backup.example.com
+```
+
+替换为你的实际域名。只有主动选择 `install --proxy managed --domain backup.example.com` 时才由 VaultMesh 占用 80/443、管理证书。完整依赖、Nginx 配置、容器网络与排错见[安装指南](docs/INSTALL.md)。
 
 登录后，在“服务器”创建注册令牌，将控制台给出的同版本 Agent 命令复制到需要备份的服务器。Agent 使用预编译二进制；缺少 Restic 时安装器会下载并校验官方预编译版本。数据库导出客户端、Docker 和 rclone 按实际数据源配置。
 
 ## 升级：你决定何时更新
 
 ```bash
-sudo vaultmesh status
-sudo vaultmesh upgrade
-# 也可固定到一个实际发布的版本：
-sudo vaultmesh upgrade --version vX.Y.Z
+vaultmesh status
+# 升级到本次候选版，必须指定版本：
+vaultmesh upgrade --version v0.1.2-rc.2
+# 以后选择升级到最新正式版时才使用不带 --version 的 upgrade。
 ```
 
 升级先拉好镜像，再备份数据库、主密钥配置和旧部署文件，完成健康检查后切换版本。不重新生成密码、不删除数据卷、不自动编译。发布包安装与旧 Git 安装有不同目录结构；已有 Git/IP 测试部署不会被直接接管，见[迁移说明](docs/UPGRADE.md)。

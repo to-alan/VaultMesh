@@ -26,6 +26,8 @@ with open(os.environ['VM_COMMAND_LOG'], 'a') as log:
     log.write(json.dumps([name] + args) + '\n')
 joined = ' '.join(args)
 if name == 'docker':
+    if args == ['ps', '--format', '{{.Ports}}']:
+        print(os.environ.get('VM_DOCKER_PORTS', ''))
     if os.environ.get('VM_FAIL') == 'existing-stack' and args and args[0] == 'ps':
         print('existing-container')
     if os.environ.get('VM_FAIL') == 'existing-volume' and args[:2] == ['volume', 'ls']:
@@ -54,6 +56,12 @@ elif name == 'systemctl':
             state.write_text('{"identity":{"agent_id":"fixture"}}')
 elif name == 'uname':
     print('x86_64' if '-m' in args else 'Linux')
+elif name == 'ss':
+    if os.environ.get('VM_FAIL') == 'listeners':
+        sys.exit(1)
+    port = args[-1].split(':')[-1]
+    if port in os.environ.get('VM_BUSY_PORTS', '').split(','):
+        print(f'LISTEN 0 128 0.0.0.0:{port} 0.0.0.0:*')
 elif name == 'restic':
     print('restic 0.18.0')
 elif name == 'mv':
@@ -94,7 +102,7 @@ class InstallerTests(unittest.TestCase):
         self.fixtures = self.root / 'assets'
         self.fixtures.mkdir()
         self.log = self.root / 'commands.jsonl'
-        for name in ['docker', 'systemctl', 'curl', 'sha256sum', 'uname', 'restic', 'mv']:
+        for name in ['docker', 'systemctl', 'curl', 'sha256sum', 'uname', 'restic', 'mv', 'ss']:
             path = self.bin / name
             path.write_text(FAKE)
             path.chmod(0o755)
@@ -108,7 +116,7 @@ class InstallerTests(unittest.TestCase):
             f'. {shlex.quote(str(self.script))}',
             f'INSTALL_DIR={shlex.quote(str(self.install))}',
             f'TMP={shlex.quote(str(self.tmp))}',
-            'VERSION=v0.2.0', 'MODE=external',
+            'VERSION=v0.2.0',
             "PUBLIC_URL=https://backup.example.test",
             f'download() {{ cp {shlex.quote(str(self.fixtures))}/"$(basename "$1")" "$2"; }}',
             'trap finish EXIT',
@@ -124,12 +132,15 @@ class InstallerTests(unittest.TestCase):
     def commands(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
-    def bundle(self, version, bad_member=None, link=False):
+    def bundle(self, version, bad_member=None, link=False, proxy_api=True):
         archive = self.fixtures / f'vaultmesh-deploy-{version}.tar.gz'
         with tarfile.open(archive, 'w:gz') as tar:
-            for name in ['install.sh', 'VERSION', 'compose.yaml', 'compose.managed.yaml',
-                         'compose.external.yaml', 'Caddyfile', 'deploy/systemd/vaultmesh-agent.service']:
-                data = (version if name == 'VERSION' else '# fixture') + '\n'
+            names = ['install.sh', 'VERSION', 'compose.yaml', 'compose.managed.yaml',
+                     'compose.external.yaml', 'Caddyfile', 'deploy/systemd/vaultmesh-agent.service']
+            if proxy_api:
+                names.append('INSTALLER_API')
+            for name in names:
+                data = (version if name == 'VERSION' else '2' if name == 'INSTALLER_API' else '# fixture') + '\n'
                 info = tarfile.TarInfo(name)
                 info.size = len(data.encode())
                 info.mode = 0o755 if name == 'install.sh' else 0o644
@@ -153,7 +164,8 @@ class InstallerTests(unittest.TestCase):
         old = self.install / 'releases/v0.1.2'
         old.mkdir(parents=True)
         (old / 'VERSION').write_text('v0.1.2\n')
-        for name in ['compose.yaml', 'compose.external.yaml', 'install.sh']:
+        (old / 'INSTALLER_API').write_text('2\n')
+        for name in ['compose.yaml', 'compose.external.yaml', 'compose.managed.yaml', 'install.sh']:
             (old / name).write_text('# original\n')
         (self.install / 'current').symlink_to('releases/v0.1.2')
         (self.install / '.vaultmesh-installation').write_text('1\n')
@@ -187,6 +199,13 @@ valid_version v0.2.0-rc.1
 ! valid_url 'https://user:secret@example.com'
 ! valid_url 'http://example.com'
 valid_url 'http://[::1]:8080'
+valid_port 3000
+valid_port 65535
+! valid_port 0
+! valid_port 443
+! valid_port 65536
+! valid_port 03000
+! valid_port '3000\nBAD=1'
 newer_version v0.1.2 v0.2.0
 newer_version v0.2.0-rc.9 v0.2.0-rc.10
 newer_version v0.2.0-rc.1 v0.2.0
@@ -225,6 +244,140 @@ newer_version v0.2.0-rc.1 v0.2.0
         self.assertEqual((self.install / '.env').stat().st_mode & 0o777, 0o600)
         self.assertTrue(any('up' in cmd and '--no-build' in cmd for cmd in self.commands()))
         self.assertFalse(any('build' in cmd for cmd in self.commands()))
+
+    def test_default_install_without_domain_uses_loopback_and_no_tls_claim(self):
+        self.run_shell('PUBLIC_URL=; ACTION=install; control_action')
+        settings = (self.install / '.env').read_text()
+        self.assertIn('VAULTMESH_PROXY_MODE=external\n', settings)
+        self.assertIn('VAULTMESH_PUBLIC_API_URL=http://127.0.0.1:3000\n', settings)
+        self.assertIn('VAULTMESH_COOKIE_SECURE=false\n', settings)
+        self.assertNotIn('VAULTMESH_HTTPS_ENABLED', settings)
+        self.assertFalse(any('compose.managed.yaml' in ' '.join(c) for c in self.commands()))
+
+    def test_default_port_skips_host_and_docker_nat_listeners(self):
+        self.run_shell('export VM_BUSY_PORTS=80,443,3000; export VM_DOCKER_PORTS="0.0.0.0:3001->80/tcp"; PUBLIC_URL=; ACTION=install; control_action')
+        self.assertIn('VAULTMESH_HTTP_PORT=3002\n', (self.install / '.env').read_text())
+        self.assertTrue(any('http://127.0.0.1:3002/healthz' in c for c in self.commands()))
+
+    def test_explicit_port_is_kept_and_conflict_fails_before_initialization(self):
+        self.run_shell('export VM_BUSY_PORTS=8300; HTTP_PORT=8300; ACTION=install; control_action', ok=False)
+        self.assertFalse((self.install / '.env').exists())
+        self.assertFalse((self.install / 'releases').exists())
+        self.assertFalse(any('pull' in c or 'up' in c or 'stop' in c for c in self.commands()))
+
+    def test_custom_port_without_domain_has_matching_health_and_origin(self):
+        self.run_shell('HTTP_PORT=8300; PUBLIC_URL=; ACTION=install; control_action')
+        settings = (self.install / '.env').read_text()
+        self.assertIn('VAULTMESH_HTTP_PORT=8300\n', settings)
+        self.assertIn('VAULTMESH_PUBLIC_API_URL=http://127.0.0.1:8300\n', settings)
+        self.assertTrue(any('http://127.0.0.1:8300/healthz' in c for c in self.commands()))
+
+    def test_auto_port_exhaustion_does_not_initialize(self):
+        occupied = ','.join(str(port) for port in range(3000, 3100))
+        self.run_shell(f'export VM_BUSY_PORTS={occupied}; ACTION=install; control_action', ok=False)
+        self.assertFalse((self.install / '.env').exists())
+        self.assertFalse(any('pull' in c or 'up' in c for c in self.commands()))
+
+    def test_domain_does_not_implicitly_claim_https_ports(self):
+        self.run_shell('export VM_BUSY_PORTS=80,443; PUBLIC_URL=; DOMAIN=backup.example.test; ACTION=install; control_action')
+        settings = (self.install / '.env').read_text()
+        self.assertIn('VAULTMESH_PROXY_MODE=external\n', settings)
+        self.assertIn('VAULTMESH_COOKIE_SECURE=true\n', settings)
+
+    def test_managed_mode_checks_https_ports_before_creating_configuration(self):
+        self.run_shell('export VM_BUSY_PORTS=443; MODE=managed; PUBLIC_URL=; DOMAIN=backup.example.test; ACTION=install; control_action', ok=False)
+        self.assertFalse((self.install / '.env').exists())
+        self.assertFalse((self.install / 'releases').exists())
+        self.assertFalse(any('pull' in c or 'up' in c or 'stop' in c for c in self.commands()))
+
+    def test_managed_mode_remains_explicitly_available(self):
+        self.run_shell('MODE=managed; PUBLIC_URL=; DOMAIN=backup.example.test; ACTION=install; control_action')
+        settings = (self.install / '.env').read_text()
+        self.assertIn('VAULTMESH_PROXY_MODE=managed\n', settings)
+        self.assertIn('VAULTMESH_COOKIE_SECURE=true\n', settings)
+        self.assertTrue(any('https://backup.example.test/healthz' in c for c in self.commands()))
+
+    def test_port_inventory_failure_is_not_treated_as_free(self):
+        self.run_shell('ACTION=install; control_action', failure='listeners', ok=False)
+        self.assertFalse((self.install / '.env').exists())
+
+    def test_docker_nat_inventory_failure_is_not_treated_as_free(self):
+        self.run_shell('ACTION=install; control_action', failure='ps --format', ok=False)
+        self.assertFalse((self.install / '.env').exists())
+
+    def test_invalid_origin_fails_without_initializing_database(self):
+        self.run_shell('PUBLIC_URL=http://203.0.113.10:3000; ACTION=install; control_action', ok=False)
+        self.assertFalse((self.install / '.env').exists())
+
+    def test_old_bundle_is_rejected_before_new_proxy_installation(self):
+        self.bundle('v0.2.0', proxy_api=False)
+        result = self.run_shell('PUBLIC_URL=; ACTION=install; control_action', ok=False)
+        self.assertIn('INSTALLER_API=2', result.stderr)
+        self.assertFalse((self.install / '.env').exists())
+        self.assertFalse(any('up' in c for c in self.commands()))
+
+    def test_configure_proxy_keeps_credentials_and_version(self):
+        self.existing_control()
+        settings = self.install / '.env'
+        with settings.open('a') as file:
+            file.write('POSTGRES_PASSWORD=original-db-secret\nVAULTMESH_ADMIN_PASSWORD=original-admin-secret\nCUSTOM_SETTING=keep-me\n')
+        original = settings.read_bytes()
+        self.run_shell('HTTP_PORT=8300; PUBLIC_URL=https://new.example.test; ACTION=configure-proxy; control_action')
+        updated = settings.read_text()
+        for key in ['VAULTMESH_MASTER_KEY=fixture-key', 'POSTGRES_PASSWORD=original-db-secret',
+                    'VAULTMESH_ADMIN_PASSWORD=original-admin-secret', 'CUSTOM_SETTING=keep-me']:
+            self.assertIn(key + '\n', updated)
+        self.assertIn('VAULTMESH_HTTP_PORT=8300\n', updated)
+        self.assertIn('VAULTMESH_PUBLIC_API_URL=https://new.example.test\n', updated)
+        self.assertIn('VAULTMESH_COOKIE_SECURE=true\n', updated)
+        backup = next((self.install / 'backups').iterdir())
+        self.assertEqual((backup / '.env').read_bytes(), original)
+        self.assertEqual((self.install / 'current/VERSION').read_text(), 'v0.1.2\n')
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+        commands = self.commands()
+        self.assertFalse(any('pull' in c or 'pg_dump' in c or 'dropdb' in c for c in commands))
+        up = next(c for c in commands if 'up' in c)
+        self.assertIn('--no-deps', up)
+        self.assertNotIn('postgres', up)
+
+    def test_configure_proxy_reuses_own_port(self):
+        self.existing_control()
+        self.run_shell('export VM_BUSY_PORTS=3000; PUBLIC_URL=https://new.example.test; ACTION=configure-proxy; control_action')
+        self.assertFalse(any(c[0] == 'ss' for c in self.commands()))
+
+    def test_configure_proxy_conflict_keeps_original_configuration(self):
+        self.existing_control()
+        before = (self.install / '.env').read_bytes()
+        self.run_shell('export VM_BUSY_PORTS=8300; HTTP_PORT=8300; PUBLIC_URL=https://new.example.test; ACTION=configure-proxy; control_action', ok=False)
+        self.assertEqual((self.install / '.env').read_bytes(), before)
+        self.assertFalse(any('up' in c for c in self.commands()))
+
+    def test_configure_proxy_invalid_compose_keeps_original_configuration(self):
+        self.existing_control()
+        before = (self.install / '.env').read_bytes()
+        self.run_shell('PUBLIC_URL=https://new.example.test; ACTION=configure-proxy; control_action', failure='config --quiet', ok=False)
+        self.assertEqual((self.install / '.env').read_bytes(), before)
+
+    def test_configure_proxy_health_failure_preserves_recovery_copy(self):
+        self.existing_control()
+        before = (self.install / '.env').read_bytes()
+        result = self.run_shell('PUBLIC_URL=https://new.example.test; ACTION=configure-proxy; control_action', failure='health', ok=False)
+        self.assertIn('入口配置未完成', result.stderr)
+        backup = next((self.install / 'backups').iterdir())
+        self.assertEqual((backup / '.env').read_bytes(), before)
+        self.assertEqual((self.install / 'current/VERSION').read_text(), 'v0.1.2\n')
+
+    def test_old_installation_requires_documented_proxy_recovery(self):
+        self.existing_control()
+        (self.install / 'current/INSTALLER_API').unlink()
+        before = (self.install / '.env').read_bytes()
+        self.run_shell('PUBLIC_URL=https://new.example.test; ACTION=configure-proxy; control_action', ok=False)
+        self.assertEqual((self.install / '.env').read_bytes(), before)
+
+    def test_upgrade_cannot_silently_consume_proxy_options(self):
+        result = subprocess.run(['sh', str(REPO / 'install.sh'), 'upgrade', '--port', '8300'], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('升级不会改变现有入口', result.stderr)
 
     def test_existing_git_install_is_never_overwritten(self):
         (self.install / '.git').mkdir()
@@ -277,6 +430,26 @@ newer_version v0.2.0-rc.1 v0.2.0
         self.run_shell('ACTION=upgrade; control_action', failure='pull control', ok=False)
         self.assertFalse(any('stop' in cmd for cmd in self.commands()))
         self.assertEqual((self.install / 'current/VERSION').read_text().strip(), 'v0.1.2')
+
+    def test_upgrade_preserves_custom_http_port(self):
+        self.existing_control()
+        settings = self.install / '.env'
+        with settings.open('a') as file:
+            file.write('VAULTMESH_HTTP_PORT=8300\n')
+        before = settings.read_bytes()
+        self.run_shell('ACTION=upgrade; control_action')
+        self.assertEqual(settings.read_bytes(), before)
+        self.assertTrue(any('http://127.0.0.1:8300/healthz' in c for c in self.commands()))
+
+    def test_upgrade_preserves_managed_mode(self):
+        self.existing_control()
+        settings = self.install / '.env'
+        settings.write_text(settings.read_text().replace('VAULTMESH_PROXY_MODE=external', 'VAULTMESH_PROXY_MODE=managed'))
+        before = settings.read_bytes()
+        self.run_shell('ACTION=upgrade; control_action')
+        self.assertEqual(settings.read_bytes(), before)
+        self.assertTrue(any('https://backup.example.test/healthz' in c for c in self.commands()))
+        self.assertTrue(any('compose.managed.yaml' in ' '.join(c) for c in self.commands()))
 
     def test_failed_backup_restarts_old_control_without_migration(self):
         self.existing_control()
@@ -370,7 +543,7 @@ newer_version v0.2.0-rc.1 v0.2.0
         self.assertEqual(result.returncode, 0, result.stderr)
         with tarfile.open(target / 'vaultmesh-deploy-v0.2.0.tar.gz') as tar:
             names = {name.removeprefix('./') for name in tar.getnames()}
-            self.assertTrue({'install.sh', 'compose.yaml', 'Caddyfile', 'VERSION', 'COMMIT', 'LICENSE', 'docs/INSTALL.md', 'docs/UPGRADE.md'} <= names)
+            self.assertTrue({'install.sh', 'compose.yaml', 'Caddyfile', 'VERSION', 'COMMIT', 'LICENSE', 'INSTALLER_API', 'docs/INSTALL.md', 'docs/UPGRADE.md'} <= names)
             self.assertFalse({'.env', '.git', 'node_modules', 'state.json'} & names)
             self.assertEqual(tar.getmember('./install.sh').mode & 0o111, 0o111)
         checksum = (target / 'vaultmesh-deploy-v0.2.0.tar.gz.sha256').read_text().split()[0]

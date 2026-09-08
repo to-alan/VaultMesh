@@ -5,9 +5,14 @@ umask 077
 RELEASE_BASE=https://github.com/to-alan/VaultMesh/releases
 INSTALL_DIR=${VAULTMESH_INSTALL_DIR:-/opt/vaultmesh}
 VERSION=${VAULTMESH_VERSION:-latest}
-MODE=managed
+MODE=external
 DOMAIN=
 PUBLIC_URL=
+HTTP_PORT=
+PROXY_OPTIONS=false
+COMPOSE_ENV_FILE=
+PROXY_CHANGED=false
+ENV_STAGE=
 TMP=
 LOCK=
 BACKUP=
@@ -21,6 +26,7 @@ has_restic() { command -v restic >/dev/null 2>&1; }
 valid_line() { [ "$(printf '%s' "$1" | tr -d '\r\n')" = "$1" ]; }
 valid_version() { valid_line "$1" && printf '%s\n' "$1" | LC_ALL=C grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?$'; }
 valid_domain() { valid_line "$1" && printf '%s\n' "$1" | LC_ALL=C grep -Eq '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$'; }
+valid_port() { valid_line "$1" && printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[1-9][0-9]{0,4}$' && [ "$1" -ge 1024 ] && [ "$1" -le 65535 ]; }
 valid_url() {
     # Origin only: no userinfo, path, whitespace or environment-file injection.
     valid_line "$1" && printf '%s\n' "$1" | LC_ALL=C grep -Eq '^https://[a-zA-Z0-9.-]+(:[0-9]{1,5})?$|^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?$'
@@ -65,10 +71,63 @@ fetch_bundle() {
     done
 }
 read_setting() { sed -n "s/^$1=//p" "$INSTALL_DIR/.env"; }
+require_proxy_layout() {
+    if [ ! -f "$1/INSTALLER_API" ] || [ "$(cat "$1/INSTALLER_API")" != 2 ]; then
+        fail '该部署包不支持新版端口配置；请使用包含 INSTALLER_API=2 的新版本。v0.1.2-rc.1 中断安装请按 docs/UPGRADE.md 恢复，不要混用新脚本与旧模板'
+    fi
+}
+port_free() {
+    need ss
+    listeners=$(ss -H -ltn "sport = :$1") || fail '无法检查监听端口，停止安装'
+    [ -z "$listeners" ] || return 1
+    published=$(docker ps --format '{{.Ports}}') || fail '无法检查 Docker 已发布端口，停止安装'
+    # Docker can publish via NAT without a userspace listener visible to ss.
+    if printf '%s\n' "$published" | grep -Eq ":$1->"; then return 1; fi
+}
+select_http_port() {
+    if [ -n "$HTTP_PORT" ]; then
+        valid_port "$HTTP_PORT" || fail '--port 必须为 1024–65535 的整数'
+        port_free "$HTTP_PORT" || fail "端口 $HTTP_PORT 已被占用；请选择其他 --port，不会停止已有服务"
+        return
+    fi
+    HTTP_PORT=3000
+    while ! port_free "$HTTP_PORT"; do
+        HTTP_PORT=$((HTTP_PORT + 1))
+        [ "$HTTP_PORT" -le 3099 ] || fail '3000–3099 均不可用；请用 --port 指定空闲端口'
+    done
+}
+configure_endpoint() {
+    if [ "$MODE" = managed ]; then
+        [ -z "$HTTP_PORT" ] || fail '--port 仅用于 external 模式；managed 使用 80/443'
+        [ -z "$PUBLIC_URL" ] || fail 'managed 模式请使用 --domain，不要同时指定 --url'
+        valid_domain "$DOMAIN" || fail '自动 HTTPS 需要 --proxy managed --domain 已解析的域名；已有 Nginx 请使用默认 external 模式'
+        PUBLIC_URL="https://$DOMAIN"; SITE_ADDRESS=$DOMAIN; COOKIE_SECURE=true
+    else
+        valid_port "$HTTP_PORT" || fail '无效的 HTTP 入口端口'
+        SITE_ADDRESS=http://:80
+        if [ -n "$DOMAIN" ]; then
+            [ -z "$PUBLIC_URL" ] || fail '--domain 与 --url 不能同时指定'
+            valid_domain "$DOMAIN" || fail '无效域名；也可省略域名，稍后配置 Nginx'
+            PUBLIC_URL="https://$DOMAIN"
+        fi
+        PUBLIC_URL=${PUBLIC_URL:-http://127.0.0.1:$HTTP_PORT}
+        valid_url "$PUBLIC_URL" || fail '--url 必须为 HTTPS Origin，不要包含路径'
+        case "$PUBLIC_URL" in
+            https://*) COOKIE_SECURE=true; DOMAIN=${PUBLIC_URL#https://}; DOMAIN=${DOMAIN%%:*};;
+            "http://127.0.0.1:$HTTP_PORT"|"http://localhost:$HTTP_PORT") COOKIE_SECURE=false; DOMAIN=;;
+            *) fail '未配置 HTTPS 时只允许与本地端口一致的回环 HTTP 地址';;
+        esac
+    fi
+}
+write_proxy_settings() {
+    printf 'VAULTMESH_PROXY_MODE=%s\nVAULTMESH_SITE_ADDRESS=%s\n' "$MODE" "$SITE_ADDRESS"
+    printf 'VAULTMESH_PUBLIC_API_URL=%s\nVAULTMESH_WEBAUTHN_RP_ID=%s\n' "$PUBLIC_URL" "$DOMAIN"
+    printf 'VAULTMESH_HTTP_PORT=%s\nVAULTMESH_COOKIE_SECURE=%s\n' "${HTTP_PORT:-3000}" "$COOKIE_SECURE"
+}
 compose_at() {
     release_dir=$1; shift
     VAULTMESH_RELEASE_DIR="$release_dir" VAULTMESH_IMAGE_TAG="$(cat "$release_dir/VERSION")" \
-        docker compose --project-name vaultmesh --project-directory "$INSTALL_DIR" --env-file "$INSTALL_DIR/.env" \
+        docker compose --project-name vaultmesh --project-directory "$INSTALL_DIR" --env-file "${COMPOSE_ENV_FILE:-$INSTALL_DIR/.env}" \
         -f "$release_dir/compose.yaml" -f "$release_dir/compose.$MODE.yaml" "$@" </dev/null
 }
 current_compose() { compose_at "$INSTALL_DIR/current" "$@"; }
@@ -79,6 +138,55 @@ load_installation() {
     case "$MODE" in managed|external) ;; *) fail '无效的代理模式';; esac
     PUBLIC_URL=$(read_setting VAULTMESH_PUBLIC_API_URL)
     valid_url "$PUBLIC_URL" || fail '.env 中的公开地址无效'
+    HTTP_PORT=$(read_setting VAULTMESH_HTTP_PORT)
+    HTTP_PORT=${HTTP_PORT:-3000}
+    valid_port "$HTTP_PORT" || fail '.env 中的 HTTP 入口端口无效'
+}
+check_gateway() {
+    if [ "$MODE" = managed ]; then
+        curl -fSs --retry 12 --retry-all-errors --retry-delay 5 --connect-timeout 5 --max-time 10 "$PUBLIC_URL/healthz" >/dev/null || fail 'HTTPS 验证失败：检查 DNS、80/443、防火墙和 gateway 日志'
+    else
+        curl -fSs --retry 5 --retry-connrefused --connect-timeout 5 --max-time 10 "http://127.0.0.1:$HTTP_PORT/healthz" >/dev/null || fail '本地 HTTP 入口未通过健康检查'
+    fi
+}
+print_proxy_access() {
+    [ "$MODE" = external ] || return 0
+    printf '本地 HTTP 入口：http://127.0.0.1:%s（仅宿主机可访问，不占用 80/443）\n' "$HTTP_PORT"
+    case "$PUBLIC_URL" in
+        https://*) printf '请将现有 Nginx 的整个 HTTPS 站点反代到上述入口；尚未验证公网证书。\n';;
+        *) printf '尚未设置公开域名；配置好 Nginx HTTPS 后运行：vaultmesh configure-proxy --url https://你的域名\n探测、备份与恢复仍受 HTTPS 保护，不会因为本地端口就绪自动解除。\n';;
+    esac
+}
+configure_proxy() {
+    requested_port=$HTTP_PORT; requested_url=$PUBLIC_URL; requested_domain=$DOMAIN
+    [ "$MODE" = external ] || fail 'configure-proxy 用于接入已有代理，不启用自动 HTTPS'
+    load_installation
+    require_proxy_layout "$INSTALL_DIR/current"
+    previous_mode=$MODE; previous_port=$HTTP_PORT
+    MODE=external; DOMAIN=$requested_domain; PUBLIC_URL=$requested_url
+    [ -n "$DOMAIN$PUBLIC_URL" ] || fail '请用 --url 指定已配置的 HTTPS 地址（或 --domain 指定域名）'
+    HTTP_PORT=${requested_port:-$previous_port}
+    if [ "$previous_mode" != external ] || [ "$HTTP_PORT" != "$previous_port" ]; then select_http_port; fi
+    configure_endpoint
+    # Preserve every non-proxy setting, including all credentials. Never source .env.
+    awk '!/^(VAULTMESH_PROXY_MODE|VAULTMESH_SITE_ADDRESS|VAULTMESH_PUBLIC_API_URL|VAULTMESH_WEBAUTHN_RP_ID|VAULTMESH_HTTP_PORT|VAULTMESH_COOKIE_SECURE)=/' "$INSTALL_DIR/.env" > "$TMP/proxy.env"
+    write_proxy_settings >> "$TMP/proxy.env"
+    COMPOSE_ENV_FILE="$TMP/proxy.env"
+    current_compose config --quiet
+    COMPOSE_ENV_FILE=
+    mkdir -p "$INSTALL_DIR/backups"
+    BACKUP=$(mktemp -d "$INSTALL_DIR/backups/proxy-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
+    cp -p "$INSTALL_DIR/.env" "$BACKUP/.env"
+    ENV_STAGE=$(mktemp "$INSTALL_DIR/.proxy-env.XXXXXX")
+    cp "$TMP/proxy.env" "$ENV_STAGE"
+    chmod 600 "$ENV_STAGE"
+    mv -f "$ENV_STAGE" "$INSTALL_DIR/.env"
+    ENV_STAGE=; PROXY_CHANGED=true
+    current_compose up -d --no-deps --no-build --pull never --wait --wait-timeout 180 control web gateway
+    check_gateway
+    PROXY_CHANGED=false
+    printf '入口配置已更新：%s；原配置备份：%s\n' "$PUBLIC_URL" "$BACKUP"
+    print_proxy_access
 }
 backup_control() {
     BACKUP="$INSTALL_DIR/backups/$(date -u +%Y%m%dT%H%M%SZ)-$(cat "$INSTALL_DIR/current/VERSION")"
@@ -113,17 +221,24 @@ finish() {
     if [ "$AGENT_STOPPED" = true ]; then
         printf 'Agent 更新未完成；身份/配置已保留，备份：%s。请按 docs/UPGRADE.md 检查后启动，不要重新注册。\n' "$BACKUP" >&2
     fi
+    if [ "$PROXY_CHANGED" = true ]; then
+        printf '入口配置未完成；原 .env 保存在 %s/.env，数据库和版本未变。请检查代理与端口后重试 configure-proxy，或按升级文档恢复原配置。\n' "$BACKUP" >&2
+    fi
     if [ "$status" -ne 0 ] && [ "${ACTION:-}" = install ] && [ -f "$INSTALL_DIR/.vaultmesh-installation" ]; then
         printf '首次安装未完成，配置和数据保留在 %s；请按 docs/UPGRADE.md 的中断恢复步骤处理，不要删除数据卷。\n' "$INSTALL_DIR" >&2
     fi
     if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
+    if [ -n "$ENV_STAGE" ]; then rm -f "$ENV_STAGE"; fi
     if [ -n "$LOCK" ]; then rmdir "$LOCK" 2>/dev/null || true; fi
     exit "$status"
 }
 help_text() {
     printf '%s\n' 'VaultMesh 发布包安装与维护（Linux）' \
-      '  install --domain backup.example.com [--version vX.Y.Z]' \
-      '  install --url https://backup.example.com --proxy external [--version vX.Y.Z]' \
+      '  install [--port 3000] [--url https://backup.example.com] [--version vX.Y.Z]' \
+      '    默认 external：仅监听 127.0.0.1，3000 占用时自动寻找 3001–3099；域名可稍后配置' \
+      '  install --proxy managed --domain backup.example.com [--version vX.Y.Z]' \
+      '    可选自动 HTTPS：需要空闲的 80/443 和已解析的域名' \
+      '  configure-proxy --url https://backup.example.com [--port 3000]   接入已有 Nginx' \
       '  upgrade [--version vX.Y.Z]   校验 → 拉取镜像 → 备份 → 升级 → 健康检查' \
       '  status | logs | backup' \
       '  compose <args...>            使用当前发布包的 Compose 配置' \
@@ -136,14 +251,15 @@ control_action() {
     need docker; need openssl
     docker info >/dev/null 2>&1 || fail 'Docker 不可用，请启动 Docker Engine'
     docker compose version >/dev/null || fail '需要 Docker Compose v2（支持 up --wait）'
+    if [ "$ACTION" = configure-proxy ]; then configure_proxy; return; fi
     if [ "$ACTION" != install ]; then load_installation; fi
     case "$ACTION" in
-        status) printf '版本：%s\n入口：%s\n' "$(cat "$INSTALL_DIR/current/VERSION")" "$PUBLIC_URL"; current_compose ps; return;;
+        status) printf '版本：%s\n入口：%s\n' "$(cat "$INSTALL_DIR/current/VERSION")" "$PUBLIC_URL"; print_proxy_access; current_compose ps; return;;
         logs) current_compose logs --tail 100 control gateway; return;;
         backup) backup_control; return;;
     esac
-    resolve_version
     if [ "$ACTION" = upgrade ]; then
+        resolve_version
         current_version=$(cat "$INSTALL_DIR/current/VERSION")
         if [ "$current_version" = "$VERSION" ]; then printf '已经是 %s；检查当前服务。\n' "$VERSION"; current_compose ps; return; fi
         newer_version "$current_version" "$VERSION" || fail '拒绝降级；数据库迁移不保证向后兼容，请按回滚文档恢复'
@@ -157,16 +273,16 @@ control_action() {
         [ -z "$existing_volumes" ] || fail '发现旧 vaultmesh 数据卷，请按迁移文档处理，不自动重新初始化'
         existing_database=$(docker volume ls --filter 'name=^vaultmesh_vaultmesh-postgres$' --format '{{.Name}}') || fail '无法检查 PostgreSQL 数据卷，停止安装'
         [ -z "$existing_database" ] || fail '发现同名 PostgreSQL 数据卷，拒绝用新密码/主密钥接管'
+        if [ "$MODE" = external ]; then select_http_port; fi
+        configure_endpoint
         if [ "$MODE" = managed ]; then
-            valid_domain "$DOMAIN" || fail '请用 --domain 指定已解析到本机的域名；IP 测试和已有代理见 docs/INSTALL.md'
-            PUBLIC_URL="https://$DOMAIN"; SITE_ADDRESS=$DOMAIN
-        else
-            valid_url "$PUBLIC_URL" || fail '请用 --url 指定 HTTPS Origin，不要包含路径'
-            case "$PUBLIC_URL" in https://*) ;; *) fail '外部代理公开入口必须是 HTTPS';; esac
-            DOMAIN=${PUBLIC_URL#https://}; DOMAIN=${DOMAIN%%:*}; SITE_ADDRESS=http://:80
+            port_free 80 || fail '80 端口已被占用；已有 Nginx 请使用默认 external 模式，不会停止现有服务'
+            port_free 443 || fail '443 端口已被占用；已有 Nginx 请使用默认 external 模式，不会停止现有服务'
         fi
+        resolve_version
     fi
     fetch_bundle
+    require_proxy_layout "$TMP/bundle"
     TARGET="$INSTALL_DIR/releases/$VERSION"
     [ ! -e "$TARGET" ] || fail "目标发布目录已存在：${TARGET}；如为失败升级，请先查看恢复文档，不能自动覆盖"
     mkdir -p "$INSTALL_DIR/releases"
@@ -174,8 +290,7 @@ control_action() {
     if [ "$ACTION" = install ]; then
         admin_password=$(openssl rand -hex 16)
         {
-            printf 'VAULTMESH_PROXY_MODE=%s\nVAULTMESH_SITE_ADDRESS=%s\n' "$MODE" "$SITE_ADDRESS"
-            printf 'VAULTMESH_PUBLIC_API_URL=%s\nVAULTMESH_WEBAUTHN_RP_ID=%s\n' "$PUBLIC_URL" "$DOMAIN"
+            write_proxy_settings
             printf 'VAULTMESH_ADMIN_USERNAME=admin\nVAULTMESH_ADMIN_PASSWORD=%s\n' "$admin_password"
             printf 'POSTGRES_PASSWORD=%s\nVAULTMESH_MASTER_KEY=%s\n' "$(openssl rand -hex 24)" "$(openssl rand -base64 32)"
         } > "$INSTALL_DIR/.env"
@@ -197,19 +312,15 @@ control_action() {
     else
         compose_at "$TARGET" up -d --no-deps --no-build --pull never --wait --wait-timeout 180 control web gateway
     fi
-    if [ "$MODE" = managed ]; then
-        curl -fSs --retry 12 --retry-all-errors --retry-delay 5 --connect-timeout 5 --max-time 10 "$PUBLIC_URL/healthz" >/dev/null || fail 'HTTPS 验证失败：检查 DNS、80/443、防火墙和 gateway 日志'
-    else
-        curl -fSs --retry 5 --retry-connrefused --max-time 10 http://127.0.0.1:3000/healthz >/dev/null || fail '本地代理未通过健康检查'
-    fi
+    check_gateway
     ln -s "releases/$VERSION" "$INSTALL_DIR/.current-next"
     mv -Tf "$INSTALL_DIR/.current-next" "$INSTALL_DIR/current"
     CONTROL_STOPPED=false
     if [ ! -e /usr/local/bin/vaultmesh ] && [ ! -L /usr/local/bin/vaultmesh ]; then ln -s "$INSTALL_DIR/current/install.sh" /usr/local/bin/vaultmesh; fi
     printf '\nVaultMesh %s 已就绪：%s\n' "$VERSION" "$PUBLIC_URL"
     if [ "$ACTION" = install ]; then printf '账号：admin\n初始密码：%s\n请立即修改密码，并异机备份 .env 和数据库。\n' "$admin_password"; fi
-    if [ "$MODE" = external ]; then printf '请让已有 HTTPS 代理转发到 http://127.0.0.1:3000；尚未验证公网证书。\n'; fi
-    printf '下次升级：sudo sh %s/current/install.sh upgrade --dir %s\n' "$INSTALL_DIR" "$INSTALL_DIR"
+    print_proxy_access
+    printf '下次升级（root 终端）：sh %s/current/install.sh upgrade --dir %s\n' "$INSTALL_DIR" "$INSTALL_DIR"
 }
 
 agent_action() {
@@ -311,7 +422,7 @@ agent_action() {
 
 main() {
     ACTION=${1:-help}; [ "$#" -eq 0 ] || shift
-    case "$ACTION" in help|--help|-h) help_text; return;; install|upgrade|status|logs|backup|compose|install-agent|upgrade-agent) ;; *) fail "未知命令：${ACTION}（运行 --help 查看用法）";; esac
+    case "$ACTION" in help|--help|-h) help_text; return;; install|upgrade|status|logs|backup|compose|configure-proxy|install-agent|upgrade-agent) ;; *) fail "未知命令：${ACTION}（运行 --help 查看用法）";; esac
     if [ "$ACTION" = install-agent ]; then
         [ "$#" -ge 2 ] || fail '用法：install-agent <url> <token> [--version vX.Y.Z]'
         AGENT_URL=$1; AGENT_TOKEN=$2; shift 2
@@ -320,11 +431,13 @@ main() {
     if [ "$ACTION" != compose ]; then
         while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || fail "选项缺少值：$1"
-            case "$1" in --version) VERSION=$2;; --domain) DOMAIN=$2;; --url) PUBLIC_URL=$2;; --proxy) MODE=$2;; --dir) INSTALL_DIR=$2;; *) fail "未知选项：$1";; esac
+            case "$1" in --version) VERSION=$2;; --domain) DOMAIN=$2; PROXY_OPTIONS=true;; --url) PUBLIC_URL=$2; PROXY_OPTIONS=true;; --proxy) MODE=$2; PROXY_OPTIONS=true;; --port) HTTP_PORT=$2; PROXY_OPTIONS=true;; --dir) INSTALL_DIR=$2;; *) fail "未知选项：$1";; esac
             shift 2
         done
     fi
     case "$MODE" in managed|external) ;; *) fail '--proxy 必须为 managed 或 external';; esac
+    case "$ACTION" in install|configure-proxy) ;; *) [ "$PROXY_OPTIONS" = false ] || fail '代理/端口选项仅用于 install 或 configure-proxy，升级不会改变现有入口';; esac
+    if [ -n "$HTTP_PORT" ]; then valid_port "$HTTP_PORT" || fail '--port 必须为 1024–65535 的整数'; fi
     [ "$(uname -s)" = Linux ] || fail '一键安装仅支持 Linux；macOS 二进制仅供手动开发测试'
     [ "$(id -u)" -eq 0 ] || fail '请使用 sudo sh install.sh ... 或 root 运行'
     valid_line "$INSTALL_DIR" || fail '安装目录不能包含换行'

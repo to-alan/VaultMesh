@@ -152,6 +152,9 @@ jobs:
             gh release create "$TAG" --verify-tag --draft --generate-notes --title "VaultMesh $TAG"
           fi
           test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true || { echo 'Refusing to overwrite a published release'; exit 1; }
+          if [ -f "docs/RELEASE-$TAG.md" ]; then
+            gh release edit "$TAG" --notes-file "docs/RELEASE-$TAG.md"
+          fi
           gh release upload "$TAG" dist/* --clobber
           # Backports and release candidates must not replace a newer stable release.
           latest=false
