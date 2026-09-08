@@ -19,6 +19,8 @@
 
 ## 安装：使用发布包，不在服务器编译
 
+> 测试 `v0.1.2-rc.1` 请使用[候选版专用安装命令](docs/RELEASE-v0.1.2-rc.1.md#安装候选版)，显式指定版本。候选版不更新 `latest`，下面的正式版入口目前仍指向没有新部署包的 v0.1.1。
+
 准备 Linux amd64/arm64、Docker Engine + Compose v2，以及指向服务器的域名。正式发布后，从 GitHub Release 下载脚本：
 
 ```bash

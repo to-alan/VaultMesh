@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+## [0.1.2-rc.1] - 2026-09-08
+
+候选测试版，不替换最新正式版。新安装器不直接接管旧 Git/IP 部署；安装、升级边界与验收事项见 [候选版说明](docs/RELEASE-v0.1.2-rc.1.md)。
+
 ### 发布与安装
 
 - 发布包安装器：固定版本、SHA256 校验、无 Git/Go/Node 依赖，不再回退服务器编译；默认自动 HTTPS，并支持已有反向代理。
@@ -25,6 +29,7 @@
 
 ### 修复
 
+- 前后端从 v0.1.2-rc.1 起允许探测，避免候选版 Agent 被误判为过旧而禁用探测；更早或未知的预发布版本继续拒绝。
 - 必需数据源的路径缺失/断链在准备阶段即失败并给出精确原因，不再依赖 Restic 退出码 3 降级为 partial 快照（可选源保持跳过+警告语义）
 - Dashboard 总量排除已归档的服务器与项目，归档后指标不再虚高
 - Agent 拒绝把自身状态目录（含明文凭据）与恢复目录作为备份源，并向 Restic 追加无条件排除，父目录扫掠（如 /var/lib）不再泄露凭据；控制面在保存时拒绝默认状态目录 `/var/lib/vaultmesh-agent`
@@ -72,6 +77,7 @@
 - 只支持 `missed_run_policy=skip`；恢复仅限同 Agent 隔离目录
 - 保护标签不等于 Object Lock；仓库连通性在首次 Restic 操作时才验证
 
-[Unreleased]: https://github.com/to-alan/VaultMesh/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/to-alan/VaultMesh/compare/v0.1.2-rc.1...HEAD
+[0.1.2-rc.1]: https://github.com/to-alan/VaultMesh/compare/v0.1.1...v0.1.2-rc.1
 [0.1.1]: https://github.com/to-alan/VaultMesh/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/to-alan/VaultMesh/releases/tag/v0.1.0

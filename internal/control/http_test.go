@@ -1095,7 +1095,7 @@ func TestDetectionCommandRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "detect-host", AgentVersion: "v0.1.2"})
+	identity, err := service.EnrollAgent(ctx, enrollment.EnrollmentToken, domain.AgentInfo{Hostname: "detect-host", AgentVersion: "v0.1.2-rc.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1190,7 +1190,16 @@ func TestDetectionVersionSupportIsFailClosed(t *testing.T) {
 	}{
 		{"v0.1.1", false},
 		{"v0.0.99", false},
-		{"v0.1.2-rc.1", false},
+		{"v0.1.2-rc.0", false},
+		{"v0.1.2-alpha.1", false},
+		{"v0.1.2-beta.1", false},
+		{"v0.1.2-rc.01", false},
+		{"v0.1.2-rc.1.dev", false},
+		{"v0.1.2-rc.1", true},
+		{"v0.1.2-rc.2", true},
+		{"v0.1.2-rc.10", true},
+		{"v0.1.2-rc.1+build.7", true},
+		{"v0.1.1-rc.1", false},
 		{"v0.1.2", true},
 		{"v0.1.2+build.7", true},
 		{"v0.2.0", true},

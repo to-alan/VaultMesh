@@ -31,7 +31,8 @@ export function supportsDetectionVersion(agentVersion: string): boolean {
   for (let index = 0; index < numbers.length; index += 1) {
     if (numbers[index] !== minimum[index]) return numbers[index] > minimum[index]
   }
-  return !match[4]
+  // Detection first shipped in rc.1; earlier/unknown prereleases stay blocked.
+  return !match[4] || /^rc\.[1-9]\d*$/.test(match[4])
 }
 
 export function buildAgentInstallCommand(apiBaseURL: string, enrollmentToken: string, controlPlaneVersion: string): string {

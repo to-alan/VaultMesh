@@ -63,7 +63,7 @@ function apply() {
     </div>
     <p class="discovery-help">只读探测，不读取文件内容或数据库密码。结果在此展示，不自动打开编辑器。</p>
     <p v-if="agentWorkDisabled" class="message">当前连接未启用安全传输，请先完成 HTTPS 配置。</p>
-    <p v-else-if="versionBlocked" class="message">Agent {{ target?.agent_version || '版本未知' }} 不支持探测，请在服务器页升级 Agent（需要 v0.1.2 或 edge）。</p>
+    <p v-else-if="versionBlocked" class="message">Agent {{ target?.agent_version || '版本未知' }} 不支持探测，请按升级指南升级 Agent（需要 v0.1.2-rc.1 及以上版本，或 edge）。</p>
     <p v-else-if="target && target.status !== 'online'" class="message">服务器离线，可查看上次结果；上线后才能重新探测。</p>
     <div v-if="running" class="discovery-progress" role="status"><span class="system-pulse"></span><div><strong>等待 Agent 回传</strong><small>已派发给 {{ target?.name }} · 领取次数 {{ attempts }} · 最长等待两分钟</small></div></div>
     <p v-else-if="reportLoading" class="discovery-help" role="status">正在读取上次探测结果…</p>

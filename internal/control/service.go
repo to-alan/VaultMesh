@@ -28,6 +28,7 @@ const defaultScheduleGrace = time.Hour
 
 var fullResticSnapshotID = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var agentSemanticVersion = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$`)
+var detectionReleaseCandidate = regexp.MustCompile(`^rc\.[1-9]\d*$`)
 
 type Service struct {
 	store              store.Store
@@ -521,7 +522,7 @@ func (s *Service) reconcileConfigDegradation(ctx context.Context, serverID strin
 
 // detectMinimumVersion is the first release that understands the detect
 // command. Anything older receives an immediate warning.
-const detectMinimumVersion = "v0.1.2"
+const detectMinimumVersion = "v0.1.2-rc.1"
 
 func detectionWarningFor(agentVersion string) string {
 	version := strings.TrimSpace(agentVersion)
@@ -531,7 +532,7 @@ func detectionWarningFor(agentVersion string) string {
 	if version == "" {
 		return fmt.Sprintf("Agent 未上报版本，无法确认探测能力（需要 %s 或 edge）。请先升级 Agent。", detectMinimumVersion)
 	}
-	return fmt.Sprintf("Agent 版本 %s 不支持探测命令或版本格式无法识别（需要 %s 或 edge）。请重新运行 install-agent 并设置 VAULTMESH_AGENT_VERSION=edge。", agentVersion, detectMinimumVersion)
+	return fmt.Sprintf("Agent 版本 %s 不支持探测命令或版本格式无法识别（需要 %s 及以上版本，或 edge）。请按升级指南使用同版本安装器的 upgrade-agent，保留已有设备身份。", agentVersion, detectMinimumVersion)
 }
 
 func supportsDetectionVersion(agentVersion string) bool {
@@ -558,7 +559,8 @@ func supportsDetectionVersion(agentVersion string) bool {
 			return numbers[index] > minimum[index]
 		}
 	}
-	return matches[4] == ""
+	// Detection first shipped in rc.1; earlier/unknown prereleases stay blocked.
+	return matches[4] == "" || detectionReleaseCandidate.MatchString(matches[4])
 }
 
 // CreateDetectionCommand queues a read-only inventory scan on one server.

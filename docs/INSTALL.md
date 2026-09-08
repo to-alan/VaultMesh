@@ -20,6 +20,20 @@ df -h
 
 ## 2. 安装控制面
 
+### v0.1.2-rc.1 候选测试版
+
+此候选版必须显式选择版本，不能使用下面的 `latest` 正式版入口（v0.1.1 没有新部署包）：
+
+```bash
+curl -fL https://github.com/to-alan/VaultMesh/releases/download/v0.1.2-rc.1/install.sh -o vaultmesh-install.sh
+less vaultmesh-install.sh
+sudo sh vaultmesh-install.sh install --domain backup.example.com --version v0.1.2-rc.1
+```
+
+请先阅读[候选版说明](RELEASE-v0.1.2-rc.1.md)，用独立测试数据验证备份和隔离恢复。已有反向代理时，改用 `install --proxy external --url https://backup.example.com --version v0.1.2-rc.1`。
+
+### 最新正式版（已有新部署包时）
+
 先下载脚本，方便审阅，也避免下载中断时执行半个脚本：
 
 ```bash
