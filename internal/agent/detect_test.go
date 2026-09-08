@@ -186,3 +186,20 @@ func TestScanMarkersRecognizesCanonicalComposeFile(t *testing.T) {
 		t.Fatalf("canonical Compose project not detected: %+v", apps)
 	}
 }
+
+func TestDetectToolsUsesResticVersionSubcommand(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "restic")
+	// Restic supports `restic version`, not the generic --version flag.
+	script := "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = version ]; then\n  printf 'restic 0.18.0 compiled with go1.24.1 on linux/amd64\\n'\nelse\n  exit 1\nfi\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunnerWithTools(bin, "", "", "", "")
+	tools := runner.detectTools(context.Background())
+	if tools["restic"] != "restic 0.18.0 compiled with go1.24.1 on linux/amd64" {
+		t.Fatalf("installed Restic was reported missing: %+v", tools)
+	}
+	if tools["docker"] != "" {
+		t.Fatalf("missing Docker was reported installed: %+v", tools)
+	}
+}

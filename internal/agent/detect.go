@@ -495,7 +495,7 @@ func classifyApp(markers []string) (string, string) {
 
 func (r *Runner) detectTools(ctx context.Context) map[string]string {
 	tools := map[string]string{}
-	tools["restic"] = toolVersion(ctx, r.resticPath, "--version")
+	tools["restic"] = toolVersion(ctx, r.resticPath, "version")
 	tools["docker"] = toolVersion(ctx, r.dockerPath, "--version")
 	return tools
 }
