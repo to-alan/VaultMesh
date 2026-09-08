@@ -43,6 +43,8 @@ var appMarkers = map[string]struct{ kind, name string }{
 	"package.json":        {"nodejs", "Node.js"},
 	"docker-compose.yml":  {"compose", "Docker Compose"},
 	"docker-compose.yaml": {"compose", "Docker Compose"},
+	"compose.yml":         {"compose", "Docker Compose"},
+	"compose.yaml":        {"compose", "Docker Compose"},
 	"wp-config.php":       {"wordpress", "WordPress"},
 	"requirements.txt":    {"python", "Python"},
 	"pyproject.toml":      {"python", "Python"},
@@ -65,7 +67,8 @@ type detectDocker struct {
 		Running bool `json:"Running"`
 	} `json:"State"`
 	Config struct {
-		Image string `json:"Image"`
+		Image  string            `json:"Image"`
+		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	NetworkSettings struct {
 		Ports map[string][]struct {
@@ -86,9 +89,11 @@ func (r *Runner) Detect(ctx context.Context, commandID string) RunResult {
 	stats := map[string]any{"operation": "detect"}
 	report := domain.DetectionReport{CommandID: commandID, GeneratedAt: time.Now().UTC()}
 
-	report.Containers = r.detectContainers(ctx)
+	var platformRoots []string
+	report.Containers, platformRoots = r.detectContainerInventory(ctx)
 	report.Databases = r.detectDatabases(ctx, report.Containers)
 	report.Apps = detectApps(ctx)
+	annotateExcludedApps(report.Apps, platformRoots, r.protectedPaths)
 	report.Tools = r.detectTools(ctx)
 
 	stats["containers"] = len(report.Containers)
@@ -98,14 +103,19 @@ func (r *Runner) Detect(ctx context.Context, commandID string) RunResult {
 }
 
 func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContainer {
+	containers, _ := r.detectContainerInventory(ctx)
+	return containers
+}
+
+func (r *Runner) detectContainerInventory(ctx context.Context) ([]domain.DetectedContainer, []string) {
 	if r.dockerPath == "" {
-		return nil
+		return nil, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, detectTimeoutCommand)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, r.dockerPath, "ps", "--all", "--format", "{{.Names}}\t{{.Image}}\t{{.State}}").Output()
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	containers := make([]domain.DetectedContainer, 0, 16)
 	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
@@ -122,6 +132,7 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 			Running: parts[2] == "running",
 		})
 	}
+	labels := make([]map[string]string, len(containers))
 	// Enrich with ports and mounts via inspect, best-effort per container.
 	for index := range containers {
 		inspect, err := exec.CommandContext(ctx, r.dockerPath, "inspect", "--type", "container", containers[index].Name).Output()
@@ -135,6 +146,7 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 		if json.Unmarshal(inspect, &parsed) != nil || len(parsed) != 1 {
 			continue
 		}
+		labels[index] = parsed[0].Config.Labels
 		for portSpec, bindings := range parsed[0].NetworkSettings.Ports {
 			containers[index].Ports = append(containers[index].Ports, portSpec)
 			containerPort, protocol, ok := parseDockerPortSpec(portSpec)
@@ -172,7 +184,86 @@ func (r *Runner) detectContainers(ctx context.Context) []domain.DetectedContaine
 			return left.HostPort < right.HostPort
 		})
 	}
-	return containers
+	return containers, markPlatformContainers(containers, labels)
+}
+
+const platformExclusionReason = "VaultMesh 自身组件；请使用专门的平台灾备方案"
+
+// Use explicit ownership, never a container-name substring. Compose identity
+// also identifies the platform's generic postgres image on older deployments.
+// Labels and environment values are not forwarded in the detection report.
+func markPlatformContainers(containers []domain.DetectedContainer, labels []map[string]string) []string {
+	scopes := map[string]bool{}
+	rootSet := map[string]bool{}
+	owned := make([]bool, len(containers))
+	for i, container := range containers {
+		image := strings.SplitN(strings.SplitN(container.Image, "@", 2)[0], ":", 2)[0]
+		component := labels[i]["io.vaultmesh.component"]
+		owned[i] = component == "control" || component == "web" || component == "postgres" || component == "agent" ||
+			image == "ghcr.io/to-alan/vaultmesh/vaultmesh-control" || image == "ghcr.io/to-alan/vaultmesh/vaultmesh-web" || image == "ghcr.io/to-alan/vaultmesh/vaultmesh-agent"
+		if !owned[i] {
+			continue
+		}
+		project, root := labels[i]["com.docker.compose.project"], labels[i]["com.docker.compose.project.working_dir"]
+		if isPlatformProjectRoot(root) {
+			root = filepath.Clean(root)
+			rootSet[root] = true
+			if project != "" {
+				scopes[project+"\x00"+root] = true
+			}
+		}
+	}
+	for i := range containers {
+		project, root := labels[i]["com.docker.compose.project"], labels[i]["com.docker.compose.project.working_dir"]
+		service := labels[i]["com.docker.compose.service"]
+		platformService := service == "control" || service == "web" || service == "postgres" || service == "agent"
+		if owned[i] || (platformService && scopes[project+"\x00"+filepath.Clean(root)]) {
+			containers[i].ExclusionReason = platformExclusionReason
+		}
+	}
+	roots := make([]string, 0, len(rootSet))
+	for root := range rootSet {
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+func isPlatformProjectRoot(root string) bool {
+	if !filepath.IsAbs(root) || filepath.Clean(root) == "/" {
+		return false
+	}
+	// A stack launched directly from a shared scan root does not own every
+	// neighbouring application below that root.
+	for _, shared := range detectRoots {
+		if filepath.Clean(root) == shared {
+			return false
+		}
+	}
+	return true
+}
+
+func annotateExcludedApps(apps []domain.DetectedApp, platformRoots, protectedPaths []string) {
+	for i := range apps {
+		for _, root := range platformRoots {
+			if pathWithinDetectionRoot(apps[i].Path, root) {
+				apps[i].ExclusionReason = platformExclusionReason
+			}
+		}
+		for _, root := range protectedPaths {
+			if pathWithinDetectionRoot(apps[i].Path, root) {
+				apps[i].ExclusionReason = "Agent 私有状态或凭据目录，不应作为业务数据源"
+			}
+		}
+	}
+}
+
+func pathWithinDetectionRoot(path, root string) bool {
+	if !filepath.IsAbs(root) || filepath.Clean(root) == "/" {
+		return false
+	}
+	path, root = filepath.Clean(path), filepath.Clean(root)
+	return path == root || strings.HasPrefix(path, root+string(filepath.Separator))
 }
 
 func parseDockerPortSpec(value string) (int, string, bool) {
@@ -219,13 +310,7 @@ func (r *Runner) detectDatabases(ctx context.Context, containers []domain.Detect
 		if !container.Running {
 			continue
 		}
-		kind := ""
-		switch {
-		case strings.Contains(strings.ToLower(container.Image), "mysql"), strings.Contains(strings.ToLower(container.Image), "mariadb"):
-			kind = "mysql"
-		case strings.Contains(strings.ToLower(container.Image), "postgres"):
-			kind = "postgresql"
-		}
+		kind := detectedDatabaseKind(container.Image)
 		if kind == "" {
 			continue
 		}
@@ -237,6 +322,7 @@ func (r *Runner) detectDatabases(ctx context.Context, containers []domain.Detect
 		databases = append(databases, domain.DetectedDatabase{
 			Kind: kind, Source: "docker", Container: container.Name,
 			Host: host, Port: port, Reachable: reach,
+			ExclusionReason: container.ExclusionReason,
 		})
 	}
 
@@ -268,6 +354,20 @@ func (r *Runner) detectDatabases(ctx context.Context, containers []domain.Detect
 		}
 	}
 	return deduped
+}
+
+func detectedDatabaseKind(image string) string {
+	image = strings.SplitN(image, "@", 2)[0]
+	image = image[strings.LastIndex(image, "/")+1:]
+	image = strings.ToLower(strings.SplitN(image, ":", 2)[0])
+	switch image {
+	case "mysql", "mysql-server", "mariadb", "percona", "percona-server":
+		return "mysql"
+	case "postgres", "postgresql", "timescaledb":
+		return "postgresql"
+	default:
+		return ""
+	}
 }
 
 func detectedDatabaseEndpoint(container domain.DetectedContainer, expectedContainerPort int, reachable func(string, int) bool) (string, int, bool) {

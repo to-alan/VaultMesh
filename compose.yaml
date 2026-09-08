@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:17-alpine
+    labels:
+      io.vaultmesh.component: postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: vaultmesh
@@ -15,6 +17,8 @@ services:
       retries: 20
 
   control:
+    labels:
+      io.vaultmesh.component: control
     # Prebuilt images are published to GHCR on every release tag. With both
     # image and build set, `docker compose up -d` pulls the published image
     # and `up -d --build` rebuilds locally from this source tree instead.
@@ -66,6 +70,8 @@ services:
       retries: 10
 
   web:
+    labels:
+      io.vaultmesh.component: web
     image: ghcr.io/to-alan/vaultmesh/vaultmesh-web:${VAULTMESH_IMAGE_TAG:-latest}
     build:
       context: .

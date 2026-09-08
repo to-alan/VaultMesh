@@ -395,12 +395,13 @@ type DetectionReport struct {
 }
 
 type DetectedContainer struct {
-	Name         string                `json:"name"`
-	Image        string                `json:"image"`
-	Running      bool                  `json:"running"`
-	Ports        []string              `json:"ports,omitempty"`
-	PortBindings []DetectedPortBinding `json:"port_bindings,omitempty"`
-	Mounts       []string              `json:"mounts,omitempty"`
+	ExclusionReason string                `json:"exclusion_reason,omitempty"`
+	Name            string                `json:"name"`
+	Image           string                `json:"image"`
+	Running         bool                  `json:"running"`
+	Ports           []string              `json:"ports,omitempty"`
+	PortBindings    []DetectedPortBinding `json:"port_bindings,omitempty"`
+	Mounts          []string              `json:"mounts,omitempty"`
 }
 
 // DetectedPortBinding preserves the host endpoint separately from the
@@ -414,20 +415,22 @@ type DetectedPortBinding struct {
 }
 
 type DetectedDatabase struct {
-	Kind      string `json:"kind"` // mysql | postgresql
-	Source    string `json:"source"`
-	Container string `json:"container,omitempty"`
-	Host      string `json:"host"`
-	Port      int    `json:"port"`
-	Reachable bool   `json:"reachable"`
-	DumpTool  string `json:"dump_tool,omitempty"`
+	ExclusionReason string `json:"exclusion_reason,omitempty"`
+	Kind            string `json:"kind"` // mysql | postgresql
+	Source          string `json:"source"`
+	Container       string `json:"container,omitempty"`
+	Host            string `json:"host"`
+	Port            int    `json:"port"`
+	Reachable       bool   `json:"reachable"`
+	DumpTool        string `json:"dump_tool,omitempty"`
 }
 
 type DetectedApp struct {
-	Path    string   `json:"path"`
-	Name    string   `json:"name"`
-	Kind    string   `json:"kind"`
-	Markers []string `json:"markers"`
+	ExclusionReason string   `json:"exclusion_reason,omitempty"`
+	Path            string   `json:"path"`
+	Name            string   `json:"name"`
+	Kind            string   `json:"kind"`
+	Markers         []string `json:"markers"`
 }
 
 // AuditEvent is an append-only record of a security-sensitive control-plane

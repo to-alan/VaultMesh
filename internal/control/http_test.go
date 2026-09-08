@@ -1152,6 +1152,9 @@ func TestDetectionCommandRoundTrip(t *testing.T) {
 		Databases:   []domain.DetectedDatabase{{Kind: "mysql", Source: "docker", Container: "mysql-main", Host: "127.0.0.1", Port: 3306, Reachable: true}},
 		Apps:        []domain.DetectedApp{{Path: "/var/www/site", Name: "PHP (Composer)", Kind: "php", Markers: []string{"composer.json"}}},
 	}
+	report.Containers = append(report.Containers, domain.DetectedContainer{Name: "platform-db", Image: "postgres:17", ExclusionReason: "VaultMesh 自身数据库"})
+	report.Databases = append(report.Databases, domain.DetectedDatabase{Kind: "postgresql", Source: "docker", Container: "platform-db", ExclusionReason: "VaultMesh 自身数据库"})
+	report.Apps = append(report.Apps, domain.DetectedApp{Path: "/opt/platform", ExclusionReason: "VaultMesh 自身组件"})
 	requestJSON(t, handler, http.MethodPut, "/api/v1/agent/detection", identity.Token, report, http.StatusNoContent, nil)
 
 	var available struct {
@@ -1160,8 +1163,13 @@ func TestDetectionCommandRoundTrip(t *testing.T) {
 	}
 	requestJSONWithCookie(t, handler, http.MethodGet, "/api/v1/servers/"+identity.AgentID+"/detection", adminCookie,
 		nil, http.StatusOK, &available)
-	if !available.Available || len(available.Report.Apps) != 1 || len(available.Report.Containers) != 1 {
+	if !available.Available || len(available.Report.Apps) != 2 || len(available.Report.Containers) != 2 || len(available.Report.Databases) != 2 {
 		t.Fatalf("detection report was not stored: %#v", available)
+	}
+	if available.Report.Containers[1].ExclusionReason != report.Containers[1].ExclusionReason ||
+		available.Report.Databases[1].ExclusionReason != report.Databases[1].ExclusionReason ||
+		available.Report.Apps[1].ExclusionReason != report.Apps[1].ExclusionReason {
+		t.Fatalf("detection exclusion reasons were not preserved: %#v", available.Report)
 	}
 
 	// A manual command is a run-scoped fact; the detect command must have

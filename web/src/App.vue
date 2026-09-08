@@ -37,6 +37,8 @@ import {
 import { controlPlane } from './services'
 import type { NotificationChannelWriteInput } from './services'
 import { agentInstallUsesLoopbackFallback, buildAgentInstallCommand, detectionPollDecision, supportsDetectionVersion } from './detection'
+import { detectionCandidates, selectedDetectionCandidates, type DetectionCandidate } from './detectionCandidates'
+import ProjectDetectionView from './views/ProjectDetectionView.vue'
 import { useAuditFilters } from './composables/auditFilters'
 import { useSnapshotExplorer } from './composables/snapshotExplorer'
 import AuditView from './views/AuditView.vue'
@@ -556,6 +558,11 @@ function selectDefaults() {
 // ---- Detection wizard -------------------------------------------------
 const detectionServerID = ref('')
 const detectionReport = ref<DetectionReport | null>(null)
+const detectionReportLoading = ref(false)
+const detectionDraftStarted = ref(false)
+watch(projectEditorOpen, (open) => { if (open) detectionDraftStarted.value = true })
+const detectionHasDraft = computed(() => detectionDraftStarted.value || Boolean(editingProjectID.value || projectForm.name))
+const detectionItems = computed(() => detectionReport.value ? detectionCandidates(detectionReport.value, projects.value, detectionServerID.value) : [])
 const detectionSelection = reactive({ apps: [] as number[], databases: [] as number[], containers: [] as number[] })
 const detectionAttempts = ref(0)
 const detectionExhausted = ref(false)
@@ -566,8 +573,6 @@ const activeDetectionCommandID = ref('')
 let detectionPollTimer: number | undefined
 let detectionReportLoadRevision = 0
 const detectionRunning = computed(() => detectionDispatched.value && !detectionExhausted.value)
-const detectionHasSelection = computed(() =>
-  detectionSelection.apps.length + detectionSelection.databases.length + detectionSelection.containers.length > 0)
 const detectionWarning = ref('')
 const detectionAgentVersion = computed(() =>
   servers.value.find((item) => item.id === detectionServerID.value)?.agent_version || '')
@@ -592,8 +597,6 @@ watch([enrollment, controlPlaneVersion], ([result, version]) => {
   }
   installCommandText.value = buildInstallCommand(result, version)
 })
-const detectionTargetName = computed(() =>
-  servers.value.find((item) => item.id === detectionServerID.value)?.name || detectionServerID.value)
 // A stale selection (server archived/offline from an earlier session) must
 // never silently dispatch into the void.
 watch(() => servers.value.map((item) => item.id + ':' + item.status).join(','), () => {
@@ -610,13 +613,8 @@ watch(() => servers.value.map((item) => item.id + ':' + item.status).join(','), 
   }
 })
 
-// Results and diagnoses appear below the fold when the report is large;
-// scrolling them into view is the difference between feedback and silence.
-function revealDetectionPanel(id: string) {
-  window.requestAnimationFrame(() => {
-    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  })
-}
+// Loading a report never scrolls the page or opens an editor. Only an explicit
+// "generate draft" action may move focus to project configuration.
 watch(detectionServerID, (serverID) => {
   const loadRevision = ++detectionReportLoadRevision
   if (detectionRunning.value) return
@@ -628,6 +626,7 @@ watch(detectionServerID, (serverID) => {
   detectionSelection.apps = []
   detectionSelection.databases = []
   detectionSelection.containers = []
+  detectionReportLoading.value = Boolean(serverID)
   if (!serverID) return
   void (async () => {
     try {
@@ -638,18 +637,18 @@ watch(detectionServerID, (serverID) => {
         detectionAttempts.value = status.command?.attempts ?? 0
       }
     } catch {
-      // ignore: the wizard stays empty until the user starts a detection
+      if (loadRevision === detectionReportLoadRevision) detectionWarning.value = '无法读取上次结果。请检查连接，或点击开始探测。'
+    } finally {
+      if (loadRevision === detectionReportLoadRevision) detectionReportLoading.value = false
     }
   })()
 })
-watch(detectionReport, (report) => { if (report) revealDetectionPanel('detection-wizard') })
-watch(detectionExhausted, (exhausted) => { if (exhausted) revealDetectionPanel('detection-diagnosis') })
-watch(detectionWarning, (warning) => { if (warning) revealDetectionPanel('detection-diagnosis') })
 
 const DETECTION_POLL_TOTAL = 24   // 24 × 5s = 2 分钟窗口
 const DETECTION_POLL_INTERVAL = 5000
 
 async function startDetection(serverIDInput: string, force = false) {
+  if (loading.value || detectionRunning.value || agentWorkDisabled.value || detectionVersionBlocked.value) return
   const server = servers.value.find((item) => item.id === serverIDInput)
   if (!server) {
     error.value = '请先在下拉框中选择一台服务器。'
@@ -664,6 +663,7 @@ async function startDetection(serverIDInput: string, force = false) {
   // selected server. Otherwise it can put an old report back after this fresh
   // scan has started and make the UI appear idle.
   const requestRevision = ++detectionReportLoadRevision
+  detectionReportLoading.value = false
   window.clearTimeout(detectionPollTimer)
   detectionReport.value = null
   detectionExhausted.value = false
@@ -717,6 +717,7 @@ function pollDetection(serverID: string, commandID: string, remainingAttempts: n
     if (activeDetectionCommandID.value !== commandID || detectionServerID.value !== serverID) return
     try {
       const status = await controlPlane.servers.detection(serverID)
+      if (activeDetectionCommandID.value !== commandID || detectionServerID.value !== serverID) return
       // 命令派发状态随每次轮询刷新，让用户看到"系统确实在等 Agent"
       if (status.command?.id === commandID) {
         detectionAttempts.value = status.command.attempts ?? 0
@@ -751,6 +752,8 @@ function pollDetection(serverID: string, commandID: string, remainingAttempts: n
 }
 
 function closeDetection() {
+  ++detectionReportLoadRevision
+  detectionReportLoading.value = false
   window.clearTimeout(detectionPollTimer)
   detectionServerID.value = ''
   detectionReport.value = null
@@ -768,23 +771,31 @@ function closeDetection() {
 
 // Convert selected findings into a project draft; the user confirms in the
 // existing builder, including entering database passwords by hand.
-function applyDetectionDraft() {
+function toggleDetectionCandidate(candidate: DetectionCandidate, checked: boolean) {
+  const current = detectionItems.value.find((item) => item.key === candidate.key)
+  if (!current?.selectable || loading.value || detectionRunning.value) return
+  const indices = detectionSelection[current.kind].filter((index) => index !== current.index)
+  detectionSelection[current.kind] = checked ? [...indices, current.index] : indices
+}
+
+function applyDetectionDraft(replace = false) {
   const report = detectionReport.value
   const serverID = detectionServerID.value
-  if (!report) return
+  if (!report || loading.value || detectionRunning.value || (detectionHasDraft.value && !replace)) return
+  const selected = selectedDetectionCandidates(detectionItems.value, detectionSelection)
   const drafts: ProjectSourceDraft[] = []
   const skipped: string[] = []
 
-  for (const index of detectionSelection.apps) {
+  for (const { index } of selected.filter((item) => item.kind === 'apps')) {
     const app = report.apps?.[index]
     if (!app) continue
     const draft = createProjectSourceDraft('files')
     draft.paths = app.path
     drafts.push(draft)
   }
-  for (const index of detectionSelection.databases) {
+  for (const { index } of selected.filter((item) => item.kind === 'databases')) {
     const db = report.databases?.[index]
-    if (!db || !db.reachable) {
+    if (!db || !db.reachable || !db.dump_tool || db.port <= 0) {
       skipped.push(`${db?.kind === 'postgresql' ? 'PostgreSQL' : 'MySQL'}（端口未发布）`)
       continue
     }
@@ -793,9 +804,9 @@ function applyDetectionDraft() {
     draft.port = db.port || (db.kind === 'mysql' ? 3306 : 5432)
     drafts.push(draft)
   }
-  for (const index of detectionSelection.containers) {
+  for (const { index } of selected.filter((item) => item.kind === 'containers')) {
     const container = report.containers?.[index]
-    if (!container || !container.running) continue
+    if (!container) continue
     if (!container.mounts?.length) {
       skipped.push(`${container.name}（无挂载卷，容器内数据不持久化）`)
       continue
@@ -919,6 +930,7 @@ async function saveProject() {
 }
 
 function resetProjectForm() {
+  detectionDraftStarted.value = false
   editingProjectID.value = ''
   Object.assign(projectForm, createProjectFormDraft(
     servers.value[0]?.id ?? '',
@@ -1099,10 +1111,6 @@ async function refreshData(silent = false) {
 
 // perform runs an operation with the shared loading/error banner handling.
 // It returns the operation result, or undefined when the error was shown.
-function appPathName(path: string): string {
-  return path.split('/').filter(Boolean).at(-1) || path
-}
-
 async function perform<T>(operation: () => Promise<T>): Promise<T | undefined> {
   loading.value = true
   error.value = ''
@@ -1251,6 +1259,8 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  ++detectionReportLoadRevision
+  activeDetectionCommandID.value = ''
   window.removeEventListener('vaultmesh-ui-error', handleUIError)
   window.removeEventListener('popstate', syncTabFromLocation)
   if (clockTimer) window.clearInterval(clockTimer)
@@ -1406,75 +1416,33 @@ onBeforeUnmount(() => {
 
       <template v-else-if="activeTab === 'projects'">
         <div class="project-workspace-heading">
-          <p class="muted">{{ projectEditorOpen ? '按步骤配置数据源、计划与保留策略。返回列表会保留当前草稿。' : '查看保护状态、发起备份，或添加新的备份计划。' }}</p>
+          <p class="muted">{{ projectEditorOpen ? '按步骤配置数据源、计划与保留策略。返回列表会保留当前草稿。' : '发现数据 → 选择备份内容 → 确认计划。探测结果不会自动创建项目。' }}</p>
           <button v-if="projectEditorOpen" type="button" class="ghost" :disabled="loading" @click="projectEditorOpen = false">返回项目列表</button>
-          <button v-else type="button" class="primary" :disabled="loading || !servers.length || !repositories.length" @click="projectEditorOpen = true">{{ editingProjectID || projectForm.name ? '继续编辑草稿' : '+ 创建备份项目' }}</button>
+          <button v-else type="button" class="primary" :disabled="loading || !servers.length || !repositories.length" @click="projectEditorOpen = true">{{ detectionHasDraft ? '继续编辑草稿' : '+ 手动创建项目' }}</button>
         </div>
         <p v-if="!servers.length || !repositories.length" class="message" role="status">创建项目需要服务器和备份仓库。<button v-if="!servers.length" class="text-button" @click="navigateTo('servers')">添加服务器 →</button> <button v-if="!repositories.length" class="text-button" @click="navigateTo('repositories')">配置仓库 →</button></p>
         <div class="content-grid projects-grid">
-        <div v-show="!projectEditorOpen" class="projects-left">
-        <section class="panel detection-toolbar">
-          <div><p class="eyebrow">AUTO-DETECT</p><h2>自动发现可备份项</h2><small>只读扫描运行中的容器、数据库信号与应用目录；不读取文件内容，不收集密钥。</small></div>
-          <div class="data-toolbar">
-            <select v-model="detectionServerID" :disabled="detectionRunning" aria-label="自动发现的目标服务器">
-              <option value="" disabled>选择服务器</option>
-              <option v-for="server in servers.filter((item) => item.status === 'online')" :key="server.id" :value="server.id">{{ server.name }}（{{ server.agent_version || '未知版本' }}）</option>
-            </select>
-            <button type="button" class="primary compact-action" :disabled="loading || agentWorkDisabled || !detectionServerID || detectionRunning || detectionVersionBlocked" @click="startDetection(detectionServerID, true)">{{ detectionRunning ? '探测中…' : '开始探测' }}</button>
-          </div>
-          <p v-if="detectionVersionBlocked" class="detection-status stale">该 Agent 版本为 {{ detectionAgentVersion || '未知' }}，不支持探测或无法确认能力（需要 v0.1.2 或 edge）。重新安装：<code>curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo VAULTMESH_AGENT_VERSION=edge sh -s -- install-agent 'http://localhost:8080' '新令牌'</code></p>
-          <p v-if="detectionRunning" class="detection-status" role="status"><i></i>已派发给 {{ detectionTargetName }}（{{ detectionServerID }}）的 Agent，等待回传（第 {{ detectionAttempts }} 次尝试）…</p>
-          <p v-else-if="detectionExhausted" class="detection-status stale">两分钟内没有收到回传，请查看下方诊断。</p>
-        </section>
-        <section id="detection-wizard" v-if="detectionReport && detectionServerID" class="panel detection-wizard">
-          <div class="panel-heading"><div><p class="eyebrow">DETECTION</p><h2>探测结果</h2><p>勾选要纳入备份的内容，生成项目草稿后在下方表单确认。数据库密码需要你手动填写，探测不会读取任何密钥。</p></div><button type="button" class="ghost compact" @click="closeDetection">关闭</button></div>
-
-          <div v-if="detectionReport.databases?.length" class="detection-group">
-            <h3>数据库</h3>
-            <label v-for="(db, index) in detectionReport.databases" :key="'db' + index" class="check-row">
-              <input type="checkbox" v-model="detectionSelection.databases" :value="index" />
-              <span><strong>{{ db.kind === 'mysql' ? 'MySQL' : 'PostgreSQL' }} · {{ db.container || db.source }}</strong>
-              <small>{{ db.host || '127.0.0.1' }}:{{ db.port || (db.kind === 'mysql' ? 3306 : 5432) }} · {{ db.reachable ? '端口可达' : '端口未发布，暂不可备份' }}{{ db.dump_tool ? ' · ' + db.dump_tool : '' }}</small></span>
-            </label>
-          </div>
-
-          <div v-if="detectionReport.apps?.length" class="detection-group">
-            <h3>应用目录</h3>
-            <label v-for="(app, index) in detectionReport.apps" :key="'app' + index" class="check-row">
-              <input type="checkbox" v-model="detectionSelection.apps" :value="index" />
-              <span><strong>{{ appPathName(app.path) }} · {{ app.name }}</strong><small>{{ app.path }} · {{ app.markers.join('、') }}</small></span>
-            </label>
-          </div>
-
-          <div v-if="detectionReport.containers?.length" class="detection-group">
-            <h3>Docker 容器</h3>
-            <label v-for="(container, index) in detectionReport.containers" :key="'ct' + index" class="check-row">
-              <input type="checkbox" v-model="detectionSelection.containers" :value="index" />
-              <span><strong>{{ container.name }} · {{ container.image }}</strong><small>{{ container.running ? '运行中' : '已停止' }}{{ container.mounts?.length ? ' · 挂载 ' + container.mounts.length + ' 项' : '' }}</small></span>
-            </label>
-          </div>
-
-          <div v-if="!detectionReport.databases?.length && !detectionReport.apps?.length && !detectionReport.containers?.length" class="empty-state">
-            探测完成：这台服务器上没有发现明显的可备份项。可以手动创建项目指定任意路径。
-          </div>
-
-          <footer class="form-actions">
-            <button type="button" class="primary" :disabled="loading || !detectionHasSelection" @click="applyDetectionDraft">用所选生成项目草稿</button>
-            <button type="button" class="ghost" @click="startDetection(detectionServerID, true)" :disabled="loading || agentWorkDisabled || !detectionServerID">重新探测</button>
-          </footer>
-        </section>
-        <section id="detection-diagnosis" v-if="detectionWarning" class="panel detection-diagnosis">
-          <div class="panel-heading"><div><p class="eyebrow">VERSION MISMATCH</p><h2>探测命令无法被该 Agent 执行</h2></div></div>
-          <p>{{ detectionWarning }}</p>
-        </section>
-        <section id="detection-diagnosis" v-if="detectionExhausted" class="panel detection-diagnosis">
-          <div class="panel-heading"><div><p class="eyebrow">DIAGNOSIS</p><h2>Agent 没有回传探测结果</h2></div></div>
-          <ol>
-            <li v-if="detectionAgentVersion">Agent 版本为 <code>{{ detectionAgentVersion }}</code>，已通过探测能力检查；超时通常表示 Agent 未能领取命令或扫描过程失败。</li>
-            <li>查看 Agent 日志：<code>journalctl -u vaultmesh-agent -n 50</code>，关注 <code>detection</code> 或 <code>reject unsupported command</code> 关键字。</li>
-            <li>确认 Agent 在线（服务器页状态为「在线」），并且与控制面的地址可达。</li>
-          </ol>
-        </section>
+        <div v-show="!projectEditorOpen" class="project-discovery-workspace">
+          <ProjectDetectionView
+            v-model:server-id="detectionServerID"
+            :servers="servers"
+            :report="detectionReport"
+            :candidates="detectionItems"
+            :selection="detectionSelection"
+            :running="detectionRunning"
+            :loading="loading"
+            :report-loading="detectionReportLoading"
+            :attempts="detectionAttempts"
+            :exhausted="detectionExhausted"
+            :warning="detectionWarning"
+            :version-blocked="detectionVersionBlocked"
+            :agent-work-disabled="agentWorkDisabled"
+            :has-draft="detectionHasDraft"
+            @toggle="toggleDetectionCandidate"
+            @scan="startDetection(detectionServerID, true)"
+            @clear="closeDetection"
+            @apply="applyDetectionDraft"
+          />
 
           <ProjectListView
             :projects="projects"

@@ -91,7 +91,8 @@ function previewSummary(project: Project): string {
 <template>
   <section class="panel projects-list-panel">
       <div class="panel-heading filter-heading">
-        <div><p class="eyebrow">DESIRED STATE</p><h2>项目列表</h2></div>
+        <div class="project-list-title"><div><p class="eyebrow">PROTECT</p><h2>项目列表</h2><p>已保存的备份计划，与探测候选独立。</p></div><span class="project-total">{{ projects.length }}<small>个项目</small></span></div>
+        <div class="project-list-summary"><span><i class="server-state online"></i>{{ projects.filter(project => project.enabled).length }} 已启用</span><span>{{ projects.filter(project => !project.enabled).length }} 已暂停</span><span>{{ servers.length }} 台服务器</span></div>
         <div class="data-toolbar project-toolbar">
           <label class="search-field"><span>搜索</span><input v-model.trim="search" type="search" placeholder="项目、服务器、仓库或数据源" /></label>
           <label><span>状态</span><select v-model="stateFilter"><option value="all">全部状态</option><option value="enabled">已启用</option><option value="at_risk">需要关注</option><option value="paused">已暂停</option></select></label>

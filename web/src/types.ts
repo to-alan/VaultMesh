@@ -245,6 +245,7 @@ export interface Profile {
 }
 
 export interface DetectedContainer {
+  exclusion_reason?: string
   name: string
   image: string
   running: boolean
@@ -261,6 +262,7 @@ export interface DetectedPortBinding {
 }
 
 export interface DetectedDatabase {
+  exclusion_reason?: string
   kind: 'mysql' | 'postgresql'
   source: string
   container?: string
@@ -271,6 +273,7 @@ export interface DetectedDatabase {
 }
 
 export interface DetectedApp {
+  exclusion_reason?: string
   path: string
   name: string
   kind: string

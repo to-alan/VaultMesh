@@ -116,4 +116,73 @@ func TestDetectContainersDoesNotHideDataServicesByName(t *testing.T) {
 	if containers[0].Name != "redis-cache" || containers[1].Name != "vaultmesh-worker" {
 		t.Fatalf("unexpected container inventory: %+v", containers)
 	}
+	for _, container := range containers {
+		if container.ExclusionReason != "" {
+			t.Fatalf("business container incorrectly excluded: %+v", container)
+		}
+	}
+}
+
+func TestPlatformDetectionUsesOwnershipNotNames(t *testing.T) {
+	containers := []domain.DetectedContainer{
+		{Name: "custom-postgres-1", Image: "postgres:17"},
+		{Name: "custom-control-1", Image: "ghcr.io/to-alan/vaultmesh/vaultmesh-control:edge-test"},
+		{Name: "vaultmesh-postgres-1", Image: "postgres:17"},
+		{Name: "custom-worker-1", Image: "custom/worker:latest"},
+		{Name: "renamed-web", Image: "private/web:latest"},
+	}
+	labels := []map[string]string{
+		{"com.docker.compose.project": "custom", "com.docker.compose.project.working_dir": "/opt/platform", "com.docker.compose.service": "postgres"},
+		{"com.docker.compose.project": "custom", "com.docker.compose.project.working_dir": "/opt/platform", "com.docker.compose.service": "control"},
+		{"com.docker.compose.project": "customer", "com.docker.compose.project.working_dir": "/opt/customer", "com.docker.compose.service": "postgres"},
+		{"com.docker.compose.project": "custom", "com.docker.compose.project.working_dir": "/opt/platform", "com.docker.compose.service": "worker"},
+		{"io.vaultmesh.component": "web"},
+	}
+	roots := markPlatformContainers(containers, labels)
+	for i, excluded := range []bool{true, true, false, false, true} {
+		if (containers[i].ExclusionReason != "") != excluded {
+			t.Fatalf("container %s exclusion mismatch: %+v", containers[i].Name, containers[i])
+		}
+	}
+	if len(roots) != 1 || roots[0] != "/opt/platform" {
+		t.Fatalf("unexpected platform roots: %v", roots)
+	}
+}
+
+func TestPlatformAppDetectionKeepsSiblingApplications(t *testing.T) {
+	apps := []domain.DetectedApp{{Path: "/opt/platform"}, {Path: "/opt/platform/web"}, {Path: "/opt/platform-shop"}, {Path: "/data/agent/state"}, {Path: "/srv/shop"}}
+	annotateExcludedApps(apps, []string{"/opt/platform", "/"}, []string{"/data/agent"})
+	for i, excluded := range []bool{true, true, false, true, false} {
+		if (apps[i].ExclusionReason != "") != excluded {
+			t.Fatalf("app %s exclusion mismatch: %+v", apps[i].Path, apps[i])
+		}
+	}
+	for _, root := range []string{"/", "/opt", "/srv", "relative"} {
+		if isPlatformProjectRoot(root) {
+			t.Fatalf("shared or unsafe root accepted: %s", root)
+		}
+	}
+}
+
+func TestDatabaseDetectionDoesNotMistakeToolsForDatabases(t *testing.T) {
+	for image, want := range map[string]string{
+		"postgres:17-alpine": "postgresql", "bitnami/postgresql:17": "postgresql", "mysql/mysql-server:8": "mysql",
+		"registry.example:5000/team/mariadb@sha256:abc": "mysql", "timescale/timescaledb:latest": "postgresql",
+		"prometheus/mysqld-exporter:latest": "", "postgres-backup:latest": "", "phpmyadmin:latest": "",
+	} {
+		if got := detectedDatabaseKind(image); got != want {
+			t.Errorf("%s: got %q, want %q", image, got, want)
+		}
+	}
+}
+
+func TestScanMarkersRecognizesCanonicalComposeFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "compose.yaml"), []byte("services: {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	apps := scanMarkers(context.Background(), root, 0)
+	if len(apps) != 1 || apps[0].Kind != "compose" {
+		t.Fatalf("canonical Compose project not detected: %+v", apps)
+	}
 }
