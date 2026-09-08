@@ -26,6 +26,10 @@ with open(os.environ['VM_COMMAND_LOG'], 'a') as log:
     log.write(json.dumps([name] + args) + '\n')
 joined = ' '.join(args)
 if name == 'docker':
+    if os.environ.get('VM_FAIL') == 'existing-stack' and args and args[0] == 'ps':
+        print('existing-container')
+    if os.environ.get('VM_FAIL') == 'existing-volume' and args[:2] == ['volume', 'ls']:
+        print('vaultmesh_vaultmesh-postgres')
     failure = os.environ.get('VM_FAIL', '')
     if failure and failure in joined:
         sys.exit(1)
@@ -228,6 +232,24 @@ newer_version v0.2.0-rc.1 v0.2.0
         original.write_text('original secret\n')
         self.run_shell('ACTION=install; control_action', ok=False)
         self.assertEqual(original.read_text(), 'original secret\n')
+
+    def test_different_directory_cannot_adopt_existing_compose_stack(self):
+        self.run_shell('ACTION=install; control_action', failure='existing-stack', ok=False)
+        self.assertFalse((self.install / '.env').exists())
+        self.assertFalse(any('up' in c or 'stop' in c for c in self.commands()))
+
+    def test_fresh_install_cannot_reuse_orphaned_postgres_volume(self):
+        self.run_shell('ACTION=install; control_action', failure='existing-volume', ok=False)
+        self.assertFalse((self.install / '.env').exists())
+        self.assertFalse(any('up' in c or 'stop' in c for c in self.commands()))
+
+    def test_container_inventory_error_aborts_installation(self):
+        self.run_shell('ACTION=install; control_action', failure='ps -a', ok=False)
+        self.assertFalse((self.install / '.env').exists())
+
+    def test_volume_inventory_error_aborts_installation(self):
+        self.run_shell('ACTION=install; control_action', failure='volume ls', ok=False)
+        self.assertFalse((self.install / '.env').exists())
 
     def test_upgrade_keeps_secrets_and_backs_up_before_start(self):
         self.existing_control()

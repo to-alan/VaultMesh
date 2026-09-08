@@ -150,6 +150,13 @@ control_action() {
     else
         [ ! -d "$INSTALL_DIR/.git" ] || fail '检测到旧版 Git 部署，拒绝自动覆盖。请阅读 docs/UPGRADE.md'
         [ -z "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name .operation-lock -print -quit)" ] || fail '安装目录非空，请使用 upgrade；不覆盖既有配置/数据库'
+        # Changing --dir must not adopt an existing Compose project or database.
+        existing_containers=$(docker ps -a --filter label=com.docker.compose.project=vaultmesh --format '{{.ID}}') || fail '无法检查现有容器，停止安装'
+        [ -z "$existing_containers" ] || fail '本机已有 vaultmesh 容器；换安装目录不能创建第二套或接管旧部署'
+        existing_volumes=$(docker volume ls --filter label=com.docker.compose.project=vaultmesh --format '{{.Name}}') || fail '无法检查现有数据卷，停止安装'
+        [ -z "$existing_volumes" ] || fail '发现旧 vaultmesh 数据卷，请按迁移文档处理，不自动重新初始化'
+        existing_database=$(docker volume ls --filter 'name=^vaultmesh_vaultmesh-postgres$' --format '{{.Name}}') || fail '无法检查 PostgreSQL 数据卷，停止安装'
+        [ -z "$existing_database" ] || fail '发现同名 PostgreSQL 数据卷，拒绝用新密码/主密钥接管'
         if [ "$MODE" = managed ]; then
             valid_domain "$DOMAIN" || fail '请用 --domain 指定已解析到本机的域名；IP 测试和已有代理见 docs/INSTALL.md'
             PUBLIC_URL="https://$DOMAIN"; SITE_ADDRESS=$DOMAIN
@@ -212,9 +219,13 @@ agent_action() {
         valid_url "$AGENT_URL" || fail 'Agent 地址必须是 HTTPS 或回环 HTTP Origin'
         valid_line "$AGENT_TOKEN" || fail '注册令牌格式无效'
         printf '%s\n' "$AGENT_TOKEN" | grep -Eq '^[A-Za-z0-9_-]+$' || fail '注册令牌格式无效'
-        [ ! -e /var/lib/vaultmesh-agent/state.json ] && [ ! -e /etc/vaultmesh-agent.env ] && [ ! -e /usr/local/bin/vaultmesh-agent ] || fail '已存在 Agent；请使用 upgrade-agent，绝不自动删除设备身份'
+        if [ -e /var/lib/vaultmesh-agent/state.json ] || [ -e /etc/vaultmesh-agent.env ] || [ -e /usr/local/bin/vaultmesh-agent ]; then
+            fail '已存在 Agent；请使用 upgrade-agent，绝不自动删除设备身份'
+        fi
     else
-        [ -s /var/lib/vaultmesh-agent/state.json ] && [ -f /etc/vaultmesh-agent.env ] && [ -x /usr/local/bin/vaultmesh-agent ] || fail '找不到完整的现有 Agent 安装'
+        if [ ! -s /var/lib/vaultmesh-agent/state.json ] || [ ! -f /etc/vaultmesh-agent.env ] || [ ! -x /usr/local/bin/vaultmesh-agent ]; then
+            fail '找不到完整的现有 Agent 安装'
+        fi
         [ "$VERSION" != latest ] || fail '请用 --version 指定与控制面一致的版本，先升级控制面再升级 Agent'
     fi
     case "$VERSION" in
