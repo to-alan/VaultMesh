@@ -1,0 +1,14 @@
+{
+    admin off
+}
+
+{$VAULTMESH_SITE_ADDRESS} {
+    encode zstd gzip
+    @api path /api/* /healthz
+    handle @api {
+        reverse_proxy control:8080
+    }
+    handle {
+        reverse_proxy web:80
+    }
+}

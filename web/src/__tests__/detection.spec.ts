@@ -47,13 +47,13 @@ describe('detection version support', () => {
 describe('Agent install command', () => {
   it('rewrites remote plain HTTP and pins edge agents to an edge control plane', () => {
     const command = buildAgentInstallCommand('http://192.0.2.8:8080', 'enroll_test', 'edge-dev')
-    expect(command).toContain('sudo VAULTMESH_AGENT_VERSION=edge sh')
+    expect(command).toContain("--version 'edge'")
     expect(command).toContain("install-agent 'http://localhost:8080' 'enroll_test'")
   })
 
   it('recognizes edge channel names case-insensitively', () => {
     expect(buildAgentInstallCommand('https://backup.example.com', 'enroll_test', 'EDGE-dev'))
-      .toContain('sudo VAULTMESH_AGENT_VERSION=edge sh')
+      .toContain("--version 'edge'")
   })
 
   it('marks only remote plain HTTP addresses as same-host fallbacks', () => {
@@ -68,6 +68,22 @@ describe('Agent install command', () => {
     expect(command).toContain("install-agent 'https://backup.example.com'")
     expect(command).toContain(shellQuote("enroll_a'b"))
     expect(command).not.toContain('VAULTMESH_AGENT_VERSION=edge')
+    expect(command).toContain('/releases/download/v0.1.2/install.sh')
+    expect(command).toContain("--version 'v0.1.2'")
+    expect(command).not.toContain('/main/')
+  })
+
+  it('pins edge installer and binary to the same full revision', () => {
+    const revision = 'a'.repeat(40)
+    const command = buildAgentInstallCommand('https://backup.example.com', 'enroll_test', `edge-${revision}`)
+    expect(command).toContain(`/VaultMesh/${revision}/install.sh`)
+    expect(command).toContain(`--version 'edge-${revision}'`)
+    expect(command).not.toContain('/main/')
+  })
+
+  it('pins release candidates without falling back to main', () => {
+    expect(buildAgentInstallCommand('https://backup.example.com', 'enroll_test', 'v0.2.0-rc.1'))
+      .toContain('/releases/download/v0.2.0-rc.1/install.sh')
   })
 })
 

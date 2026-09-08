@@ -18,6 +18,8 @@ make check                 # Go 测试 + 前端构建 + go vet
 make build                 # 产出 bin/vaultmesh-server、bin/vaultmesh-agent
 ```
 
+安装器回归需要 Python 3 标准库（开发/CI 依赖，不是用户安装依赖）。`make installer-test` 不访问真实主机服务，使用临时目录和命令替身验证失败保护。GitHub 认证、`make push`、`make release VERSION=...` 和发布包维护详见 [发布指南](docs/RELEASING.md)。
+
 本地跑 PostgreSQL 集成测试（`internal/store/postgres/postgres_integration_test.go`）：
 
 ```bash

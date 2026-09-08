@@ -1,6 +1,14 @@
 .git
 .github
 .env
+.env.*
+.secrets
+dist
+coverage
+**/__pycache__
+*.pem
+*.key
+*.dump
 bin
 web/node_modules
 web/dist

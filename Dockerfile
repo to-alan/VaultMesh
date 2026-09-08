@@ -1,4 +1,4 @@
-FROM golang:1.26.6-alpine AS server
+FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS server
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -7,7 +7,9 @@ COPY internal/ ./internal/
 ARG VERSION=dev
 ARG COMMIT=none
 ARG DATE=unknown
-RUN CGO_ENABLED=0 go build -trimpath \
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
     -ldflags "-s -w -X github.com/to-alan/vaultmesh/internal/version.Version=${VERSION} -X github.com/to-alan/vaultmesh/internal/version.Commit=${COMMIT} -X github.com/to-alan/vaultmesh/internal/version.Date=${DATE}" \
     -o /out/vaultmesh-server ./cmd/vaultmesh-server
 

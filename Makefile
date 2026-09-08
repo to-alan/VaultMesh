@@ -1,4 +1,4 @@
-.PHONY: all build test check lint fmt web-build web-test web-install clean
+.PHONY: all build test check lint fmt web-build web-test web-install clean installer-test package-release push release
 
 GOCACHE ?= /tmp/vaultmesh-go-cache
 VERSION ?= dev
@@ -16,7 +16,7 @@ build: web-build
 test: web-test
 	GOCACHE=$(GOCACHE) go test ./...
 
-check: lint test web-build
+check: lint test web-build installer-test
 	GOCACHE=$(GOCACHE) go vet ./...
 
 lint:
@@ -33,6 +33,18 @@ web-build:
 
 web-test:
 	npm --prefix web test
+
+installer-test:
+	python3 -m unittest discover -s scripts/tests -v
+
+package-release:
+	sh scripts/package-release.sh "$(VERSION)"
+
+push:
+	sh scripts/push.sh
+
+release:
+	sh scripts/release.sh "$(VERSION)"
 
 clean:
 	rm -rf bin web/dist

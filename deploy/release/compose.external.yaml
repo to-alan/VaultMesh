@@ -1,0 +1,5 @@
+# Existing host reverse proxy (1Panel / Nginx / Caddy) terminates public HTTPS.
+services:
+  gateway:
+    ports:
+      - '127.0.0.1:3000:80'

@@ -4,11 +4,27 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sh -n install.sh scripts/package-release.sh scripts/push.sh scripts/release.sh
+      - run: shellcheck install.sh scripts/*.sh scripts/tests/*.sh
+      - run: python3 -m unittest discover -s scripts/tests -v
+      - run: sh scripts/package-release.sh v0.0.0-rc.0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deployment-kit-preview
+          path: dist/*
+          retention-days: 7
+
   go:
     runs-on: ubuntu-latest
     services:
@@ -73,9 +89,19 @@ jobs:
       - run: sh -n install.sh
       - run: docker compose config --quiet
       - run: docker compose -f compose.yaml -f deploy/compose.ip-test.yaml config --quiet
+      - name: Validate release Compose modes
+        env:
+          VAULTMESH_IMAGE_TAG: ci
+          VAULTMESH_RELEASE_DIR: ${{ github.workspace }}/deploy/release
+          VAULTMESH_SITE_ADDRESS: backup.example.test
+        run: |
+          docker compose -f deploy/release/compose.yaml -f deploy/release/compose.managed.yaml config --quiet
+          docker compose -f deploy/release/compose.yaml -f deploy/release/compose.external.yaml config --quiet
       - run: docker build --tag vaultmesh-control:ci .
       - run: docker build --file Dockerfile.web --tag vaultmesh-web:ci .
       - run: docker build --file Dockerfile.agent --tag vaultmesh-agent:ci .
+      - name: Smoke test production release layout
+        run: sh scripts/tests/release-smoke.sh
       - name: Smoke test independent containers
         run: |
           cleanup() {

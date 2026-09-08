@@ -2,6 +2,8 @@
 
 本文面向使用 Docker Compose 部署控制面的管理员，覆盖备份、恢复、升级、回滚和常见故障。VaultMesh 当前仍处于 1.0 之前；生产部署必须保留现有备份方案并完成真实恢复验收。
 
+新用户请从[发布包安装](INSTALL.md)开始，日常升级与失败恢复以 [UPGRADE.md](UPGRADE.md) 为准。本文直接在 `/opt/vaultmesh` 执行 `docker compose` 的手工命令针对旧版 Git/自定义部署（包含 IP 测试覆盖）；发布包布局应使用 `vaultmesh compose` 选择正确的当前版本配置，不能混用两套布局。本文保留旧版步骤是为避免覆盖既有环境，不再推荐重复运行旧安装器。
+
 ## 必须保护的资产
 
 控制面能否完整恢复取决于两类资产，缺一不可：
@@ -88,6 +90,8 @@ sudo systemctl restart vaultmesh-agent
 控制面按天清理已完成的事实：运行记录默认保留 90 天、已完成命令 30 天、已完成的投递记录 90 天、已恢复的告警事件 180 天、审计事件 365 天。可用 `VAULTMESH_RETENTION_*_DAYS` 环境变量调整，设置为 `0` 关闭对应范围的清理（完整变量列表见 `.env.example`）。进行中的运行、待投递的通知和 firing 中的告警事件不受保留策略影响。归档的服务器、项目和仓库不会参与保留清理。
 
 ## 升级
+
+本节仅适用于旧 Git/自定义 Compose 布局；新发布包用户使用 `sudo vaultmesh upgrade`，详见 [UPGRADE.md](UPGRADE.md)。旧布局也必须先校验目标发布说明，不使用浮动 `latest` 或未通过 CI 的 edge。
 
 升级前先执行控制面备份并阅读目标版本说明。标准流程：
 

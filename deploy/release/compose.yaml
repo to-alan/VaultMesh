@@ -1,0 +1,89 @@
+# Release-only deployment: intentionally no build contexts and no floating app tags.
+services:
+  postgres:
+    image: postgres:17-alpine
+    labels: {io.vaultmesh.component: postgres}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: vaultmesh
+      POSTGRES_USER: vaultmesh
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    volumes:
+      - vaultmesh-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U vaultmesh -d vaultmesh]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: &logging
+      driver: json-file
+      options: {max-size: 10m, max-file: '3'}
+
+  control:
+    image: ghcr.io/to-alan/vaultmesh/vaultmesh-control:${VAULTMESH_IMAGE_TAG:?use the release installer}
+    labels: {io.vaultmesh.component: control}
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      VAULTMESH_LISTEN: :8080
+      VAULTMESH_DATABASE_URL: postgres://vaultmesh:${POSTGRES_PASSWORD}@postgres:5432/vaultmesh?sslmode=disable
+      VAULTMESH_MASTER_KEY: ${VAULTMESH_MASTER_KEY:?required}
+      VAULTMESH_ADMIN_USERNAME: ${VAULTMESH_ADMIN_USERNAME:-admin}
+      VAULTMESH_ADMIN_PASSWORD: ${VAULTMESH_ADMIN_PASSWORD:?required}
+      VAULTMESH_PUBLIC_API_URL: ${VAULTMESH_PUBLIC_API_URL:?required}
+      VAULTMESH_ALLOWED_ORIGINS: ${VAULTMESH_PUBLIC_API_URL:?required}
+      VAULTMESH_COOKIE_SECURE: 'true'
+      VAULTMESH_COOKIE_SAME_SITE: lax
+      VAULTMESH_WEBAUTHN_RP_ID: ${VAULTMESH_WEBAUTHN_RP_ID:-}
+      VAULTMESH_WEBAUTHN_RP_ORIGINS: ${VAULTMESH_PUBLIC_API_URL:?required}
+      VAULTMESH_AUTO_MIGRATE: 'true'
+      VAULTMESH_RETENTION_RUNS_DAYS: ${VAULTMESH_RETENTION_RUNS_DAYS:-90}
+      VAULTMESH_RETENTION_COMMANDS_DAYS: ${VAULTMESH_RETENTION_COMMANDS_DAYS:-30}
+      VAULTMESH_RETENTION_DELIVERIES_DAYS: ${VAULTMESH_RETENTION_DELIVERIES_DAYS:-90}
+      VAULTMESH_RETENTION_INCIDENTS_DAYS: ${VAULTMESH_RETENTION_INCIDENTS_DAYS:-180}
+      VAULTMESH_RETENTION_AUDIT_EVENTS_DAYS: ${VAULTMESH_RETENTION_AUDIT_EVENTS_DAYS:-365}
+    read_only: true
+    tmpfs: ['/tmp:size=16m,mode=1777']
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    healthcheck:
+      test: [CMD, wget, -qO-, 'http://127.0.0.1:8080/healthz']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *logging
+
+  web:
+    image: ghcr.io/to-alan/vaultmesh/vaultmesh-web:${VAULTMESH_IMAGE_TAG:?use the release installer}
+    labels: {io.vaultmesh.component: web}
+    restart: unless-stopped
+    environment:
+      VAULTMESH_API_BASE_URL: ${VAULTMESH_PUBLIC_API_URL:?required}
+    healthcheck:
+      test: [CMD, wget, -qO-, 'http://127.0.0.1/config.txt']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *logging
+
+  gateway:
+    image: caddy:2.10-alpine
+    labels: {io.vaultmesh.component: gateway}
+    restart: unless-stopped
+    depends_on:
+      control: {condition: service_healthy}
+      web: {condition: service_healthy}
+    environment:
+      VAULTMESH_SITE_ADDRESS: ${VAULTMESH_SITE_ADDRESS:?required}
+    volumes:
+      - ${VAULTMESH_RELEASE_DIR:?use the release installer}/Caddyfile:/etc/caddy/Caddyfile:ro
+      - vaultmesh-caddy-data:/data
+      - vaultmesh-caddy-config:/config
+    logging: *logging
+
+volumes:
+  vaultmesh-postgres:
+  vaultmesh-caddy-data:
+  vaultmesh-caddy-config:

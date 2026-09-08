@@ -2,6 +2,8 @@
 
 本文说明代码边界和扩展约定。目标是让新增数据源、存储渠道、通知 Provider 或页面能力时，改动集中、可测试，并且不破坏备份与凭据安全边界。
 
+开发推送/构建/发版流程见 [RELEASING.md](RELEASING.md)。`install.sh` 是用户发布包管理器，`deploy/release/` 是无 build context 的生产配置；根目录 `compose.yaml` 继续用于开发及旧部署，不能把两者混合发布。修改安装器须通过 `make installer-test`，涉及代理还要验证真实容器路由与登录。
+
 ## 依赖方向
 
 ```text

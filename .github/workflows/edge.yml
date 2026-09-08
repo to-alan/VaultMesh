@@ -1,9 +1,10 @@
 name: Edge Images
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,12 +12,21 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+concurrency:
+  group: edge-main
+  cancel-in-progress: true
 
 jobs:
   edge-images:
+    if: >-
+      github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TARGET_SHA }}
       # GHCR rejects uppercase repository names; lowercase the full prefix.
       - id: image-prefix
         run: echo "prefix=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
@@ -33,12 +43,11 @@ jobs:
           file: ./Dockerfile
           push: true
           build-args: |
-            VERSION=edge-${{ github.sha }}
-            COMMIT=${{ github.sha }}
+            VERSION=edge-${{ env.TARGET_SHA }}
+            COMMIT=${{ env.TARGET_SHA }}
           tags: |
-            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-control:edge
-            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-control:edge-${{ github.sha }}
-          labels: org.opencontainers.image.revision=${{ github.sha }}
+            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-control:edge-${{ env.TARGET_SHA }}
+          labels: org.opencontainers.image.revision=${{ env.TARGET_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build and push edge web image
@@ -48,9 +57,8 @@ jobs:
           file: ./Dockerfile.web
           push: true
           tags: |
-            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-web:edge
-            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-web:edge-${{ github.sha }}
-          labels: org.opencontainers.image.revision=${{ github.sha }}
+            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-web:edge-${{ env.TARGET_SHA }}
+          labels: org.opencontainers.image.revision=${{ env.TARGET_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build and push edge agent image
@@ -60,11 +68,17 @@ jobs:
           file: ./Dockerfile.agent
           push: true
           build-args: |
-            VERSION=edge-${{ github.sha }}
-            COMMIT=${{ github.sha }}
+            VERSION=edge-${{ env.TARGET_SHA }}
+            COMMIT=${{ env.TARGET_SHA }}
           tags: |
-            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-agent:edge
-            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-agent:edge-${{ github.sha }}
-          labels: org.opencontainers.image.revision=${{ github.sha }}
+            ${{ steps.image-prefix.outputs.prefix }}/vaultmesh-agent:edge-${{ env.TARGET_SHA }}
+          labels: org.opencontainers.image.revision=${{ env.TARGET_SHA }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Promote completed edge images
+        env:
+          PREFIX: ${{ steps.image-prefix.outputs.prefix }}
+        run: |
+          for component in control web agent; do
+            docker buildx imagetools create --tag "$PREFIX/vaultmesh-$component:edge" "$PREFIX/vaultmesh-$component:edge-$TARGET_SHA"
+          done

@@ -38,8 +38,15 @@ export function buildAgentInstallCommand(apiBaseURL: string, enrollmentToken: st
   const parsedAPIURL = new URL(apiBaseURL)
   const isRemotePlainHTTP = agentInstallUsesLoopbackFallback(parsedAPIURL)
   const agentURL = isRemotePlainHTTP ? 'http://localhost:8080' : apiBaseURL
-  const channel = controlPlaneVersion.toLowerCase().startsWith('edge') ? 'VAULTMESH_AGENT_VERSION=edge ' : ''
-  return `curl -fsSL https://raw.githubusercontent.com/to-alan/VaultMesh/main/install.sh | sudo ${channel}sh -s -- install-agent ${shellQuote(agentURL)} ${shellQuote(enrollmentToken)}`
+  const normalizedVersion = controlPlaneVersion.toLowerCase()
+  const isRelease = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-rc\.(?:0|[1-9]\d*))?$/.test(controlPlaneVersion)
+  const edgeVersion = /^edge-[a-f0-9]{40}$/.test(normalizedVersion) ? normalizedVersion : 'edge'
+  const selectedVersion = isRelease ? controlPlaneVersion : edgeVersion
+  const installerURL = isRelease
+    ? `https://github.com/to-alan/VaultMesh/releases/download/${selectedVersion}/install.sh`
+    : `https://raw.githubusercontent.com/to-alan/VaultMesh/${edgeVersion === 'edge' ? 'main' : edgeVersion.slice(5)}/install.sh`
+  // Download before executing; stable installations never consume mutable main.
+  return `curl -fL ${installerURL} -o vaultmesh-install.sh && sudo sh vaultmesh-install.sh install-agent ${shellQuote(agentURL)} ${shellQuote(enrollmentToken)} --version ${shellQuote(selectedVersion)}`
 }
 
 export function agentInstallUsesLoopbackFallback(apiBaseURL: string | URL): boolean {
